@@ -12,6 +12,19 @@ from routes.manager      import manager_bp
 from routes.ticket_sales import ticket_sales_bp
 from routes.tickets_static import tickets_bp
 from mqtt_ingest import start_in_background
+from flask_sqlalchemy import SQLAlchemy
+
+app = Flask(__name__)
+app.config.from_object(Config)
+db = SQLAlchemy(app)
+
+@app.route('/db-test')
+def db_test():
+    try:
+        result = db.session.execute("SELECT 1")
+        return f"✅ DB Connected! Result: {list(result)}"
+    except Exception as e:
+        return f"❌ DB Connection Failed: {str(e)}"
 
 def create_app():
     app = Flask(__name__)
