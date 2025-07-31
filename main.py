@@ -1,4 +1,4 @@
-# backend/app.py
+# backend/main.py
 from flask import Flask, jsonify
 from config import Config
 from db import db, migrate
