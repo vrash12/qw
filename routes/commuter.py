@@ -9,15 +9,139 @@ from models.sensor_reading import SensorReading
 from models.announcement   import Announcement
 from models.ticket_sale import TicketSale
 from datetime import datetime, timedelta
-
+from sqlalchemy import func
 from models.bus import Bus   
+from models.user import User
 
 commuter_bp = Blueprint("commuter", __name__, url_prefix="/commuter")
-       # ← new
+# routes/commuter.py  (add at the very bottom)
+
+@commuter_bp.route("/dashboard", methods=["GET"])
+@require_role("commuter")
+def dashboard():
+    """
+    Everything the mobile dashboard needs in one round-trip.
+    """
+    today = datetime.utcnow().date()
+
+    # -- next trip ------------------------------------------------------
+    next_trip = (
+        db.session.query(Trip, Bus.identifier)
+        .join(Bus, Trip.bus_id == Bus.id)
+        .filter(Trip.service_date == today)
+        .order_by(Trip.start_time.asc())
+        .first()
+    )
+
+    # -- ticket & announcement counters --------------------------------
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    recent_tix  = TicketSale.query.filter(
+                    TicketSale.user_id == g.user.id,
+                    TicketSale.created_at >= seven_days_ago).count()
+    unread_msgs = Announcement.query.count()  # refine later ↩︎
+
+    # -- build payload --------------------------------------------------
+    return jsonify({
+        "greeting":      _choose_greeting(),
+        "user_name":     f"{g.user.first_name} {g.user.last_name}",
+        "next_trip":     None if not next_trip else {
+            "bus":   next_trip.identifier.replace("bus-", "Bus "),
+            "start": next_trip.Trip.start_time.strftime("%H:%M"),
+            "end":   next_trip.Trip.end_time.strftime("%H:%M"),
+        },
+        "recent_tickets":   recent_tix,
+        "unread_messages":  unread_msgs,
+    }), 200
+
+
+def _choose_greeting() -> str:
+    hr = datetime.utcnow().hour
+    if hr < 12:      return "Good morning"
+    elif hr < 18:    return "Good afternoon"
+    return "Good evening"
+
+@commuter_bp.route('/trips', methods=['GET'])
+def list_all_trips():
+    """
+    GET /commuter/trips?date=YYYY-MM-DD
+    Returns a list of all scheduled trips for a given day.
+    This is a public endpoint.
+    """
+    date_str = request.args.get('date')
+    if not date_str:
+        return jsonify(error="A 'date' parameter is required."), 400
+
+    try:
+        svc_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify(error="Invalid date format. Use YYYY-MM-DD."), 400
+
+    # Subquery to find the first stop for each trip
+    first_stop_sq = (
+        db.session.query(
+            StopTime.trip_id,
+            func.min(StopTime.seq).label('min_seq')
+        )
+        .group_by(StopTime.trip_id)
+        .subquery()
+    )
+    first_stop_name_sq = (
+        db.session.query(
+            StopTime.trip_id,
+            StopTime.stop_name.label('origin')
+        )
+        .join(first_stop_sq, (StopTime.trip_id == first_stop_sq.c.trip_id) & (StopTime.seq == first_stop_sq.c.min_seq))
+        .subquery()
+    )
+
+    # Subquery to find the last stop for each trip
+    last_stop_sq = (
+        db.session.query(
+            StopTime.trip_id,
+            func.max(StopTime.seq).label('max_seq')
+        )
+        .group_by(StopTime.trip_id)
+        .subquery()
+    )
+    last_stop_name_sq = (
+        db.session.query(
+            StopTime.trip_id,
+            StopTime.stop_name.label('destination')
+        )
+        .join(last_stop_sq, (StopTime.trip_id == last_stop_sq.c.trip_id) & (StopTime.seq == last_stop_sq.c.max_seq))
+        .subquery()
+    )
+    
+    # Main query to get trips and join with all the info
+    trips = (
+        db.session.query(
+            Trip,
+            Bus.identifier,
+            first_stop_name_sq.c.origin,
+            last_stop_name_sq.c.destination
+        )
+        .join(Bus, Trip.bus_id == Bus.id)
+        .outerjoin(first_stop_name_sq, Trip.id == first_stop_name_sq.c.trip_id)
+        .outerjoin(last_stop_name_sq, Trip.id == last_stop_name_sq.c.trip_id)
+        .filter(Trip.service_date == svc_date)
+        .order_by(Trip.start_time.asc())
+        .all()
+    )
+
+    result = [{
+        "id": trip.id,
+        "bus_identifier": identifier,
+        "start_time": trip.start_time.strftime("%H:%M"),
+        "end_time": trip.end_time.strftime("%H:%M"),
+        "origin": origin or "N/A",
+        "destination": destination or "N/A"
+    } for trip, identifier, origin, destination in trips]
+    
+    return jsonify(result), 200
 
 # ─────────────────────────── BUS LIST ────────────────────────────
 @commuter_bp.route("/buses", methods=["GET"])
-@require_role("commuter")
+#@require_role("commuter")
 def list_buses():
     """
     Optional: ?date=YYYY-MM-DD  → only buses that have trips on that day
@@ -269,23 +393,41 @@ def schedule():
             })
 
     return jsonify(events=events), 200
-
-
-# ────────────────────────── ANNOUNCEMENTS ──────────────────────────────
 @commuter_bp.route("/announcements", methods=["GET"])
-@require_role("commuter")
 def announcements():
-    anns = (
-        Announcement.query
-        .order_by(Announcement.timestamp.desc())
-        .all()
+    bus_id   = request.args.get("bus_id", type=int)
+    date_str = request.args.get("date")
+
+    # ── build query ──────────────────────────────────────────────
+    query = (
+        db.session.query(
+            Announcement,
+            User.first_name,
+            User.last_name,
+            Bus.identifier.label("bus_identifier"),
+        )
+        .join(User, Announcement.created_by == User.id)
+        .outerjoin(Bus, User.assigned_bus_id == Bus.id)   # ← OUTER join
     )
-    return jsonify([
-        {
-            "id":         a.id,
-            "message":    a.message,
-            "timestamp":  a.timestamp.isoformat(),
-            "created_by": a.created_by,
-        }
-        for a in anns
-    ]), 200
+
+    if bus_id:
+        query = query.filter(User.assigned_bus_id == bus_id)
+
+    if date_str:
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify(error="date must be YYYY-MM-DD"), 400
+        query = query.filter(func.date(Announcement.timestamp) == day)
+
+    results = query.order_by(Announcement.timestamp.desc()).all()
+
+    anns = [{
+        "id":            ann.id,
+        "message":       ann.message,
+        "timestamp":     ann.timestamp.isoformat(),
+        "author_name":   f"{first} {last}",
+        "bus_identifier": bus_identifier or "unassigned"   # safe default
+    } for ann, first, last, bus_identifier in results]     # ← only **one** “in results”
+
+    return jsonify(anns), 200

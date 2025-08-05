@@ -45,7 +45,15 @@ def on_message(client, userdata, msg):
         )
         if not bus:
             raise ValueError(f"no bus in DB matching {device_id!r}")
-
+        if msg.topic.startswith("pao/") and payload.get("type") == "request":
+            bus_id_str = msg.topic.split("/")[1]        # pao/<bus>/passenger/updates
+            bus_id = int(bus_id_str.replace("bus-", ""))
+            push_to_bus(
+                bus_id,
+                "🚍 New Pickup Request",
+                f"Commuter #{payload['id']} is waiting.",
+                {"commuterId": payload["id"]}
+            )
         # --------------------- 3) numeric values ----------------------------
         in_c   = int(data["in"])
         out_c  = int(data["out"])

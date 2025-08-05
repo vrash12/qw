@@ -19,10 +19,25 @@ class TicketSale(db.Model):
     reference_no      = db.Column(db.String(16), unique=True, nullable=False)
     passenger_type    = db.Column(db.Enum('regular','discount'), nullable=False, server_default='regular')
     paid              = db.Column(db.Boolean, nullable=False, server_default=db.text('0'))
-
+    voided          = db.Column(db.Boolean, default=False, nullable=False, server_default="0")
+    void_reason     = db.Column(db.String(120))
     # relationships
     user              = db.relationship('User', back_populates='ticket_sales')
     fare_segment      = db.relationship('FareSegment')
     bus_id = db.Column(db.Integer, db.ForeignKey("buses.id"), nullable=False)
 
     bus = db.relationship("Bus", back_populates="tickets")
+
+    origin_stop_time_id      = db.Column(
+        db.Integer, db.ForeignKey('stop_times.id', ondelete='SET NULL'),
+        nullable=True
+    )
+    destination_stop_time_id = db.Column(
+        db.Integer, db.ForeignKey('stop_times.id', ondelete='SET NULL'),
+        nullable=True
+    )
+
+    origin_stop_time      = db.relationship('StopTime',
+        foreign_keys=[origin_stop_time_id])
+    destination_stop_time = db.relationship('StopTime',
+        foreign_keys=[destination_stop_time_id])

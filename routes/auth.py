@@ -100,10 +100,13 @@ def require_role(role):
         @wraps(f)
         def decorated_function(*args, **kwargs):
             token = None
+            print(f"[DEBUG][auth] Incoming headers: {dict(request.headers)}")
             if 'Authorization' in request.headers:
                 auth_header = request.headers['Authorization']
+                print(f"[DEBUG][auth] Found Authorization header: {auth_header}")
                 try:
                     token = auth_header.split(" ")[1]
+                    print(f"[DEBUG][auth] Extracted token: {token}")
                 except IndexError:
                     return jsonify(error="Malformed Authorization header"), 401
 

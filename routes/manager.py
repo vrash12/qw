@@ -1,62 +1,218 @@
 # routes/manager.py
-import os, uuid
-from datetime import datetime
-
-from flask import Blueprint, request, jsonify, send_from_directory
+from flask import Blueprint, request, jsonify, send_from_directory, current_app
+import os
+import uuid
+from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
-from flask import current_app
-from db               import db
-from routes.auth      import require_role
-from models.bus       import Bus
-from models.schedule  import  Trip, StopTime
-from models.qr_template  import QRTemplate
+from db import db
+from routes.auth import require_role
+from models.bus import Bus
+from models.schedule import Trip, StopTime
+from models.qr_template import QRTemplate
 from models.fare_segment import FareSegment
 from models.sensor_reading import SensorReading
-from sqlalchemy import func   
 from models.ticket_sale import TicketSale
-
+from sqlalchemy import func
+from sqlalchemy.orm import aliased
+from models.user import User 
+from models.schedule import StopTime  
+from models.ticket_stop import TicketStop 
 
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 manager_bp = Blueprint("manager", __name__)
+# Update Schedule and Trip
+@manager_bp.route("/trips/<int:trip_id>", methods=["PATCH"])
+@require_role("manager")
+def update_trip(trip_id: int):
+    data = request.get_json() or {}
+    try:
+        # Validate and extract new data from request
+        number = data.get("number", "").strip()
+        start_time = datetime.strptime(data["start_time"], "%H:%M").time()
+        end_time = datetime.strptime(data["end_time"], "%H:%M").time()
+
+        trip = Trip.query.get_or_404(trip_id)
+
+        # Update trip details
+        trip.number = number
+        trip.start_time = start_time
+        trip.end_time = end_time
+
+        db.session.commit()
+
+        return jsonify(
+            id=trip.id,
+            number=trip.number,
+            start_time=trip.start_time.strftime("%H:%M"),
+            end_time=trip.end_time.strftime("%H:%M"),
+        ), 200
+
+    except (KeyError, ValueError):
+        return jsonify(error="Invalid payload or missing required fields"), 400
+
+# Delete Trip and Schedule
+@manager_bp.route("/trips/<int:trip_id>", methods=["DELETE"])
+@require_role("manager")
+def delete_trip(trip_id: int):
+    try:
+        trip = Trip.query.get_or_404(trip_id)
+
+        # Delete related stop times
+        StopTime.query.filter_by(trip_id=trip_id).delete()
+
+        # Delete trip
+        db.session.delete(trip)
+        db.session.commit()
+
+        return jsonify(message="Trip successfully deleted"), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(error="Error deleting trip: " + str(e)), 500
+
+@manager_bp.route("/tickets", methods=["GET"])
+@require_role("manager")
+def tickets_for_day():
+    try:
+        day = datetime.strptime(
+            request.args.get("date") or datetime.utcnow().date().isoformat(),
+            "%Y-%m-%d",
+        ).date()
+    except ValueError:
+        return jsonify(error="invalid date"), 400
+
+    Start = datetime.combine(day, datetime.min.time())
+    End   = datetime.combine(day, datetime.max.time())
+
+    O = aliased(TicketStop)                        # ➋  CHANGE
+    D = aliased(TicketStop)
+
+    rows = (
+        db.session.query(
+            TicketSale.id,
+            TicketSale.price,
+            User.first_name,
+            User.last_name,
+            Bus.identifier.label("bus"),
+            O.stop_name.label("origin"),
+            D.stop_name.label("destination"),
+        )
+        .join(User, TicketSale.user_id == User.id)
+        .join(Bus,  TicketSale.bus_id == Bus.id)
+        .outerjoin(O, TicketSale.origin_stop_time_id      == O.id)
+        .outerjoin(D, TicketSale.destination_stop_time_id == D.id)
+        .filter(TicketSale.created_at.between(Start, End))
+        .order_by(TicketSale.id.asc())
+        .all()
+    )
+
+    tickets = [{
+        "id": r.id,
+        "bus":         r.bus,
+        "commuter": f"{r.first_name} {r.last_name}",
+        "origin": r.origin or "",
+        "destination": r.destination or "",
+        "fare": f"{float(r.price):.2f}",
+    } for r in rows]
+
+    return jsonify(
+        tickets=tickets,
+        total=f"{sum(float(r.price) for r in rows):.2f}"
+    ), 200
+
+# ──────────────────────────────  BUS CRUD  ──────────────────────────────
+@manager_bp.route("/buses", methods=["GET"])
+@require_role("manager")
+def list_buses():
+    """List all buses."""
+    try:
+        out = []
+        buses = Bus.query.order_by(Bus.identifier).all()
+        for b in buses:
+            latest = (
+                SensorReading.query
+                .filter_by(bus_id=b.id)
+                .order_by(SensorReading.timestamp.desc())
+                .first()
+            )
+            out.append({
+                "id":          b.id,
+                "identifier":  b.identifier,
+                "capacity":    b.capacity,
+                "description": b.description,
+                "last_seen":   latest.timestamp.isoformat() if latest else None,
+                "occupancy":   latest.total_count if latest else None,
+            })
+        return jsonify(out), 200
+    except Exception as e:
+        # This safely logs the error to your console and returns a JSON error
+        print(f"ERROR in /manager/buses: {e}")
+        return jsonify(error="Could not process the request to list buses."), 500
 
 
 
-# ───────────────────────── Route + Bus + Trip insights ─────────────────────────
 @manager_bp.route("/route-insights", methods=["GET"])
 @require_role("manager")
 def route_data_insights():
     """
     Query params
-      date=YYYY-MM-DD
-      bus_id=1
-      trip_id=3             # optional – you may use it later for stop-time filtering
-      from=HH:MM            # window start (bus’s local time)
-      to=HH:MM              # window end
-    Returns
-      {
-        "occupancy": [ {"time":"13:05","passengers":20}, … ],
-        "tickets":   [ {"time":"13:05","tickets":2,"revenue":30.00}, … ]
-      }
+      date=YYYY-MM-DD   # optional if trip_id provided
+      bus_id=1          # optional if trip_id provided
+      trip_id=3         # optional
+      from=HH:MM        # required if trip_id omitted
+      to=HH:MM          # required if trip_id omitted
     """
-    # ── parse & validate ─────────────────────────────────────────────────
-    try:
-        date_str  = request.args["date"]
-        bus_id    = int(request.args["bus_id"])
-        start     = request.args["from"]
-        end       = request.args["to"]
-    except (KeyError, ValueError):
-        return jsonify(error="date, bus_id, from, to are required"), 400
+    # ── parse & validate ────────────────────────────────────────────────
+    trip_id = request.args.get("trip_id", type=int)
+    if trip_id:
+        # derive everything from the trip record
+        trip = Trip.query.filter_by(id=trip_id).first()
+        if not trip:
+            return jsonify(error="trip not found"), 404
 
-    day        = datetime.strptime(date_str, "%Y-%m-%d").date()
-    window_from= datetime.combine(day,  datetime.strptime(start, "%H:%M").time())
-    window_to  = datetime.combine(day,  datetime.strptime(end,   "%H:%M").time())
+        bus_id = trip.bus_id
+        day    = trip.service_date
+        window_from = datetime.combine(day, trip.start_time)
+        window_to   = datetime.combine(day, trip.end_time)
+        meta = {
+            "trip_id":     trip_id,
+            "trip_number": trip.number,
+            "window_from": window_from.isoformat(),
+            "window_to":   window_to.isoformat(),
+        }
+
+    else:
+        # need explicit date, bus_id, from/to
+        date_str = request.args.get("date")
+        bus_id   = request.args.get("bus_id", type=int)
+        if not date_str or not bus_id:
+            return jsonify(error="date and bus_id are required when trip_id is omitted"), 400
+
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify(error="invalid date format"), 400
+
+        try:
+            start = request.args["from"]
+            end   = request.args["to"]
+        except KeyError:
+            return jsonify(error="from and to are required when trip_id is omitted"), 400
+
+        window_from = datetime.combine(day, datetime.strptime(start, "%H:%M").time())
+        window_to   = datetime.combine(day, datetime.strptime(end,   "%H:%M").time())
+        meta = {
+            "trip_id":     None,
+            "trip_number": None,
+            "window_from": window_from.isoformat(),
+            "window_to":   window_to.isoformat(),
+        }
 
     # ── SENSOR READINGS (one row per minute) ─────────────────────────────
     occ_rows = (
         db.session.query(
-            func.strftime('%H:%M', SensorReading.timestamp).label("hhmm"),
+            func.date_format(SensorReading.timestamp, '%H:%i').label("hhmm"),
             func.max(SensorReading.total_count).label("pax")
         )
         .filter(
@@ -67,15 +223,12 @@ def route_data_insights():
         .order_by("hhmm")
         .all()
     )
-    occupancy = [
-        {"time": r.hhmm, "passengers": int(r.pax)}
-        for r in occ_rows
-    ]
+    occupancy = [{"time": r.hhmm, "passengers": int(r.pax)} for r in occ_rows]
 
     # ── TICKET SALES (grouped per minute) ───────────────────────────────
     tix_rows = (
         db.session.query(
-            func.strftime('%H:%M', TicketSale.created_at).label("hhmm"),
+            func.date_format(TicketSale.created_at, '%H:%i').label("hhmm"),
             func.count(TicketSale.id).label("tickets"),
             func.sum(TicketSale.price).label("revenue")
         )
@@ -88,16 +241,76 @@ def route_data_insights():
         .all()
     )
     tickets = [
-        {
-          "time":    r.hhmm,
-          "tickets": int(r.tickets),
-          "revenue": float(r.revenue or 0)
-        }
+        {"time":    r.hhmm,
+         "tickets": int(r.tickets),
+         "revenue": float(r.revenue or 0)}
         for r in tix_rows
     ]
 
-    return jsonify(occupancy=occupancy, tickets=tickets), 200
+    return jsonify(occupancy=occupancy, tickets=tickets, meta=meta), 200
 
+@manager_bp.route("/metrics/tickets", methods=["GET"])
+@require_role("manager")
+def ticket_metrics():
+    """
+    GET /manager/metrics/tickets
+        ?from=2025-07-25&to=2025-07-31   # optional –- defaults to last 7 days
+        &bus_id=2                        # optional –- limit to one bus
+    Response:
+      {
+        "daily": [
+          {"date":"2025-07-25","tickets":42,"revenue":630.00},
+          …
+        ],
+        "total_tickets": 234,
+        "total_revenue": 3510.00
+      }
+    """
+    # ── time window ──────────────────────────────────────────────
+    today     = datetime.utcnow().date()
+    date_to   = datetime.strptime(request.args.get("to",   today.isoformat()), "%Y-%m-%d").date()
+    date_from = datetime.strptime(
+        request.args.get("from", (date_to - timedelta(days=6)).isoformat()),
+        "%Y-%m-%d"
+    ).date()
+
+    # add 1 day so the BETWEEN is inclusive of the end-date’s 23:59
+    window_start = datetime.combine(date_from, datetime.min.time())
+    window_end   = datetime.combine(date_to + timedelta(days=1), datetime.min.time())
+
+    bus_id = request.args.get("bus_id", type=int)
+
+    # ── aggregate ────────────────────────────────────────────────
+    qs = (
+        db.session.query(
+            func.date_format(TicketSale.created_at, '%Y-%m-%d').label("d"),
+            func.count(TicketSale.id).label("tickets"),
+            func.sum(TicketSale.price).label("revenue")
+        )
+        .filter(TicketSale.created_at.between(window_start, window_end))
+    )
+    if bus_id:
+        qs = qs.filter(TicketSale.bus_id == bus_id)
+
+    rows = qs.group_by("d").order_by("d").all()
+
+    daily          = []
+    total_tickets  = 0
+    total_revenue  = 0.0
+    for r in rows:
+        daily.append({
+            "date":    r.d,
+            "tickets": int(r.tickets),
+            "revenue": float(r.revenue or 0)
+        })
+        total_tickets += int(r.tickets)
+        total_revenue += float(r.revenue or 0)
+
+    return jsonify(
+        daily          = daily,
+        total_tickets  = total_tickets,
+        total_revenue  = round(total_revenue, 2)
+    ), 200
 
 @manager_bp.route("/routes", methods=["GET"])
 @require_role("manager")
@@ -305,59 +518,8 @@ def create_stop_time():
     db.session.commit()
     return jsonify(id=st.id), 201
 
-# ──────────────────────────────  BUS CRUD  ──────────────────────────────
-@manager_bp.route("/buses", methods=["POST"])
-@require_role("manager")
-def create_bus():
-    """
-    Body: { "identifier": "bus-01", "capacity": 40, "description": "Hino RK1J" }
-    """
-    data = request.get_json() or {}
-    ident = data.get("identifier", "").strip()
-    if not ident:
-        return jsonify(error="identifier is required"), 400
-
-    bus = Bus(
-        identifier  = ident,
-        capacity    = data.get("capacity"),
-        description = data.get("description", "").strip() or None,
-    )
-    db.session.add(bus)
-    db.session.commit()
-    return jsonify(id=bus.id, identifier=bus.identifier), 201
 
 
-# routes/manager.py  – inside list_buses()
-@manager_bp.route("/buses", methods=["GET"])
-@require_role("manager")
-def list_buses():
-    route_id = request.args.get("route_id", type=int)
-
-    q = Bus.query
-    if route_id is not None:
-        q = q.join(Trip, Bus.id == Trip.bus_id).filter(Trip.route_id == route_id)
-
-    out = []
-    for b in q.order_by(Bus.identifier).all():
-        latest = (
-            SensorReading.query
-                .filter_by(bus_id=b.id)
-                .order_by(SensorReading.timestamp.desc())
-                .first()
-        )
-        out.append({
-            "id":         b.id,           # ← numeric PK, not the string identifier
-            "identifier": b.identifier,   # ← what the picker will show
-            # keep extra fields if you still need them elsewhere
-            "capacity":   b.capacity,
-            "description":b.description,
-            "last_seen":  latest.timestamp.isoformat() if latest else None,
-            "occupancy":  latest.total_count if latest else None,
-        })
-    return jsonify(out), 200
-
-
-# ──────────────────────────────  QR TEMPLATES  ──────────────────────────
 @manager_bp.route("/qr-templates", methods=["POST"])
 @require_role("manager")
 def upload_qr():
@@ -505,3 +667,4 @@ def list_bus_readings(device_id: str):
         }
         for r in readings
     ]), 200
+
