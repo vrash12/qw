@@ -22,6 +22,7 @@ from models.ticket_stop import TicketStop
 from models.device_token import DeviceToken
 from push import send_expo_push
 from mqtt_ingest import publish 
+from typing import Optional
 
 
 pao_bp = Blueprint('pao', __name__, url_prefix='/pao')
@@ -67,7 +68,7 @@ def pickup_request():
     )
 
     return jsonify(success=True), 201
-def _void_ticket(ticket: TicketSale, reason: str | None):
+def _void_ticket(ticket: TicketSale, reason: Optional[str]):
     ticket.voided      = True
     ticket.paid        = False           # cannot stay paid once voided
     ticket.void_reason = (reason or "").strip() or None
