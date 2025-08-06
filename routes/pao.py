@@ -223,7 +223,7 @@ def list_commuters():
 
 
 # ── new helper, reuse everywhere we need the current bus
-def _current_bus_id() -> int | None:
+def _current_bus_id() -> Optional[int]:
     return getattr(g.user, "assigned_bus_id", None)
 
 # --------------------------------------------------------------------
