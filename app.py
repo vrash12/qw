@@ -1,4 +1,4 @@
-# backend/main.py
+# backend/app.py
 import os
 from flask import Flask, jsonify
 from config import Config
@@ -41,6 +41,10 @@ def create_app():
 
         # start the MQTT listener
         start_in_background()
+
+    @app.route("/")
+    def health_check():
+        return jsonify(status="ok"), 200
 
     # global error handler
     @app.errorhandler(Exception)
