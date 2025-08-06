@@ -1,4 +1,4 @@
-# routes/tickets.py  (register this blueprint in app.py)
+#backend/models/tickets.py
 import uuid
 from datetime import datetime
 

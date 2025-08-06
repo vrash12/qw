@@ -21,12 +21,14 @@ from routes.tickets_static import jpg_name, QR_PATH
 from models.ticket_stop import TicketStop  
 from models.device_token import DeviceToken
 from push import send_expo_push
-
+from mqtt_ingest import publish 
 
 
 pao_bp = Blueprint('pao', __name__, url_prefix='/pao')
 
 from models.bus import Bus
+
+
 
 @pao_bp.route('/pickup-request', methods=['POST'])
 @require_role('commuter')
@@ -430,18 +432,33 @@ def mark_ticket_paid(ticket_id):
     if not ticket:
         current_app.logger.debug(f" → ticket not found id={ticket_id}")
         return jsonify(error="ticket not found"), 404
-    
+
     current_app.logger.debug(f" → before update: ticket.paid={ticket.paid}")
     ticket.paid = 1 if paid else 0
     try:
         db.session.commit()
-        current_app.logger.debug(f" ← after commit: ticket.paid={ticket.paid}")
+
+        # Recompute today's total paid tickets for this bus
+        from sqlalchemy import func
+        from datetime import date
+
+        cnt = (
+            TicketSale.query
+            .filter_by(bus_id=ticket.bus_id, paid=True)
+            .filter(func.date(TicketSale.created_at) == date.today())
+            .count()
+        )
+
+        # Publish the updated count
+        topic = f"device/{ticket.bus.identifier}/fare"
+        publish(topic, {"paid": cnt})
+        current_app.logger.info(f"MQTT fare update → {topic}: {cnt}")
+
         return jsonify(id=ticket.id, paid=bool(ticket.paid)), 200
+
     except Exception as e:
         current_app.logger.exception("!! mark_ticket_paid commit failed")
         return jsonify(error=str(e)), 500
-
-
 # ─── Read a single ticket (receipt) ───────────────────────
 @pao_bp.route('/tickets/<int:ticket_id>', methods=['GET'])
 @require_role('pao')

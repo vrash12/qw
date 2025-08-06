@@ -1,11 +1,13 @@
-#backend/config.py
+# backend/config.py
 import os
 
 class Config:
-    DEBUG = True  # Changed from Debug to DEBUG
+    DEBUG = True
     SECRET_KEY = os.environ.get('SECRET_KEY', 'dev_secret')
+
     SQLALCHEMY_DATABASE_URI = os.environ.get(
         'DATABASE_URL',
-        'mysql+pymysql://root@localhost:3306/pgt'
+        'mysql+pymysql://u782952718_eee:Vanrodolf123.@srv667.hstgr.io/u782952718_eee'
     )
+
     SQLALCHEMY_TRACK_MODIFICATIONS = False

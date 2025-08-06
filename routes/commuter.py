@@ -1,3 +1,5 @@
+# routes/commuter.py  (add at the very bottom)
+
 import os
 from datetime import datetime
 
@@ -14,7 +16,6 @@ from models.bus import Bus
 from models.user import User
 
 commuter_bp = Blueprint("commuter", __name__, url_prefix="/commuter")
-# routes/commuter.py  (add at the very bottom)
 
 @commuter_bp.route("/dashboard", methods=["GET"])
 @require_role("commuter")

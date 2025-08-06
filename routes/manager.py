@@ -92,6 +92,7 @@ def tickets_for_day():
         db.session.query(
             TicketSale.id,
             TicketSale.price,
+            TicketSale.paid, 
             User.first_name,
             User.last_name,
             Bus.identifier.label("bus"),
@@ -114,6 +115,7 @@ def tickets_for_day():
         "origin": r.origin or "",
         "destination": r.destination or "",
         "fare": f"{float(r.price):.2f}",
+        "paid":        bool(r.paid),     #  ← NEW
     } for r in rows]
 
     return jsonify(
