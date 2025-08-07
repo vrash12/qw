@@ -21,13 +21,13 @@ from routes.tickets_static import tickets_bp
 
 # util (optional import, not strictly necessary here)
 from utils.push            import send_push, push_to_bus
-
-# start your MQTT ingest in the background
+from flask_cors import CORS
 from mqtt_ingest import start_in_background
 
 
 def create_app():
     app = Flask(__name__)
+    CORS(app, resources={r"/*": {"origins": "*"}})
     app.config.from_object(Config)
 
     # initialize extensions
