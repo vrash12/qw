@@ -6,6 +6,7 @@ from functools import wraps
 from datetime import datetime, timedelta
 import jwt
 import os
+from sqlalchemy.exc import OperationalError
 
 
 auth_bp = Blueprint('auth', __name__)
@@ -42,16 +43,22 @@ def signup():
     return jsonify({'message': 'User registered successfully'}), 201
 @auth_bp.route('/login', methods=['POST'])
 def login():
-    # 1. Grab the JSON payload
-    data = request.get_json()
-    print("🔍 DEBUG incoming JSON:", data)
-
-    # 2. Check for required fields
-    if not data or 'username' not in data or 'password' not in data:
-        print("🔍 DEBUG missing username or password fields")
+    data = request.get_json() or {}
+    if 'username' not in data or 'password' not in data:
         return jsonify({'error': 'Missing username or password'}), 400
 
-    # 3. Lookup user in DB
+    def _get_user():
+        return User.query.filter_by(username=data['username']).first()
+
+    try:
+        user = _get_user()
+    except OperationalError as e:
+        current_app.logger.warning("DB connection dropped; retrying once… %s", e)
+        db.session.remove()
+        db.engine.dispose()          # throw away dead pool connections
+        user = _get_user()
+
+
     user = User.query.filter_by(username=data['username']).first()
     print("🔍 DEBUG found user object:", user)
 

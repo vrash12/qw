@@ -1,3 +1,4 @@
+#backend/routes/manager.py
 from flask import Blueprint, request, jsonify, send_from_directory, current_app
 import os
 import uuid
@@ -311,9 +312,12 @@ def list_stop_times():
     if not trip_id:
         return jsonify(error="trip_id is required"), 400
 
+    # Use DISTINCT to avoid duplicates and proper ordering
     sts = (
-        StopTime.query.filter_by(trip_id=trip_id)
-        .order_by(StopTime.seq.asc(), StopTime.id.asc())
+        db.session.query(StopTime)
+        .filter_by(trip_id=trip_id)
+        .distinct(StopTime.stop_name, StopTime.arrive_time, StopTime.depart_time)
+        .order_by(StopTime.seq.asc(), StopTime.arrive_time.asc(), StopTime.id.asc())
         .all()
     )
 
@@ -325,13 +329,13 @@ def list_stop_times():
                     "stop_name": st.stop_name,
                     "arrive_time": st.arrive_time.strftime("%H:%M"),
                     "depart_time": st.depart_time.strftime("%H:%M"),
+                    "seq": st.seq,  # Include sequence for better sorting
                 }
                 for st in sts
             ]
         ),
         200,
     )
-
 
 @manager_bp.route("/trips", methods=["POST"])
 @require_role("manager")

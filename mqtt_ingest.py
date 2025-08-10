@@ -10,9 +10,9 @@ import ssl
 import time
 
 import paho.mqtt.client as mqtt
-from sqlalchemy import create_engine, func
+from sqlalchemy import create_engine, func, event
 from sqlalchemy.orm import sessionmaker, scoped_session
-
+from datetime import datetime, timezone, timedelta
 from config import Config
 
 # ─── MODEL IMPORTS ────────────────────────────────────────────────────
@@ -41,15 +41,29 @@ MQTT_USER     = "vanrodolf"
 MQTT_PASS     = "Vanrodolf123."
 TOPIC_PEOPLE  = "device/+/people"
 
+
 # ─── DB SETUP ─────────────────────────────────────────────────────────
 engine = create_engine(Config.SQLALCHEMY_DATABASE_URI, pool_pre_ping=True)
+
+# set the session time zone for every new DB connection
+from sqlalchemy import event
+@event.listens_for(engine, "connect")
+def _set_manila_timezone(dbapi_conn, _):
+    cur = dbapi_conn.cursor()
+    try:
+        cur.execute("SET time_zone = '+08:00'")
+    finally:
+        cur.close()
+
+# create the Session **after** the listener is in place
+from sqlalchemy.orm import sessionmaker, scoped_session
 Session = scoped_session(sessionmaker(bind=engine, expire_on_commit=False))
 
-# ─── MQTT CLIENT SETUP ────────────────────────────────────────────────
-# Choose WebSocket transport if USE_WS
+
 transport = "websockets" if USE_WS else "tcp"
 client = mqtt.Client(client_id="pgt-ingest", transport=transport)
 client.username_pw_set(MQTT_USER, MQTT_PASS)
+
 
 # Configure TLS
 ssl_ctx = ssl.create_default_context()
@@ -72,6 +86,10 @@ def on_connect(c, _u, _f, rc):
         c.subscribe([(TOPIC_PEOPLE, 1)])
     else:
         logging.error("❌ MQTT connect failed rc=%s", rc)
+def now_ph():
+    # store civil Manila time; if you prefer UTC, use datetime.now(timezone.utc)
+    return datetime.utcnow() + timedelta(hours=8)
+
 
 def on_message(_c, _u, msg):
     # only handle /people messages
@@ -96,10 +114,11 @@ def on_message(_c, _u, msg):
         _last_totals[bus.id] = total
 
         reading = SensorReading(
-            in_count    = int(payload.get("in",    0)),
-            out_count   = int(payload.get("out",   0)),
-            total_count = total,
-            bus_id      = bus.id
+            in_count=int(payload.get("in", 0)),
+            out_count=int(payload.get("out", 0)),
+            total_count=total,
+            bus_id=bus.id,
+            timestamp=now_ph(),   # <-- set explicitly
         )
         sess.add(reading)
         sess.commit()

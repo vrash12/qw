@@ -23,6 +23,7 @@ from routes.tickets_static import tickets_bp
 from utils.push            import send_push, push_to_bus
 from flask_cors import CORS
 from mqtt_ingest import start_in_background
+from sqlalchemy import event
 
 
 def create_app():
@@ -37,6 +38,14 @@ def create_app():
     with app.app_context():
         # ensure all models are registered
         # (Flask-Migrate will pick them up on next `flask db migrate`)
+        @event.listens_for(db.engine, "connect")
+        def _set_manila_timezone(dbapi_conn, _):
+            cur = dbapi_conn.cursor()
+            try:
+                cur.execute("SET time_zone = '+08:00'")
+            finally:
+                cur.close()
+
         _ = (User, Bus, TicketSale, DeviceToken)
 
         # start the MQTT listener
