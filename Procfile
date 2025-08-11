@@ -1,1 +1,1 @@
-web: gunicorn -w 2 -k gthread -t 0 -b 0.0.0.0:$PORT wsgi:app
+web: gunicorn -w 4 -b 0.0.0.0:8080 app:app
