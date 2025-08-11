@@ -1,1 +1,1 @@
-web: gunicorn backend.main:create_app\(\)
+web: gunicorn -w 2 -k gthread -t 0 -b 0.0.0.0:$PORT wsgi:app

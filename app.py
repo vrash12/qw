@@ -26,18 +26,17 @@ from mqtt_ingest import start_in_background
 from sqlalchemy import event
 
 
+
+
 def create_app():
     app = Flask(__name__)
     CORS(app, resources={r"/*": {"origins": "*"}})
     app.config.from_object(Config)
 
-    # initialize extensions
     db.init_app(app)
     migrate.init_app(app, db)
 
     with app.app_context():
-        # ensure all models are registered
-        # (Flask-Migrate will pick them up on next `flask db migrate`)
         @event.listens_for(db.engine, "connect")
         def _set_manila_timezone(dbapi_conn, _):
             cur = dbapi_conn.cursor()
@@ -48,28 +47,23 @@ def create_app():
 
         _ = (User, Bus, TicketSale, DeviceToken)
 
-        # start the MQTT listener
-        start_in_background()
+        # 🚫 Do NOT auto-start MQTT in web workers
+        # start_in_background()
 
     @app.route("/")
     def health_check():
         return jsonify(status="ok"), 200
 
-    # global error handler
     @app.errorhandler(Exception)
     def handle_any_error(e):
         if isinstance(e, HTTPException):
             return jsonify(error=e.description), e.code
         return jsonify(error=str(e)), 500
 
-    # register blueprints
-    app.register_blueprint(auth_bp,           url_prefix='/auth')
-    app.register_blueprint(commuter_bp,       url_prefix='/commuter')
-    app.register_blueprint(pao_bp,            url_prefix='/pao')
-    app.register_blueprint(manager_bp,        url_prefix='/manager')
-    app.register_blueprint(tickets_bp,        url_prefix='/tickets')
-
+    app.register_blueprint(auth_bp,     url_prefix="/auth")
+    app.register_blueprint(commuter_bp, url_prefix="/commuter")
+    app.register_blueprint(pao_bp,      url_prefix="/pao")
+    app.register_blueprint(manager_bp,  url_prefix="/manager")
+    app.register_blueprint(tickets_bp,  url_prefix="/tickets")
     return app
 
-if __name__ == "__main__":
-    create_app().run(host="0.0.0.0", port=5000, debug=True)

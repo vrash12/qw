@@ -1,3 +1,4 @@
+#backend/routes/commuter.py
 from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, g, current_app, url_for
 from sqlalchemy import func
@@ -11,9 +12,90 @@ from models.ticket_sale import TicketSale
 from models.bus import Bus
 from models.user import User
 from utils.qr import build_qr_payload
+from models.ticket_stop import TicketStop
+from models.ticket_stop import TicketStop
+from sqlalchemy.orm import joinedload
+from flask import send_from_directory, redirect
+
 
 commuter_bp = Blueprint("commuter", __name__, url_prefix="/commuter")
 
+
+@commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
+def qr_image_for_ticket(ticket_id: int):
+    t = TicketSale.query.get_or_404(ticket_id)
+
+    # figure out which static file matches this ticket (your existing logic)
+    if t.passenger_type == "discount":
+        base = round(float(t.price) / 0.8) if t.price else 0
+        prefix = "discount"
+    else:
+        base = int(t.price)
+        prefix = "regular"
+
+    filename = f"{prefix}_{base}.jpg"
+
+    # Option A: redirect to the static asset URL
+    return redirect(url_for("static", filename=f"qr/{filename}", _external=True), code=302)
+
+
+@commuter_bp.route("/tickets/<int:ticket_id>", methods=["GET"])
+@require_role("commuter")
+def commuter_get_ticket(ticket_id: int):
+    # Only allow the logged-in commuter to view their ticket
+    t = (
+        TicketSale.query.options(joinedload(TicketSale.user))
+        .filter(TicketSale.id == ticket_id, TicketSale.user_id == g.user.id)
+        .first()
+    )
+    if not t:
+        return jsonify(error="ticket not found"), 404
+
+    # Resolve names (works whether IDs point to StopTime or TicketStop)
+    if t.origin_stop_time:
+        origin_name = t.origin_stop_time.stop_name
+    else:
+        ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+        origin_name = ts.stop_name if ts else ""
+
+    if t.destination_stop_time:
+        destination_name = t.destination_stop_time.stop_name
+    else:
+        tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+        destination_name = tsd.stop_name if tsd else ""
+
+    # Optional QR (same logic you use elsewhere)
+    if t.passenger_type == "discount":
+        base = round(float(t.price) / 0.8) if t.price else 0
+        prefix = "discount"
+    else:
+        base = int(t.price)
+        prefix = "regular"
+    filename = f"{prefix}_{base}.jpg"
+    payload = build_qr_payload(
+        t,
+        origin_name=origin_name,
+        destination_name=destination_name,
+    )
+    qr_link = url_for("commuter.qr_image_for_ticket", ticket_id=t.id, _external=True)
+
+    return jsonify({
+        "id": t.id,
+        "referenceNo": t.reference_no,
+        "date": t.created_at.strftime("%B %d, %Y"),
+        "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+        "origin": origin_name,
+        "destination": destination_name,
+        "passengerType": t.passenger_type.title(),
+        "commuter": f"{t.user.first_name} {t.user.last_name}",
+        "fare": f"{float(t.price):.2f}",
+        "paid": bool(t.paid),
+
+        # 👇 important
+        "qr": payload,          # JSON string (contains schema, ids, names, link)
+        "qr_link": qr_link,     # plain URL — scanners will auto-open the image
+        "qr_url": qr_url,       # same static image you already use inside the app
+    }), 200
 
 @commuter_bp.route("/dashboard", methods=["GET"])
 @require_role("commuter")
@@ -331,66 +413,123 @@ def vehicle_location():
         200,
     )
 
-
 @commuter_bp.route("/tickets/mine", methods=["GET"])
 @require_role("commuter")
 def my_receipts():
-    days = request.args.get("days")
-    current_app.logger.debug(
-        f"[Commuter:tickets/mine] ENTER user={g.user.id!r} days={days!r}"
-    )
-    try:
-        qs = TicketSale.query.filter_by(user_id=g.user.id)
-        current_app.logger.debug("  → Base query constructed")
-        if days in {"7", "30"}:
-            cutoff = datetime.utcnow() - timedelta(days=int(days))
-            qs = qs.filter(TicketSale.created_at >= cutoff)
-            current_app.logger.debug(
-                f"  → Applied date filter: created_at >= {cutoff.isoformat()}"
-            )
+    """
+    GET /commuter/tickets/mine
+      Query params:
+        page=1
+        page_size=5
+        date=YYYY-MM-DD       # exact calendar day
+        days=7|30             # fallback range if 'date' not provided
+        bus_id=<int>          # filter tickets by bus (via Trip.bus_id)
+        light=1               # keep for compatibility
+    """
+    from datetime import date as _date
 
-        tickets = qs.order_by(TicketSale.created_at.desc()).all()
-        current_app.logger.debug(f"  → Retrieved {len(tickets)} tickets from DB")
+    # ── params
+    page      = max(1, request.args.get("page", type=int, default=1))
+    page_size = max(1, request.args.get("page_size", type=int, default=5))
+    date_str  = request.args.get("date")
+    days      = request.args.get("days")
+    bus_id    = request.args.get("bus_id", type=int)
+    light     = (request.args.get("light") or "").lower() in {"1", "true", "yes"}
 
-        out = []
-        for t in tickets:
-            if t.passenger_type == "discount":
-                base = round(float(t.price) / 0.8) if t.price else 0
-                disc = True
-            else:
-                base = int(t.price)
-                disc = False
-
-            prefix = "discount" if disc else "regular"
-            filename = f"{prefix}_{base}.jpg"
-            qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
-            current_app.logger.debug(f"[Commuter:tickets/mine] Ticket {t.id} → {filename}")
-
-            payload = build_qr_payload(t)
-            out.append(
-                {
-                    "id": t.id,
-                    "referenceNo": t.reference_no,
-                    "date": t.created_at.strftime("%B %d, %Y"),
-                    "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-                    "origin": t.origin_stop_time.stop_name if t.origin_stop_time else "",
-                    "destination": t.destination_stop_time.stop_name if t.destination_stop_time else "",
-                    "passengerType": t.passenger_type.title(),
-                    "commuter": f"{t.user.first_name} {t.user.last_name}",
-                    "fare": f"{float(t.price):.2f}",
-                    "paid": bool(t.paid),
-                    "qr_url": qr_url,
-                    "qr": str(t.ticket_uuid),
-                }
-            )
-
-        current_app.logger.debug(
-            f"[Commuter:tickets/mine] EXIT returning {len(out)} records"
+    # ── base query: eager-load to avoid N+1s
+    qs = (
+        db.session.query(TicketSale)
+        .options(
+            joinedload(TicketSale.user),
+            joinedload(TicketSale.origin_stop_time),
+            joinedload(TicketSale.destination_stop_time),
         )
-        return jsonify(out), 200
-    except Exception as e:
-        current_app.logger.exception("[Commuter:tickets/mine] ERROR generating receipts")
-        return jsonify(error=str(e)), 500
+        .filter(TicketSale.user_id == g.user.id)
+    )
+
+    # ── date filter (exact day)
+    if date_str:
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify(error="date must be YYYY-MM-DD"), 400
+        # Use DB's DATE() to avoid timezone mismatch headaches
+        qs = qs.filter(func.date(TicketSale.created_at) == day)
+    elif days in {"7", "30"}:
+        cutoff = datetime.utcnow() - timedelta(days=int(days))
+        qs = qs.filter(TicketSale.created_at >= cutoff)
+
+    # ── bus filter (via Trip.bus_id). If your TicketSale has bus_id, use that; else join Trip.
+    if bus_id:
+        if hasattr(TicketSale, "bus_id"):
+            qs = qs.filter(TicketSale.bus_id == bus_id)
+        else:
+            qs = qs.join(Trip, TicketSale.trip_id == Trip.id).filter(Trip.bus_id == bus_id)
+
+    total = qs.count()
+
+    rows = (
+        qs.order_by(TicketSale.created_at.desc())
+          .offset((page - 1) * page_size)
+          .limit(page_size)
+          .all()
+    )
+
+    items = []
+    for t in rows:
+        # choose QR asset
+        if t.passenger_type == "discount":
+            base = round(float(t.price) / 0.8) if t.price else 0
+            prefix = "discount"
+        else:
+            base = int(t.price)
+            prefix = "regular"
+        filename = f"{prefix}_{base}.jpg"
+        qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
+
+        # resolve stop names
+        if t.origin_stop_time:
+            origin_name = t.origin_stop_time.stop_name
+        else:
+            ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+            origin_name = ts.stop_name if ts else ""
+
+        if t.destination_stop_time:
+            destination_name = t.destination_stop_time.stop_name
+        else:
+            tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+            destination_name = tsd.stop_name if tsd else ""
+
+        payload = build_qr_payload(
+            t,
+            origin_name=origin_name,
+            destination_name=destination_name,
+        )
+        qr_link = url_for("commuter.qr_image_for_ticket", ticket_id=t.id, _external=True)
+
+        items.append({
+            "id": t.id,
+            "referenceNo": t.reference_no,
+            "date": t.created_at.strftime("%B %d, %Y"),
+            "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+            "origin": origin_name,
+            "destination": destination_name,
+            "passengerType": t.passenger_type.title(),
+            "commuter": f"{t.user.first_name} {t.user.last_name}",
+            "fare": f"{float(t.price):.2f}",
+            "paid": bool(t.paid),
+            "qr_url": qr_url,
+            "qr": payload if not light else payload,  # keep field for app compatibility
+            "qr_link": qr_link,
+        })
+
+    return jsonify(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=(page * page_size) < total,
+    ), 200
 
 
 @commuter_bp.route("/trips/<int:trip_id>", methods=["GET"])
