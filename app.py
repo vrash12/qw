@@ -60,10 +60,14 @@ def create_app():
             return jsonify(error=e.description), e.code
         return jsonify(error=str(e)), 500
 
-    app.register_blueprint(auth_bp,     url_prefix="/auth")
+    app.register_blueprint(auth_bp)
     app.register_blueprint(commuter_bp, url_prefix="/commuter")
     app.register_blueprint(pao_bp,      url_prefix="/pao")
     app.register_blueprint(manager_bp,  url_prefix="/manager")
     app.register_blueprint(tickets_bp,  url_prefix="/tickets")
+    print("\n=== URL MAP ===")
+    for r in app.url_map.iter_rules():
+        print(r.rule, sorted(r.methods))
+    print("=== END MAP ===\n")
     return app
 

@@ -13,7 +13,6 @@ from models.bus import Bus
 from models.user import User
 from utils.qr import build_qr_payload
 from models.ticket_stop import TicketStop
-from models.ticket_stop import TicketStop
 from sqlalchemy.orm import joinedload
 from flask import send_from_directory, redirect
 
