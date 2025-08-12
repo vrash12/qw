@@ -10,7 +10,7 @@ from models.user          import User
 from models.bus           import Bus
 from models.ticket_sale   import TicketSale
 from models.device_token  import DeviceToken   # <-- new
-
+from routes.tests_api_bp import tests_bp
 # import your blueprints
 from routes.auth          import auth_bp
 from routes.commuter      import commuter_bp
@@ -65,6 +65,7 @@ def create_app():
     app.register_blueprint(pao_bp,      url_prefix="/pao")
     app.register_blueprint(manager_bp,  url_prefix="/manager")
     app.register_blueprint(tickets_bp,  url_prefix="/tickets")
+    app.register_blueprint(tests_bp, url_prefix="/tests-api")
     print("\n=== URL MAP ===")
     for r in app.url_map.iter_rules():
         print(r.rule, sorted(r.methods))
