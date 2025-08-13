@@ -17,12 +17,33 @@ from models.sensor_reading import SensorReading
 from models.ticket_sale import TicketSale
 from models.user import User
 from models.ticket_stop import TicketStop
+from datetime import timezone
+from models.trip_metric import TripMetric  
 
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 manager_bp = Blueprint("manager", __name__)
 
+
+def _active_trip_for(bus_id: int, ts: datetime):
+    """Find the trip whose time window contains ts (handles past-midnight windows)."""
+    # Check day-of-ts and previous day (for trips that spill after midnight)
+    day = ts.date()
+    prev = (ts - timedelta(days=1)).date()
+    candidates = (
+        Trip.query.filter(Trip.bus_id == bus_id, Trip.service_date.in_([day, prev]))
+        .order_by(Trip.start_time.asc())
+        .all()
+    )
+    for t in candidates:
+        start = datetime.combine(t.service_date, t.start_time)
+        end   = datetime.combine(t.service_date, t.end_time)
+        if t.end_time <= t.start_time:  # past midnight
+            end = end + timedelta(days=1)
+        if start <= ts < end:
+            return t
+    return None
 
 @manager_bp.route("/trips/<int:trip_id>", methods=["PATCH"])
 @require_role("manager")
@@ -149,6 +170,8 @@ def list_buses():
 @require_role("manager")
 def route_data_insights():
     trip_id = request.args.get("trip_id", type=int)
+    use_snapshot = False
+
     if trip_id:
         trip = Trip.query.filter_by(id=trip_id).first()
         if not trip:
@@ -158,6 +181,27 @@ def route_data_insights():
         day = trip.service_date
         window_from = datetime.combine(day, trip.start_time)
         window_to = datetime.combine(day, trip.end_time)
+        if trip.end_time <= trip.start_time:
+            window_to = window_to + timedelta(days=1)
+
+        window_end_excl = window_to + timedelta(minutes=1)
+
+        # If trip is over (give a 2-min grace) and we have a snapshot, use it
+        if datetime.utcnow() > window_to + timedelta(minutes=2):
+            snap = TripMetric.query.filter_by(trip_id=trip_id).first()
+            if snap:
+                use_snapshot = True
+                metrics = dict(
+                    avg_pax=snap.avg_pax, peak_pax=snap.peak_pax,
+                    boarded=snap.boarded, alighted=snap.alighted,
+                    start_pax=snap.start_pax, end_pax=snap.end_pax,
+                    net_change=snap.end_pax - snap.start_pax,
+                )
+            else:
+                metrics = None
+        else:
+            metrics = None
+
         meta = {
             "trip_id": trip_id,
             "trip_number": trip.number,
@@ -165,6 +209,7 @@ def route_data_insights():
             "window_to": window_to.isoformat(),
         }
     else:
+        # ad-hoc window
         date_str = request.args.get("date")
         bus_id = request.args.get("bus_id", type=int)
         if not date_str or not bus_id:
@@ -176,55 +221,70 @@ def route_data_insights():
             return jsonify(error="invalid date format"), 400
 
         try:
-            start = request.args["from"]
-            end = request.args["to"]
+            start = request.args["from"]; end = request.args["to"]
         except KeyError:
             return jsonify(error="from and to are required when trip_id is omitted"), 400
 
         window_from = datetime.combine(day, datetime.strptime(start, "%H:%M").time())
-        window_to = datetime.combine(day, datetime.strptime(end, "%H:%M").time())
+        window_to   = datetime.combine(day, datetime.strptime(end, "%H:%M").time())
+        if window_to <= window_from:
+            window_to = window_to + timedelta(days=1)
+        window_end_excl = window_to + timedelta(minutes=1)
+
         meta = {
-            "trip_id": None,
-            "trip_number": None,
+            "trip_id": None, "trip_number": None,
             "window_from": window_from.isoformat(),
             "window_to": window_to.isoformat(),
         }
+        metrics = None
 
+    # Build the time series (1-minute buckets, max pax per minute + in/out sums)
     occ_rows = (
         db.session.query(
             func.date_format(SensorReading.timestamp, "%H:%i").label("hhmm"),
             func.max(SensorReading.total_count).label("pax"),
+            func.sum(SensorReading.in_count).label("ins"),
+            func.sum(SensorReading.out_count).label("outs"),
         )
         .filter(
             SensorReading.bus_id == bus_id,
-            SensorReading.timestamp.between(window_from, window_to),
+            SensorReading.timestamp >= window_from,
+            SensorReading.timestamp < window_end_excl,
         )
         .group_by("hhmm")
         .order_by("hhmm")
         .all()
     )
-    occupancy = [{"time": r.hhmm, "passengers": int(r.pax)} for r in occ_rows]
-
-    tix_rows = (
-        db.session.query(
-            func.date_format(TicketSale.created_at, "%H:%i").label("hhmm"),
-            func.count(TicketSale.id).label("tickets"),
-            func.sum(TicketSale.price).label("revenue"),
-        )
-        .filter(
-            TicketSale.bus_id == bus_id,
-            TicketSale.created_at.between(window_from, window_to),
-        )
-        .group_by("hhmm")
-        .order_by("hhmm")
-        .all()
-    )
-    tickets = [
-        {"time": r.hhmm, "tickets": int(r.tickets), "revenue": float(r.revenue or 0)}
-        for r in tix_rows
+    series = [
+        {
+            "time": r.hhmm,
+            "passengers": int(r.pax or 0),
+            "in": int(r.ins or 0),
+            "out": int(r.outs or 0),
+        }
+        for r in occ_rows
     ]
 
-    return jsonify(occupancy=occupancy, tickets=tickets, meta=meta), 200
+    # Compute metrics if no snapshot (or ad-hoc window)
+    if not metrics:
+        pax_values = [p["passengers"] for p in series]
+        avg_pax  = round(sum(pax_values) / len(pax_values)) if pax_values else 0
+        peak_pax = max(pax_values) if pax_values else 0
+        boarded  = sum(p["in"] for p in series)
+        alighted = sum(p["out"] for p in series)
+        start_pax = pax_values[0] if pax_values else 0
+        end_pax   = pax_values[-1] if pax_values else 0
+        metrics = {
+            "avg_pax":   avg_pax,
+            "peak_pax":  peak_pax,
+            "boarded":   boarded,
+            "alighted":  alighted,
+            "start_pax": start_pax,
+            "end_pax":   end_pax,
+            "net_change": end_pax - start_pax,
+        }
+
+    return jsonify(occupancy=series, meta=meta, metrics=metrics, snapshot=use_snapshot), 200
 
 
 @manager_bp.route("/metrics/tickets", methods=["GET"])
@@ -517,7 +577,6 @@ def list_fare_segments():
         200,
     )
 
-
 @manager_bp.route("/sensor-readings", methods=["POST"])
 @require_role("manager")
 def create_sensor_reading():
@@ -535,12 +594,20 @@ def create_sensor_reading():
         return jsonify(error="Invalid deviceId: Bus not found"), 404
 
     try:
+        now = datetime.utcnow()  # make timestamp explicit
         reading = SensorReading(
             in_count=int(data["in"]),
             out_count=int(data["out"]),
             total_count=int(data["total"]),
             bus_id=bus.id,
+            timestamp=now,
         )
+
+        # Tag the reading to the currently active trip, if any
+        active = _active_trip_for(bus.id, now)
+        if active:
+            reading.trip_id = active.id
+
         db.session.add(reading)
         db.session.commit()
         return jsonify(id=reading.id, timestamp=reading.timestamp.isoformat()), 201

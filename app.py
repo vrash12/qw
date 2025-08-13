@@ -25,7 +25,7 @@ from flask_cors import CORS
 from mqtt_ingest import start_in_background
 from sqlalchemy import event
 
-
+from tasks.snap_trips import snap_finished_trips
 
 
 def create_app():
@@ -35,6 +35,8 @@ def create_app():
 
     db.init_app(app)
     migrate.init_app(app, db)
+
+
 
     with app.app_context():
         @event.listens_for(db.engine, "connect")
@@ -66,9 +68,11 @@ def create_app():
     app.register_blueprint(manager_bp,  url_prefix="/manager")
     app.register_blueprint(tickets_bp,  url_prefix="/tickets")
     app.register_blueprint(tests_bp, url_prefix="/tests-api")
-    print("\n=== URL MAP ===")
-    for r in app.url_map.iter_rules():
-        print(r.rule, sorted(r.methods))
-    print("=== END MAP ===\n")
+
+    @app.cli.command("snap-trips")
+    def snap_trips_cmd():
+        """Compute and store metrics for finished trips."""
+        snap_finished_trips()
+        print("Trip snapshots complete.")
     return app
 
