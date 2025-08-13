@@ -1,23 +1,22 @@
-# Use official Python image
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies (if needed for psycopg2/mysqlclient/etc.)
-RUN apt-get update && apt-get install -y build-essential libpq-dev
+# Install system deps needed for building wheels + git for VCS requirements
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential libpq-dev git \
+ && rm -rf /var/lib/apt/lists/*
 
-# Copy dependencies
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
 COPY . .
 
-# Expose port
-ENV PORT 8080
+ENV PORT=8080 \
+    PYTHONUNBUFFERED=1
 
-# Command to run with Gunicorn (4 workers, auto-bind to Cloud Run port)
-CMD exec gunicorn --bind :$PORT --workers 4 --threads 8 --timeout 0 wsgi:app
+# Tune these if needed
+ENV WEB_CONCURRENCY=2 \
+    WEB_THREADS=8
+
+CMD exec gunicorn --bind :$PORT --workers ${WEB_CONCURRENCY} --threads ${WEB_THREADS} --timeout 0 wsgi:app
