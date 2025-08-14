@@ -26,6 +26,108 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 manager_bp = Blueprint("manager", __name__)
 
 
+@manager_bp.route("/revenue-breakdown", methods=["GET"])
+@require_role("manager")
+def revenue_breakdown():
+    """
+    Return revenue & ticket percentages by passenger_type (regular vs discount)
+    Window selection mirrors /manager/route-insights:
+      - Preferred: ?trip_id=##
+      - Or: ?date=YYYY-MM-DD&bus_id=##&from=HH:MM&to=HH:MM
+    Optional: &paid_only=(true|false)  (default true)
+    Optional: &bus_id when using trip_id to filter a specific bus (usually implicit).
+    """
+    from datetime import datetime, timedelta
+
+    paid_only = (request.args.get("paid_only", "true").lower() != "false")
+
+    # Resolve time window
+    trip_id = request.args.get("trip_id", type=int)
+    if trip_id:
+        trip = Trip.query.filter_by(id=trip_id).first()
+        if not trip:
+            return jsonify(error="trip not found"), 404
+        bus_id = trip.bus_id
+        day = trip.service_date
+        window_from = datetime.combine(day, trip.start_time)
+        window_to   = datetime.combine(day, trip.end_time)
+        if trip.end_time <= trip.start_time:
+            window_to = window_to + timedelta(days=1)
+    else:
+        date_str = request.args.get("date")
+        bus_id   = request.args.get("bus_id", type=int)
+        if not (date_str and bus_id):
+            return jsonify(error="trip_id OR (date, bus_id, from, to) required"), 400
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify(error="invalid date format"), 400
+        try:
+            hhmm_from = request.args["from"]
+            hhmm_to   = request.args["to"]
+        except KeyError:
+            return jsonify(error="from and to are required"), 400
+        window_from = datetime.combine(day, datetime.strptime(hhmm_from, "%H:%M").time())
+        window_to   = datetime.combine(day, datetime.strptime(hhmm_to, "%H:%M").time())
+        if window_to <= window_from:
+            window_to = window_to + timedelta(days=1)
+
+    # Aggregate by passenger_type within window
+    qs = db.session.query(
+        TicketSale.passenger_type,
+        func.count(TicketSale.id).label("tickets"),
+        func.coalesce(func.sum(TicketSale.price), 0.0).label("revenue"),
+    ).filter(
+        TicketSale.bus_id == bus_id,
+        TicketSale.created_at >= window_from,
+        TicketSale.created_at <= window_to,
+    )
+    if paid_only:
+        qs = qs.filter(TicketSale.paid.is_(True))
+    rows = qs.group_by(TicketSale.passenger_type).all()
+
+    # Normalize + compute percentages
+    totals_tickets = 0
+    totals_revenue = 0.0
+    by_type = []
+    for r in rows:
+        ttype = (r.passenger_type or "regular").lower()
+        tickets = int(r.tickets or 0)
+        revenue = float(r.revenue or 0.0)
+        by_type.append({"type": ttype, "tickets": tickets, "revenue": revenue})
+        totals_tickets += tickets
+        totals_revenue += revenue
+
+    # Ensure both buckets exist
+    types = {g["type"] for g in by_type}
+    if "regular" not in types:
+        by_type.append({"type": "regular", "tickets": 0, "revenue": 0.0})
+    if "discount" not in types:
+        by_type.append({"type": "discount", "tickets": 0, "revenue": 0.0})
+
+    # Percentages
+    out = []
+    for g in by_type:
+        pct_t = (g["tickets"] / totals_tickets * 100.0) if totals_tickets else 0.0
+        pct_r = (g["revenue"] / totals_revenue * 100.0) if totals_revenue else 0.0
+        out.append({
+            "type": g["type"],
+            "tickets": g["tickets"],
+            "revenue": round(g["revenue"], 2),
+            "pct_tickets": round(pct_t, 1),
+            "pct_revenue": round(pct_r, 1),
+        })
+
+    return jsonify({
+        "from": window_from.date().isoformat(),
+        "to": window_to.date().isoformat(),
+        "paid_only": bool(paid_only),
+        "totals": {"tickets": int(totals_tickets), "revenue": round(totals_revenue, 2)},
+        "by_type": sorted(out, key=lambda x: 0 if x["type"] == "regular" else 1),
+    }), 200
+
+
+
 def _active_trip_for(bus_id: int, ts: datetime):
     """Find the trip whose time window contains ts (handles past-midnight windows)."""
     # Check day-of-ts and previous day (for trips that spill after midnight)
@@ -83,6 +185,46 @@ def delete_trip(trip_id: int):
     except Exception as e:
         db.session.rollback()
         return jsonify(error="Error deleting trip: " + str(e)), 500
+# --- NEW (or replace prior attempt) /manager/tickets/composition ------
+@manager_bp.route("/tickets/composition", methods=["GET"])
+@require_role("manager")
+def tickets_composition():
+    """
+    Returns counts of regular vs discount for the given day.
+    - No payment fields are used.
+    - Voided tickets are excluded.
+    - Null passenger_type is treated as 'regular' for legacy rows.
+    """
+    try:
+        day = datetime.strptime(
+            request.args.get("date") or datetime.utcnow().date().isoformat(),
+            "%Y-%m-%d",
+        ).date()
+    except ValueError:
+        return jsonify(error="invalid date"), 400
+
+    # COALESCE(NULL, 'regular') so old rows still count
+    ptype = func.coalesce(TicketSale.passenger_type, 'regular')
+
+    rows = (
+        db.session.query(ptype.label("ptype"), func.count(TicketSale.id))
+        .filter(func.date(TicketSale.created_at) == day)
+        .filter(TicketSale.voided.is_(False))
+        .group_by("ptype")
+        .all()
+    )
+
+    regular = 0
+    discount = 0
+    for t, cnt in rows:
+        t = (t or "").lower()
+        if t == "regular":
+            regular = int(cnt or 0)
+        elif t == "discount":
+            discount = int(cnt or 0)
+
+    return jsonify(regular=regular, discount=discount, total=regular + discount), 200
+
 
 
 @manager_bp.route("/tickets", methods=["GET"])
@@ -96,9 +238,6 @@ def tickets_for_day():
     except ValueError:
         return jsonify(error="invalid date"), 400
 
-    Start = datetime.combine(day, datetime.min.time())
-    End = datetime.combine(day, datetime.max.time())
-
     O = aliased(TicketStop)
     D = aliased(TicketStop)
 
@@ -106,7 +245,7 @@ def tickets_for_day():
         db.session.query(
             TicketSale.id,
             TicketSale.price,
-            TicketSale.paid,
+            TicketSale.passenger_type,                      # include type
             User.first_name,
             User.last_name,
             Bus.identifier.label("bus"),
@@ -114,10 +253,11 @@ def tickets_for_day():
             D.stop_name.label("destination"),
         )
         .join(User, TicketSale.user_id == User.id)
-        .join(Bus, TicketSale.bus_id == Bus.id)
-        .outerjoin(O, TicketSale.origin_stop_time_id == O.id)
+        .join(Bus,  TicketSale.bus_id  == Bus.id)
+        .outerjoin(O, TicketSale.origin_stop_time_id      == O.id)
         .outerjoin(D, TicketSale.destination_stop_time_id == D.id)
-        .filter(TicketSale.created_at.between(Start, End))
+        .filter(func.date(TicketSale.created_at) == day)   # ← robust day filter
+        .filter(TicketSale.voided.is_(False))              # ignore voided
         .order_by(TicketSale.id.asc())
         .all()
     )
@@ -130,12 +270,15 @@ def tickets_for_day():
             "origin": r.origin or "",
             "destination": r.destination or "",
             "fare": f"{float(r.price):.2f}",
-            "paid": bool(r.paid),
+            # expose both keys so any client naming works
+            "passenger_type": (r.passenger_type or "regular"),
+            "passengerType":  (r.passenger_type or "regular"),
         }
         for r in rows
     ]
 
-    return jsonify(tickets=tickets, total=f"{sum(float(r.price) for r in rows):.2f}"), 200
+    total = sum(float(r.price) for r in rows)
+    return jsonify(tickets=tickets, total=f"{total:.2f}"), 200
 
 
 @manager_bp.route("/buses", methods=["GET"])

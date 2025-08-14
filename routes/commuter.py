@@ -99,7 +99,20 @@ def commuter_get_ticket(ticket_id: int):
 @commuter_bp.route("/dashboard", methods=["GET"])
 @require_role("commuter")
 def dashboard():
+    """
+    Compact, single-hop dashboard payload for the commuter app.
+    Includes a tiny "mini_schedules" teaser per bus (max 2 trips each).
+    """
     from datetime import date as _date
+    from sqlalchemy import case
+
+    def _choose_greeting() -> str:
+        hr = datetime.utcnow().hour
+        if hr < 12:
+            return "Good morning"
+        elif hr < 18:
+            return "Good afternoon"
+        return "Good evening"
 
     now = datetime.utcnow()
     today = now.date()
@@ -113,7 +126,7 @@ def dashboard():
         .first()
     )
 
-    # ── recent tickets (last 7 days)
+    # ── recent tickets (last 7 days for this user)
     seven_days_ago = now - timedelta(days=7)
     recent_tix = (
         TicketSale.query.filter(
@@ -125,18 +138,28 @@ def dashboard():
     # ── unread messages (simple total for now)
     unread_msgs = Announcement.query.count()
 
-    # ── active buses seen in last 5 minutes
+    # ── active buses (seen within last 5 minutes, ignore future-dated rows)
+    cutoff = datetime.utcnow() - timedelta(minutes=5)
+    now_utc = datetime.utcnow()
+    last_per_bus = (
+        db.session.query(
+            SensorReading.bus_id,
+            func.max(SensorReading.timestamp).label("last_ts"),
+        )
+        .group_by(SensorReading.bus_id)
+        .subquery()
+    )
     active_buses = (
-        db.session.query(SensorReading.bus_id)
-        .filter(SensorReading.timestamp >= now - timedelta(minutes=5))
-        .distinct()
-        .count()
+        db.session.query(func.count(last_per_bus.c.bus_id))
+        .filter(last_per_bus.c.last_ts >= cutoff)
+        .filter(last_per_bus.c.last_ts <= now_utc)
+        .scalar()
     )
 
     # ── all trips today (how many scheduled)
     today_trips = Trip.query.filter(Trip.service_date == today).count()
 
-    # ── commuter’s tickets today
+    # ── commuter’s tickets & revenue today
     today_tickets = (
         TicketSale.query.filter(
             TicketSale.user_id == g.user.id,
@@ -193,7 +216,7 @@ def dashboard():
             "bus_identifier": bid or "unassigned",
         }
 
-    # ── upcoming trips (next 2 from now)
+    # ── upcoming trips (next 2 from now, across all buses)
     upcoming_rows = (
         db.session.query(Trip, Bus.identifier.label("bus_identifier"))
         .join(Bus, Trip.bus_id == Bus.id)
@@ -225,6 +248,154 @@ def dashboard():
     else:
         next_trip = None
 
+    # ───────────────────────────────────────────────────────────────────
+    # Mini schedules (per bus): at most 2 nearest trips per bus for today
+    # Upcoming-first, then earliest; includes endpoints when available
+    # ───────────────────────────────────────────────────────────────────
+    limit_per_bus = 2
+    now_time = now.time()
+
+    # First/last stop names per trip (endpoints)
+    first_stop_sq = (
+        db.session.query(StopTime.trip_id, func.min(StopTime.seq).label("min_seq"))
+        .group_by(StopTime.trip_id)
+        .subquery()
+    )
+    first_name_sq = (
+        db.session.query(StopTime.trip_id, StopTime.stop_name.label("origin"))
+        .join(
+            first_stop_sq,
+            (StopTime.trip_id == first_stop_sq.c.trip_id)
+            & (StopTime.seq == first_stop_sq.c.min_seq),
+        )
+        .subquery()
+    )
+    last_stop_sq = (
+        db.session.query(StopTime.trip_id, func.max(StopTime.seq).label("max_seq"))
+        .group_by(StopTime.trip_id)
+        .subquery()
+    )
+    last_name_sq = (
+        db.session.query(StopTime.trip_id, StopTime.stop_name.label("destination"))
+        .join(
+            last_stop_sq,
+            (StopTime.trip_id == last_stop_sq.c.trip_id)
+            & (StopTime.seq == last_stop_sq.c.max_seq),
+        )
+        .subquery()
+    )
+
+    mini_schedules = []
+
+    try:
+        # Prefer single SQL with ROW_NUMBER per bus (requires MySQL 8+/Postgres)
+        past_flag = case((Trip.start_time < now_time, 1), else_=0)
+        rn = func.row_number().over(
+            partition_by=Trip.bus_id,
+            order_by=(past_flag.asc(), Trip.start_time.asc()),
+        ).label("rn")
+
+        base = (
+            db.session.query(
+                Bus.identifier.label("bus_identifier"),
+                Trip.start_time.label("start_time"),
+                Trip.end_time.label("end_time"),
+                first_name_sq.c.origin,
+                last_name_sq.c.destination,
+                rn,
+            )
+            .join(Trip, Trip.bus_id == Bus.id)
+            .outerjoin(first_name_sq, Trip.id == first_name_sq.c.trip_id)
+            .outerjoin(last_name_sq, Trip.id == last_name_sq.c.trip_id)
+            .filter(Trip.service_date == today)
+        ).subquery()
+
+        rows = (
+            db.session.query(
+                base.c.bus_identifier,
+                base.c.start_time,
+                base.c.end_time,
+                base.c.origin,
+                base.c.destination,
+            )
+            .filter(base.c.rn <= limit_per_bus)
+            .order_by(base.c.bus_identifier.asc(), base.c.start_time.asc())
+            .all()
+        )
+
+        grouped: dict[str, list[dict]] = {}
+        for r in rows:
+            grouped.setdefault(r.bus_identifier, []).append(
+                {
+                    "start": r.start_time.strftime("%H:%M"),
+                    "end": r.end_time.strftime("%H:%M"),
+                    "origin": (r.origin or ""),
+                    "destination": (r.destination or ""),
+                }
+            )
+
+        for bid, items in grouped.items():
+            mini_schedules.append(
+                {"bus": bid.replace("bus-", "Bus "), "items": items[:limit_per_bus]}
+            )
+
+    except Exception:
+        # Fallback (no window functions): do it in Python
+        from collections import defaultdict
+
+        trips = (
+            db.session.query(Trip, Bus.identifier.label("bus_identifier"))
+            .join(Bus, Trip.bus_id == Bus.id)
+            .filter(Trip.service_date == today)
+            .order_by(Trip.start_time.asc())
+            .all()
+        )
+
+        # Cache endpoints for each trip to avoid N+1 queries
+        endpoints: dict[int, tuple[str, str]] = {}
+        for t, _bid in trips:
+            fst = (
+                db.session.query(StopTime)
+                .filter_by(trip_id=t.id)
+                .order_by(StopTime.seq.asc(), StopTime.id.asc())
+                .first()
+            )
+            lst = (
+                db.session.query(StopTime)
+                .filter_by(trip_id=t.id)
+                .order_by(StopTime.seq.desc(), StopTime.id.desc())
+                .first()
+            )
+            endpoints[t.id] = (
+                (fst.stop_name if fst else ""),
+                (lst.stop_name if lst else ""),
+            )
+
+        per_bus: dict[str, list[Trip]] = defaultdict(list)
+        for t, bid in trips:
+            per_bus[bid].append(t)
+
+        def sort_key(t: Trip):
+            # Upcoming first (start_time >= now), then earliest start_time
+            return (0 if t.start_time >= now_time else 1, t.start_time)
+
+        for bid, ts in per_bus.items():
+            ts_sorted = sorted(ts, key=sort_key)[:limit_per_bus]
+            mini_schedules.append(
+                {
+                    "bus": bid.replace("bus-", "Bus "),
+                    "items": [
+                        {
+                            "start": t.start_time.strftime("%H:%M"),
+                            "end": t.end_time.strftime("%H:%M"),
+                            "origin": endpoints[t.id][0],
+                            "destination": endpoints[t.id][1],
+                        }
+                        for t in ts_sorted
+                    ],
+                }
+            )
+
     return jsonify(
         {
             "greeting": _choose_greeting(),
@@ -232,15 +403,14 @@ def dashboard():
             "next_trip": next_trip,
             "recent_tickets": recent_tix,
             "unread_messages": unread_msgs,
-
-            # NEW fields
-            "active_buses": active_buses,
-            "today_trips": today_trips,
-            "today_tickets": today_tickets,
+            "active_buses": int(active_buses or 0),
+            "today_trips": int(today_trips or 0),
+            "today_tickets": int(today_tickets or 0),
             "today_revenue": round(float(today_revenue), 2),
             "last_ticket": last_ticket,
             "last_announcement": last_announcement,
             "upcoming": upcoming,
+            "mini_schedules": mini_schedules,
         }
     ), 200
 

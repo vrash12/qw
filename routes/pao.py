@@ -17,12 +17,13 @@ from models.ticket_stop import TicketStop
 from models.user import User
 from models.device_token import DeviceToken
 from mqtt_ingest import publish
-# REMOVE the old import:
-# from push import send_expo_push
+
 from routes.auth import require_role
 from routes.tickets_static import jpg_name, QR_PATH
 from utils.qr import build_qr_payload
-from utils.push import send_push  # ← new safe wrapper
+from utils.push import send_push  # ← safe wrapper for push
+
+
 
 pao_bp = Blueprint("pao", __name__, url_prefix="/pao")
 
@@ -438,7 +439,7 @@ def get_ticket(ticket_id):
 
 @pao_bp.route("/tickets/<int:ticket_id>", methods=["PATCH"])
 @require_role("pao")
-def mark_ticket_paid(ticket_id):
+def mark_ticket_paid(ticket_id: int):
     data = request.get_json(silent=True) or {}
     current_app.logger.debug(f"[PAO:PATCH /tickets/{ticket_id}] payload={data!r}")
     paid = data.get("paid")
@@ -542,6 +543,11 @@ def list_commuters():
 @pao_bp.route("/broadcast", methods=["POST"])
 @require_role("pao")
 def broadcast():
+    """
+    Creates an announcement and emits it in real-time to:
+      1) All connected clients (broadcast)
+      2) The specific bus room (bus:<bus_id>) for subscribers
+    """
     bus_id = _current_bus_id()
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
@@ -559,6 +565,14 @@ def broadcast():
         db.session.add(ann)
         db.session.commit()
 
+        payload = {
+            "id": ann.id,
+            "message": ann.message,
+            "timestamp": ann.timestamp.replace(tzinfo=timezone.utc).isoformat(),
+            "bus_identifier": bus_identifier,
+        }
+
+    
         return jsonify(
             {
                 "id": ann.id,
@@ -579,11 +593,18 @@ def broadcast():
 @pao_bp.route("/broadcast", methods=["GET"])
 @require_role("pao")
 def list_broadcasts():
+    """
+    Return announcements.
+    By default: only messages authored by PAOs on *my* bus.
+    When ?scope=all: include messages from PAOs on *all* buses.
+    """
+    scope  = (request.args.get("scope") or "bus").lower()
     bus_id = _current_bus_id()
-    if not bus_id:
+    if not bus_id and scope != "all":
         return jsonify(error="PAO has no assigned bus"), 400
 
-    rows = (
+    # Base query: join author and the bus the author is assigned to
+    q = (
         db.session.query(
             Announcement,
             User.first_name,
@@ -591,11 +612,15 @@ def list_broadcasts():
             Bus.identifier.label("bus_identifier"),
         )
         .join(User, Announcement.created_by == User.id)
-        .join(Bus, User.assigned_bus_id == Bus.id)
-        .filter(User.assigned_bus_id == bus_id)
+        .outerjoin(Bus, User.assigned_bus_id == Bus.id)
         .order_by(Announcement.timestamp.desc())
-        .all()
     )
+
+    # Default = restrict to my bus; scope=all = show everything
+    if scope != "all":
+        q = q.filter(User.assigned_bus_id == bus_id)
+
+    rows = q.all()
 
     anns = [
         {
@@ -604,11 +629,10 @@ def list_broadcasts():
             "timestamp": ann.timestamp.replace(tzinfo=timezone.utc).isoformat(),
             "created_by": ann.created_by,
             "author_name": f"{first} {last}",
-            "bus": bus_identifier,
+            "bus": bus_identifier or "—",
         }
         for ann, first, last, bus_identifier in rows
     ]
-
     return jsonify(anns), 200
 
 
