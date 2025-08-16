@@ -35,6 +35,7 @@ def save_device_token():
         return jsonify(success=True, created=True), 201
     return jsonify(success=True, created=False), 200
 
+
 @commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
 def qr_image_for_ticket(ticket_id: int):
     t = TicketSale.query.get_or_404(ticket_id)
@@ -815,10 +816,9 @@ def schedule():
             )
     return jsonify(events=events), 200
 
-
 @commuter_bp.route("/announcements", methods=["GET"])
 def announcements():
-    bus_id = request.args.get("bus_id", type=int)
+    bus_id   = request.args.get("bus_id", type=int)
     date_str = request.args.get("date")
 
     query = (
@@ -834,7 +834,11 @@ def announcements():
     if bus_id:
         query = query.filter(User.assigned_bus_id == bus_id)
 
-    if date_str:
+    # ⬇️ default to *today* when client doesn't pass ?date=
+    if not date_str:
+        day = datetime.utcnow().date()
+        query = query.filter(func.date(Announcement.timestamp) == day)
+    else:
         try:
             day = datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
