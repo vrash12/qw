@@ -239,7 +239,6 @@ def pao_stop_times():
         ]
     ), 200
 
-
 @pao_bp.route("/tickets", methods=["POST"])
 @require_role("pao")
 def create_ticket():
@@ -300,6 +299,19 @@ def create_ticket():
         # background image for the ticket (static JPG)
         img = jpg_name(fare, p)
         qr_bg_url = f"{request.url_root.rstrip('/')}/{QR_PATH}/{img}"
+
+        # 🔔 push notification to the commuter's device(s)
+        try:
+            tokens = [t.token for t in DeviceToken.query.filter_by(user_id=user.id).all()]
+            if tokens:
+                send_push(
+                    tokens,
+                    "🎟️ Ticket Created",
+                    f"Ref {ref} • ₱{fare:.2f} • {o.stop_name} → {d.stop_name}",
+                    {"ticketId": ticket.id, "ref": ref}
+                )
+        except Exception:
+            current_app.logger.exception("push to commuter failed")
 
         return jsonify({
             "id": ticket.id,

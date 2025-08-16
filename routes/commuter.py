@@ -15,10 +15,25 @@ from utils.qr import build_qr_payload
 from models.ticket_stop import TicketStop
 from sqlalchemy.orm import joinedload
 from flask import send_from_directory, redirect
-
+from models.device_token import DeviceToken
 
 commuter_bp = Blueprint("commuter", __name__, url_prefix="/commuter")
 
+
+
+@commuter_bp.route("/device-token", methods=["POST"])
+@require_role("commuter")
+def save_device_token():
+    data = request.get_json(silent=True) or {}
+    tok = (data.get("token") or "").strip()
+    if not tok:
+        return jsonify(error="token required"), 400
+    exists = DeviceToken.query.filter_by(user_id=g.user.id, token=tok).first()
+    if not exists:
+        db.session.add(DeviceToken(user_id=g.user.id, token=tok))
+        db.session.commit()
+        return jsonify(success=True, created=True), 201
+    return jsonify(success=True, created=False), 200
 
 @commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
 def qr_image_for_ticket(ticket_id: int):
