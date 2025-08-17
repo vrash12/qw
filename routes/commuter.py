@@ -1,7 +1,9 @@
-#backend/routes/commuter.py
-from datetime import datetime, timedelta
-from flask import Blueprint, request, jsonify, g, current_app, url_for
-from sqlalchemy import func
+# routes/commuter.py
+import datetime as dt
+from flask import Blueprint, request, jsonify, g, current_app, url_for, redirect
+from sqlalchemy import func, case
+from sqlalchemy.orm import joinedload
+from typing import Any, Dict, List, Optional
 
 from routes.auth import require_role
 from db import db
@@ -13,12 +15,71 @@ from models.bus import Bus
 from models.user import User
 from utils.qr import build_qr_payload
 from models.ticket_stop import TicketStop
-from sqlalchemy.orm import joinedload
-from flask import send_from_directory, redirect
 from models.device_token import DeviceToken
+
+import traceback
+from werkzeug.exceptions import HTTPException
+from typing import Any, Optional
+
+
+# --- timezone setup ---
+try:
+    from zoneinfo import ZoneInfo
+    try:
+        LOCAL_TZ = ZoneInfo("Asia/Manila")
+    except Exception:
+        LOCAL_TZ = dt.timezone(dt.timedelta(hours=8))
+except Exception:
+    LOCAL_TZ = dt.timezone(dt.timedelta(hours=8))
+
 
 commuter_bp = Blueprint("commuter", __name__, url_prefix="/commuter")
 
+def _debug_enabled() -> bool:
+    return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
+
+@commuter_bp.app_errorhandler(Exception)
+def _commuter_errors(e: Exception):
+    """
+    If ?debug=1 (or X-Debug: 1) => return JSON with error type + message + traceback.
+    Otherwise: let HTTPExceptions pass through unchanged; others return a generic 500.
+    """
+    # Log full traceback to server logs
+    current_app.logger.exception("Unhandled error on %s %s", request.method, request.path)
+
+    if isinstance(e, HTTPException) and not _debug_enabled():
+        # Preserve normal HTTP errors (401/403/404/400 etc.) unless debug is on
+        return e
+
+    status = getattr(e, "code", 500)
+    if _debug_enabled():
+        return jsonify({
+            "ok": False,
+            "type": e.__class__.__name__,
+            "error": str(e),
+            "endpoint": request.endpoint,
+            "path": request.path,
+            "traceback": traceback.format_exc(),
+        }), status
+
+    return jsonify({"error": "internal server error"}), status
+
+# -------- helpers --------
+def _as_time(v: Any) -> Optional[dt.time]:
+    """Coerce ORM-returned values to datetime.time."""
+    if v is None:
+        return None
+    if isinstance(v, dt.datetime):
+        return v.time().replace(tzinfo=None)
+    if isinstance(v, dt.time):
+        return v.replace(tzinfo=None)
+    if isinstance(v, str):
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return dt.datetime.strptime(v, fmt).time()
+            except ValueError:
+                pass
+    return None
 
 
 @commuter_bp.route("/device-token", methods=["POST"])
@@ -40,17 +101,14 @@ def save_device_token():
 def qr_image_for_ticket(ticket_id: int):
     t = TicketSale.query.get_or_404(ticket_id)
 
-    # figure out which static file matches this ticket (your existing logic)
     if t.passenger_type == "discount":
         base = round(float(t.price) / 0.8) if t.price else 0
         prefix = "discount"
     else:
-        base = int(t.price)
+        base = int(t.price or 0)
         prefix = "regular"
 
     filename = f"{prefix}_{base}.jpg"
-
-    # Option A: redirect to the static asset URL
     return redirect(url_for("static", filename=f"qr/{filename}", _external=True), code=302)
 
 
@@ -79,14 +137,17 @@ def commuter_get_ticket(ticket_id: int):
         tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
         destination_name = tsd.stop_name if tsd else ""
 
-    # Optional QR (same logic you use elsewhere)
+    # Choose QR asset and guard for None prices
     if t.passenger_type == "discount":
-        base = round(float(t.price) / 0.8) if t.price else 0
+        base = round(float(t.price or 0) / 0.8)
         prefix = "discount"
     else:
-        base = int(t.price)
+        base = int(t.price or 0)
         prefix = "regular"
+
     filename = f"{prefix}_{base}.jpg"
+    qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
+
     payload = build_qr_payload(
         t,
         origin_name=origin_name,
@@ -103,113 +164,83 @@ def commuter_get_ticket(ticket_id: int):
         "destination": destination_name,
         "passengerType": t.passenger_type.title(),
         "commuter": f"{t.user.first_name} {t.user.last_name}",
-        "fare": f"{float(t.price):.2f}",
+        "fare": f"{float(t.price or 0):.2f}",
         "paid": bool(t.paid),
-
-        # 👇 important
-        "qr": payload,          # JSON string (contains schema, ids, names, link)
-        "qr_link": qr_link,     # plain URL — scanners will auto-open the image
-        "qr_url": qr_url,       # same static image you already use inside the app
+        "qr": payload,      # JSON payload (schema/ids/names/link)
+        "qr_link": qr_link, # dynamic redirect to static QR asset
+        "qr_url": qr_url,   # direct static asset URL
     }), 200
+
 
 @commuter_bp.route("/dashboard", methods=["GET"])
 @require_role("commuter")
 def dashboard():
     """
-    Compact, single-hop dashboard payload for the commuter app.
-    Includes a tiny "mini_schedules" teaser per bus (max 2 trips each).
+    Compact dashboard payload + accurate live_now using local time.
+
+    Debug helpers:
+      - ?debug=1           -> include a 'debug' object in the JSON
+      - ?date=YYYY-MM-DD   -> pretend we're on this service date
+      - ?now=HH:MM         -> pretend the current local time is HH:MM
     """
-    from datetime import date as _date
-    from sqlalchemy import case
+    debug_on = (request.args.get("debug") or "").lower() in {"1", "true", "yes"}
+
+    # -------- Local "now" and service date (with optional overrides) --------
+    now_local = dt.datetime.now(LOCAL_TZ) if LOCAL_TZ else dt.datetime.now()
+    date_arg = (request.args.get("date") or "").strip()
+    force_now = (request.args.get("now") or request.args.get("force_now") or "").strip()
+
+    if date_arg:
+        try:
+            today_local = dt.datetime.strptime(date_arg, "%Y-%m-%d").date()
+        except ValueError:
+            today_local = now_local.date()
+    else:
+        today_local = now_local.date()
+
+    if force_now:
+        try:
+            hh, mm = map(int, force_now.split(":")[:2])
+            now_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except Exception:
+            pass
+
+    # Compare purely on naive time values to match DB 'TIME' columns
+    now_time_local = now_local.time().replace(tzinfo=None)
 
     def _choose_greeting() -> str:
-        hr = datetime.utcnow().hour
+        hr = now_local.hour
         if hr < 12:
             return "Good morning"
         elif hr < 18:
             return "Good afternoon"
         return "Good evening"
 
-    now = datetime.utcnow()
-    today = now.date()
-
-    # ── next trip today (first one today)
+    # -------- next trip (the next one from "now") --------
     next_trip_row = (
         db.session.query(Trip, Bus.identifier.label("bus_identifier"))
         .join(Bus, Trip.bus_id == Bus.id)
-        .filter(Trip.service_date == today)
+        .filter(
+            Trip.service_date == today_local,
+            Trip.start_time >= now_time_local,
+        )
         .order_by(Trip.start_time.asc())
         .first()
     )
+    if next_trip_row:
+        trip, identifier = next_trip_row
+        next_trip = {
+            "bus": (identifier or "").replace("bus-", "Bus "),
+            "start": _as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
+            "end": _as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
+        }
+    else:
+        next_trip = None
 
-    # ── recent tickets (last 7 days for this user)
-    seven_days_ago = now - timedelta(days=7)
-    recent_tix = (
-        TicketSale.query.filter(
-            TicketSale.user_id == g.user.id,
-            TicketSale.created_at >= seven_days_ago,
-        ).count()
-    )
-
-    # ── unread messages (simple total for now)
+    # -------- unread messages (for Announcements dashlet) --------
     unread_msgs = Announcement.query.count()
 
-    # ── active buses (seen within last 5 minutes, ignore future-dated rows)
-    cutoff = datetime.utcnow() - timedelta(minutes=5)
-    now_utc = datetime.utcnow()
-    last_per_bus = (
-        db.session.query(
-            SensorReading.bus_id,
-            func.max(SensorReading.timestamp).label("last_ts"),
-        )
-        .group_by(SensorReading.bus_id)
-        .subquery()
-    )
-    active_buses = (
-        db.session.query(func.count(last_per_bus.c.bus_id))
-        .filter(last_per_bus.c.last_ts >= cutoff)
-        .filter(last_per_bus.c.last_ts <= now_utc)
-        .scalar()
-    )
-
-    # ── all trips today (how many scheduled)
-    today_trips = Trip.query.filter(Trip.service_date == today).count()
-
-    # ── commuter’s tickets & revenue today
-    today_tickets = (
-        TicketSale.query.filter(
-            TicketSale.user_id == g.user.id,
-            func.date(TicketSale.created_at) == _date.today(),
-        ).count()
-    )
-    today_revenue = (
-        db.session.query(func.coalesce(func.sum(TicketSale.price), 0.0))
-        .filter(
-            TicketSale.user_id == g.user.id,
-            func.date(TicketSale.created_at) == _date.today(),
-            TicketSale.paid.is_(True),
-        )
-        .scalar()
-        or 0.0
-    )
-
-    # ── last ticket for commuter
-    lt = (
-        TicketSale.query.filter_by(user_id=g.user.id)
-        .order_by(TicketSale.created_at.desc())
-        .first()
-    )
-    last_ticket = None
-    if lt:
-        last_ticket = {
-            "referenceNo": lt.reference_no,
-            "fare": f"{float(lt.price):.2f}",
-            "paid": bool(lt.paid),
-            "date": lt.created_at.strftime("%B %d, %Y"),
-            "time": lt.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-        }
-
-    # ── latest announcement (any)
+    # -------- last announcement pill --------
     last_ann_row = (
         db.session.query(
             Announcement,
@@ -232,212 +263,170 @@ def dashboard():
             "bus_identifier": bid or "unassigned",
         }
 
-    # ── upcoming trips (next 2 from now, across all buses)
-    upcoming_rows = (
+    # -------- LIVE NOW (tolerant like route timeline) --------
+    def _is_live_window(now_t: dt.time, s: Optional[dt.time], e: Optional[dt.time], *, grace_min: int = 3) -> bool:
+        """
+        True if now_t within [s,e). If s==e (zero-dwell), treat as ±grace_min minutes window.
+        All params are naive times (tzinfo=None).
+        """
+        if not s or not e:
+            return False
+        if s == e:
+            base = dt.datetime.combine(today_local, s)
+            nowd = dt.datetime.combine(today_local, now_t)
+            return abs((nowd - base).total_seconds()) <= grace_min * 60
+        return s <= now_t < e
+
+    live_now: List[Dict[str, Any]] = []
+    debug_trips: List[Dict[str, Any]] = []
+
+    trips_today = (
         db.session.query(Trip, Bus.identifier.label("bus_identifier"))
         .join(Bus, Trip.bus_id == Bus.id)
-        .filter(
-            Trip.service_date == today,
-            Trip.start_time >= now.time(),
-        )
+        .filter(Trip.service_date == today_local)
         .order_by(Trip.start_time.asc())
-        .limit(2)
         .all()
     )
-    upcoming = [
-        {
-            "bus": bid.replace("bus-", "Bus "),
-            "start": t.start_time.strftime("%H:%M"),
-            "end": t.end_time.strftime("%H:%M"),
-        }
-        for t, bid in upcoming_rows
-    ]
 
-    # ── pretty next trip
-    if next_trip_row:
-        trip, identifier = next_trip_row
-        next_trip = {
-            "bus": identifier.replace("bus-", "Bus "),
-            "start": trip.start_time.strftime("%H:%M"),
-            "end": trip.end_time.strftime("%H:%M"),
-        }
-    else:
-        next_trip = None
-
-    # ───────────────────────────────────────────────────────────────────
-    # Mini schedules (per bus): at most 2 nearest trips per bus for today
-    # Upcoming-first, then earliest; includes endpoints when available
-    # ───────────────────────────────────────────────────────────────────
-    limit_per_bus = 2
-    now_time = now.time()
-
-    # First/last stop names per trip (endpoints)
-    first_stop_sq = (
-        db.session.query(StopTime.trip_id, func.min(StopTime.seq).label("min_seq"))
-        .group_by(StopTime.trip_id)
-        .subquery()
-    )
-    first_name_sq = (
-        db.session.query(StopTime.trip_id, StopTime.stop_name.label("origin"))
-        .join(
-            first_stop_sq,
-            (StopTime.trip_id == first_stop_sq.c.trip_id)
-            & (StopTime.seq == first_stop_sq.c.min_seq),
-        )
-        .subquery()
-    )
-    last_stop_sq = (
-        db.session.query(StopTime.trip_id, func.max(StopTime.seq).label("max_seq"))
-        .group_by(StopTime.trip_id)
-        .subquery()
-    )
-    last_name_sq = (
-        db.session.query(StopTime.trip_id, StopTime.stop_name.label("destination"))
-        .join(
-            last_stop_sq,
-            (StopTime.trip_id == last_stop_sq.c.trip_id)
-            & (StopTime.seq == last_stop_sq.c.max_seq),
-        )
-        .subquery()
-    )
-
-    mini_schedules = []
-
-    try:
-        # Prefer single SQL with ROW_NUMBER per bus (requires MySQL 8+/Postgres)
-        past_flag = case((Trip.start_time < now_time, 1), else_=0)
-        rn = func.row_number().over(
-            partition_by=Trip.bus_id,
-            order_by=(past_flag.asc(), Trip.start_time.asc()),
-        ).label("rn")
-
-        base = (
-            db.session.query(
-                Bus.identifier.label("bus_identifier"),
-                Trip.start_time.label("start_time"),
-                Trip.end_time.label("end_time"),
-                first_name_sq.c.origin,
-                last_name_sq.c.destination,
-                rn,
-            )
-            .join(Trip, Trip.bus_id == Bus.id)
-            .outerjoin(first_name_sq, Trip.id == first_name_sq.c.trip_id)
-            .outerjoin(last_name_sq, Trip.id == last_name_sq.c.trip_id)
-            .filter(Trip.service_date == today)
-        ).subquery()
-
-        rows = (
-            db.session.query(
-                base.c.bus_identifier,
-                base.c.start_time,
-                base.c.end_time,
-                base.c.origin,
-                base.c.destination,
-            )
-            .filter(base.c.rn <= limit_per_bus)
-            .order_by(base.c.bus_identifier.asc(), base.c.start_time.asc())
+    for t, bid in trips_today:
+        sts = (
+            StopTime.query.filter_by(trip_id=t.id)
+            .order_by(StopTime.seq.asc(), StopTime.id.asc())
             .all()
         )
 
-        grouped: dict[str, list[dict]] = {}
-        for r in rows:
-            grouped.setdefault(r.bus_identifier, []).append(
-                {
-                    "start": r.start_time.strftime("%H:%M"),
-                    "end": r.end_time.strftime("%H:%M"),
-                    "origin": (r.origin or ""),
-                    "destination": (r.destination or ""),
-                }
-            )
+        events: List[Dict[str, Any]] = []
+        if len(sts) < 2:
+            # No usable stop list — fall back to full trip window
+            events.append({
+                "type": "trip",
+                "label": "In Transit",
+                "start": _as_time(t.start_time),
+                "end": _as_time(t.end_time),
+                "description": "",
+            })
+        else:
+            for idx, st in enumerate(sts):
+                # STOP window even if only one of arrive/depart exists
+                s = _as_time(st.arrive_time or st.depart_time)
+                e = _as_time(st.depart_time or st.arrive_time)
+                if s or e:
+                    events.append({
+                        "type": "stop",
+                        "label": "At Stop",
+                        "start": s,
+                        "end": e,
+                        "description": st.stop_name,
+                    })
 
-        for bid, items in grouped.items():
-            mini_schedules.append(
-                {"bus": bid.replace("bus-", "Bus "), "items": items[:limit_per_bus]}
-            )
+                # TRIP window to next stop — be lenient with missing times
+                if idx < len(sts) - 1:
+                    nxt = sts[idx + 1]
+                    s2 = _as_time(st.depart_time or st.arrive_time)
+                    e2 = _as_time(nxt.arrive_time or nxt.depart_time)
+                    if s2 and e2 and s2 != e2:
+                        events.append({
+                            "type": "trip",
+                            "label": "In Transit",
+                            "start": s2,
+                            "end": e2,
+                            "description": f"{st.stop_name} → {nxt.stop_name}",
+                        })
 
-    except Exception:
-        # Fallback (no window functions): do it in Python
-        from collections import defaultdict
+        # If still nothing, ensure one full window
+        if not events:
+            events.append({
+                "type": "trip",
+                "label": "In Transit",
+                "start": _as_time(t.start_time),
+                "end": _as_time(t.end_time),
+                "description": "",
+            })
 
-        trips = (
-            db.session.query(Trip, Bus.identifier.label("bus_identifier"))
-            .join(Bus, Trip.bus_id == Bus.id)
-            .filter(Trip.service_date == today)
-            .order_by(Trip.start_time.asc())
-            .all()
-        )
+        chosen = None
+        for ev in events:
+            if _is_live_window(now_time_local, ev["start"], ev["end"], grace_min=3):
+                chosen = ev
+                live_now.append({
+                    "bus_id": t.bus_id,
+                    "bus": (bid or "").replace("bus-", "Bus "),
+                    "trip_id": t.id,
+                    "type": ev["type"],
+                    "label": ev["label"],
+                    "start": ev["start"].strftime("%H:%M"),
+                    "end": ev["end"].strftime("%H:%M"),
+                    "description": ev["description"],
+                })
+                break
 
-        # Cache endpoints for each trip to avoid N+1 queries
-        endpoints: dict[int, tuple[str, str]] = {}
-        for t, _bid in trips:
-            fst = (
-                db.session.query(StopTime)
-                .filter_by(trip_id=t.id)
-                .order_by(StopTime.seq.asc(), StopTime.id.asc())
-                .first()
-            )
-            lst = (
-                db.session.query(StopTime)
-                .filter_by(trip_id=t.id)
-                .order_by(StopTime.seq.desc(), StopTime.id.desc())
-                .first()
-            )
-            endpoints[t.id] = (
-                (fst.stop_name if fst else ""),
-                (lst.stop_name if lst else ""),
-            )
+        # Final fallback: if the specific segments didn't match but we're within the trip window, show In Transit
+        ts = _as_time(t.start_time)
+        te = _as_time(t.end_time)
+        if not chosen and ts and te and _is_live_window(now_time_local, ts, te, grace_min=0):
+            live_now.append({
+                "bus_id": t.bus_id,
+                "bus": (bid or "").replace("bus-", "Bus "),
+                "trip_id": t.id,
+                "type": "trip",
+                "label": "In Transit",
+                "start": ts.strftime("%H:%M"),
+                "end": te.strftime("%H:%M"),
+                "description": "",
+            })
 
-        per_bus: dict[str, list[Trip]] = defaultdict(list)
-        for t, bid in trips:
-            per_bus[bid].append(t)
+        if debug_on:
+            def _fmt(x: Optional[dt.datetime.time]) -> Optional[str]:
+                return x.strftime("%H:%M") if x else None
+            debug_trips.append({
+                "trip_id": t.id,
+                "bus": (bid or "").replace("bus-", "Bus "),
+                "events": [
+                    {
+                        "type": ev["type"],
+                        "label": ev["label"],
+                        "start": _fmt(ev["start"]),
+                        "end": _fmt(ev["end"]),
+                        "desc": ev["description"],
+                        "hit": _is_live_window(now_time_local, ev["start"], ev["end"], grace_min=3),
+                    } for ev in events
+                ],
+                "chosen": None if not chosen else {
+                    "type": chosen["type"],
+                    "start": _fmt(chosen["start"]),
+                    "end": _fmt(chosen["end"]),
+                },
+            })
 
-        def sort_key(t: Trip):
-            # Upcoming first (start_time >= now), then earliest start_time
-            return (0 if t.start_time >= now_time else 1, t.start_time)
+    # loud server logs
+    current_app.logger.info(
+        "dashboard live_now=%d now=%s date=%s trips=%d",
+        len(live_now),
+        now_time_local,
+        today_local,
+        len(trips_today),
+    )
 
-        for bid, ts in per_bus.items():
-            ts_sorted = sorted(ts, key=sort_key)[:limit_per_bus]
-            mini_schedules.append(
-                {
-                    "bus": bid.replace("bus-", "Bus "),
-                    "items": [
-                        {
-                            "start": t.start_time.strftime("%H:%M"),
-                            "end": t.end_time.strftime("%H:%M"),
-                            "origin": endpoints[t.id][0],
-                            "destination": endpoints[t.id][1],
-                        }
-                        for t in ts_sorted
-                    ],
-                }
-            )
+    payload: Dict[str, Any] = {
+        "greeting": _choose_greeting(),
+        "user_name": f"{g.user.first_name} {g.user.last_name}",
+        "next_trip": next_trip,
+        "unread_messages": int(unread_msgs or 0),
+        "last_announcement": last_announcement,
+        "live_now": live_now,
+    }
 
-    return jsonify(
-        {
-            "greeting": _choose_greeting(),
-            "user_name": f"{g.user.first_name} {g.user.last_name}",
-            "next_trip": next_trip,
-            "recent_tickets": recent_tix,
-            "unread_messages": unread_msgs,
-            "active_buses": int(active_buses or 0),
-            "today_trips": int(today_trips or 0),
-            "today_tickets": int(today_tickets or 0),
-            "today_revenue": round(float(today_revenue), 2),
-            "last_ticket": last_ticket,
-            "last_announcement": last_announcement,
-            "upcoming": upcoming,
-            "mini_schedules": mini_schedules,
+    if debug_on:
+        payload["debug"] = {
+            "now_local": now_local.strftime("%Y-%m-%d %H:%M:%S"),
+            "today_local": str(today_local),
+            "live_now_len": len(live_now),
+            "trips_today_len": len(trips_today),
+            "first_trip_debug": debug_trips[0] if debug_trips else None,
         }
-    ), 200
 
-
-def _choose_greeting() -> str:
-    hr = datetime.utcnow().hour
-    if hr < 12:
-        return "Good morning"
-    elif hr < 18:
-        return "Good afternoon"
-    return "Good evening"
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp, 200
 
 
 @commuter_bp.route("/trips", methods=["GET"])
@@ -446,7 +435,7 @@ def list_all_trips():
     if not date_str:
         return jsonify(error="A 'date' parameter is required."), 400
     try:
-        svc_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        svc_date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
         return jsonify(error="Invalid date format. Use YYYY-MM-DD."), 400
 
@@ -502,8 +491,8 @@ def list_all_trips():
         {
             "id": trip.id,
             "bus_identifier": identifier,
-            "start_time": trip.start_time.strftime("%H:%M"),
-            "end_time": trip.end_time.strftime("%H:%M"),
+            "start_time": _as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
+            "end_time": _as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
             "origin": origin or "N/A",
             "destination": destination or "N/A",
         }
@@ -518,7 +507,7 @@ def list_buses():
     q = Bus.query
     if date_str:
         try:
-            svc_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            svc_date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
             return jsonify(error="date must be YYYY-MM-DD"), 400
         q = q.join(Trip, Bus.id == Trip.bus_id).filter(Trip.service_date == svc_date)
@@ -534,7 +523,7 @@ def commuter_bus_trips():
     if not (bus_id and date_str):
         return jsonify(error="bus_id and date are required"), 400
     try:
-        svc_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        svc_date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
         return jsonify(error="date must be YYYY-MM-DD"), 400
 
@@ -549,8 +538,8 @@ def commuter_bus_trips():
                 {
                     "id": t.id,
                     "number": t.number,
-                    "start_time": t.start_time.strftime("%H:%M"),
-                    "end_time": t.end_time.strftime("%H:%M"),
+                    "start_time": _as_time(t.start_time).strftime("%H:%M") if _as_time(t.start_time) else "",
+                    "end_time": _as_time(t.end_time).strftime("%H:%M") if _as_time(t.end_time) else "",
                 }
                 for t in trips
             ]
@@ -572,8 +561,8 @@ def commuter_stop_times():
             [
                 {
                     "stop_name": st.stop_name,
-                    "arrive_time": st.arrive_time.strftime("%H:%M"),
-                    "depart_time": st.depart_time.strftime("%H:%M"),
+                    "arrive_time": (_as_time(st.arrive_time).strftime("%H:%M") if _as_time(st.arrive_time) else ""),
+                    "depart_time": (_as_time(st.depart_time).strftime("%H:%M") if _as_time(st.depart_time) else ""),
                 }
                 for st in sts
             ]
@@ -598,6 +587,7 @@ def vehicle_location():
         200,
     )
 
+
 @commuter_bp.route("/tickets/mine", methods=["GET"])
 @require_role("commuter")
 def my_receipts():
@@ -611,9 +601,6 @@ def my_receipts():
         bus_id=<int>          # filter tickets by bus (via Trip.bus_id)
         light=1               # keep for compatibility
     """
-    from datetime import date as _date
-
-    # ── params
     page      = max(1, request.args.get("page", type=int, default=1))
     page_size = max(1, request.args.get("page_size", type=int, default=5))
     date_str  = request.args.get("date")
@@ -635,13 +622,12 @@ def my_receipts():
     # ── date filter (exact day)
     if date_str:
         try:
-            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+            day = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
             return jsonify(error="date must be YYYY-MM-DD"), 400
-        # Use DB's DATE() to avoid timezone mismatch headaches
         qs = qs.filter(func.date(TicketSale.created_at) == day)
     elif days in {"7", "30"}:
-        cutoff = datetime.utcnow() - timedelta(days=int(days))
+        cutoff = dt.datetime.utcnow() - timedelta(days=int(days))
         qs = qs.filter(TicketSale.created_at >= cutoff)
 
     # ── bus filter (via Trip.bus_id). If your TicketSale has bus_id, use that; else join Trip.
@@ -667,7 +653,7 @@ def my_receipts():
             base = round(float(t.price) / 0.8) if t.price else 0
             prefix = "discount"
         else:
-            base = int(t.price)
+            base = int(t.price or 0)
             prefix = "regular"
         filename = f"{prefix}_{base}.jpg"
         qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
@@ -701,10 +687,10 @@ def my_receipts():
             "destination": destination_name,
             "passengerType": t.passenger_type.title(),
             "commuter": f"{t.user.first_name} {t.user.last_name}",
-            "fare": f"{float(t.price):.2f}",
+            "fare": f"{float(t.price or 0):.2f}",
             "paid": bool(t.paid),
             "qr_url": qr_url,
-            "qr": payload if not light else payload,  # keep field for app compatibility
+            "qr": payload if not light else payload,
             "qr_link": qr_link,
         })
 
@@ -739,11 +725,12 @@ def get_trip(trip_id: int):
             number=trip.number,
             origin=first_stop.stop_name if first_stop else "",
             destination=last_stop.stop_name if last_stop else "",
-            start_time=trip.start_time.strftime("%H:%M"),
-            end_time=trip.end_time.strftime("%H:%M"),
+            start_time=_as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
+            end_time=_as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
         ),
         200,
     )
+
 
 
 @commuter_bp.route("/timetable", methods=["GET"])
@@ -763,8 +750,8 @@ def timetable():
             [
                 {
                     "stop": st.stop_name,
-                    "arrive": st.arrive_time.strftime("%H:%M") if st.arrive_time else "",
-                    "depart": st.depart_time.strftime("%H:%M") if st.depart_time else "",
+                    "arrive": (_as_time(st.arrive_time).strftime("%H:%M") if _as_time(st.arrive_time) else ""),
+                    "depart": (_as_time(st.depart_time).strftime("%H:%M") if _as_time(st.depart_time) else ""),
                 }
                 for st in sts
             ]
@@ -780,41 +767,47 @@ def schedule():
     date_str = request.args.get("date")
     if not trip_id or not date_str:
         return jsonify(error="trip_id and date are required"), 400
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify(error="date must be YYYY-MM-DD"), 400
 
+    trip = Trip.query.get_or_404(trip_id)
     stops = (
         StopTime.query.filter_by(trip_id=trip_id)
         .order_by(StopTime.seq.asc(), StopTime.id.asc())
         .all()
     )
-    events = []
-    for idx, st in enumerate(stops):
-        events.append(
-            {
+
+    events: List[Dict[str, Any]] = []
+    # If we don't have at least 2 stops, synthesize one in-transit segment
+    if len(stops) < 2:
+        events.append({
+            "id": 1,
+            "type": "trip",
+            "label": "In Transit",
+            "start_time": _as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
+            "end_time": _as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
+            "description": "",
+        })
+    else:
+        for idx, st in enumerate(stops):
+            events.append({
                 "id": idx * 2 + 1,
                 "type": "stop",
                 "label": "At Stop",
-                "start_time": st.arrive_time.strftime("%H:%M") if st.arrive_time else "",
-                "end_time": st.depart_time.strftime("%H:%M") if st.depart_time else "",
+                "start_time": _as_time(st.arrive_time).strftime("%H:%M") if _as_time(st.arrive_time) else "",
+                "end_time": _as_time(st.depart_time).strftime("%H:%M") if _as_time(st.depart_time) else "",
                 "description": st.stop_name,
-            }
-        )
-        if idx < len(stops) - 1:
-            nxt = stops[idx + 1]
-            events.append(
-                {
+            })
+            if idx < len(stops) - 1:
+                nxt = stops[idx + 1]
+                events.append({
                     "id": idx * 2 + 2,
                     "type": "trip",
                     "label": "In Transit",
-                    "start_time": st.depart_time.strftime("%H:%M") if st.depart_time else "",
-                    "end_time": nxt.arrive_time.strftime("%H:%M") if nxt.arrive_time else "",
+                    "start_time": _as_time(st.depart_time).strftime("%H:%M") if _as_time(st.depart_time) else "",
+                    "end_time": _as_time(nxt.arrive_time).strftime("%H:%M") if _as_time(nxt.arrive_time) else "",
                     "description": f"{st.stop_name} → {nxt.stop_name}",
-                }
-            )
+                })
     return jsonify(events=events), 200
+
 
 @commuter_bp.route("/announcements", methods=["GET"])
 def announcements():
@@ -834,13 +827,13 @@ def announcements():
     if bus_id:
         query = query.filter(User.assigned_bus_id == bus_id)
 
-    # ⬇️ default to *today* when client doesn't pass ?date=
+    # default to *local today* when client doesn't pass ?date=
     if not date_str:
-        day = datetime.utcnow().date()
+        day = (dt.datetime.now(LOCAL_TZ) if LOCAL_TZ else dt.datetime.now()).date()
         query = query.filter(func.date(Announcement.timestamp) == day)
     else:
         try:
-            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+            day = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
             return jsonify(error="date must be YYYY-MM-DD"), 400
         query = query.filter(func.date(Announcement.timestamp) == day)
