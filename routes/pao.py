@@ -21,11 +21,38 @@ from mqtt_ingest import publish
 from routes.auth import require_role
 from routes.tickets_static import jpg_name, QR_PATH
 from utils.qr import build_qr_payload
-from utils.push import send_push  # ← safe wrapper for push
+from utils.push import send_push_async
 
 
 
 pao_bp = Blueprint("pao", __name__, url_prefix="/pao")
+
+
+@pao_bp.route("/reset-live-stats", methods=["POST"])
+@require_role("pao")
+def reset_live_stats():
+    """
+    Ask the device to zero its live passenger counters.
+    This does NOT modify database rows; it only triggers the sensor to publish fresh totals.
+    Device must subscribe to: device/<bus-identifier>/control
+    Payload: {"cmd": "reset_people"}
+    """
+    bus_id = _current_bus_id()
+    if not bus_id:
+        return jsonify(error="PAO has no assigned bus"), 400
+
+    bus_row = Bus.query.get(bus_id)
+    bus_identifier = (bus_row.identifier or f"bus-{bus_id:02d}") if bus_row else f"bus-{bus_id:02d}"
+
+    topic = f"device/{bus_identifier}/cmd/reset"
+    try:
+        publish(topic, {"reset": True})
+        current_app.logger.info(f"[PAO] reset request → {topic}")
+        # 202 to indicate it's async (device will apply and then publish /people)
+        return jsonify(ok=True), 202
+    except Exception as e:
+        current_app.logger.exception("reset-live-stats publish failed")
+        return jsonify(error=str(e)), 500
 
 
 @pao_bp.route("/summary", methods=["GET"])
@@ -98,7 +125,6 @@ def pao_summary():
     return jsonify(
         tickets_total = int(total),
         paid_count    = int(paid_count),
-        pending_count = int(max(0, total - paid_count)),
         revenue_total = float(round(revenue_total, 2)),
         last_announcement = last_announcement
     ), 200
@@ -304,11 +330,12 @@ def create_ticket():
         try:
             tokens = [t.token for t in DeviceToken.query.filter_by(user_id=user.id).all()]
             if tokens:
-                send_push(
+                send_push_async(
                     tokens,
                     "🎟️ Ticket Created",
                     f"Ref {ref} • ₱{fare:.2f} • {o.stop_name} → {d.stop_name}",
-                    {"ticketId": ticket.id, "ref": ref}
+                    {"ticketId": ticket.id, "ref": ref},
+                    channelId="payments",
                 )
         except Exception:
             current_app.logger.exception("push to commuter failed")
@@ -453,38 +480,51 @@ def get_ticket(ticket_id):
 @require_role("pao")
 def mark_ticket_paid(ticket_id: int):
     data = request.get_json(silent=True) or {}
-    current_app.logger.debug(f"[PAO:PATCH /tickets/{ticket_id}] payload={data!r}")
-    paid = data.get("paid")
-    if paid not in (True, False, 1, 0):
-        current_app.logger.debug(f" → invalid paid flag: {paid!r}")
-        return jsonify(error="invalid paid flag"), 400
+    paid = bool(data.get("paid"))
 
     ticket = (
-        TicketSale.query.options(joinedload(TicketSale.bus))
+        TicketSale.query.options(joinedload(TicketSale.bus), joinedload(TicketSale.user))
         .filter(TicketSale.id == ticket_id)
         .first()
     )
     if not ticket:
-        current_app.logger.debug(f" → ticket not found id={ticket_id}")
         return jsonify(error="ticket not found"), 404
 
-    current_app.logger.debug(f" → before update: ticket.paid={ticket.paid}")
+    was_paid = bool(ticket.paid)
     ticket.paid = 1 if paid else 0
+
     try:
         db.session.commit()
 
+        # MQTT fare count update
         from datetime import date as _date
-
         cnt = (
             TicketSale.query.filter_by(bus_id=ticket.bus_id, paid=True)
             .filter(func.date(TicketSale.created_at) == _date.today())
             .count()
         )
-
         topic = f"device/{ticket.bus.identifier}/fare"
         publish(topic, {"paid": cnt})
         current_app.logger.info(f"MQTT fare update → {topic}: {cnt}")
 
+        if (not was_paid) and bool(ticket.paid):
+            try:
+                import time
+                sent_at = int(time.time() * 1000)
+                tokens = [t.token for t in DeviceToken.query.filter_by(user_id=ticket.user_id).all()]
+                if tokens:
+                    send_push_async(
+                        tokens,
+                        "✅ Payment confirmed",
+                        f"Ref {ticket.reference_no} • ₱{float(ticket.price or 0):.2f}",
+                        {"deeplink": f"/commuter/receipt/{ticket.id}", "ticketId": ticket.id, "sentAt": sent_at},
+                        channelId="payments",
+                    )
+            except Exception:
+                current_app.logger.exception("[push] paid-confirmation failed")
+
+
+        # ✅ ALWAYS return a response
         return jsonify(id=ticket.id, paid=bool(ticket.paid)), 200
 
     except Exception as e:
@@ -555,11 +595,6 @@ def list_commuters():
 @pao_bp.route("/broadcast", methods=["POST"])
 @require_role("pao")
 def broadcast():
-    """
-    Creates an announcement and emits it in real-time to:
-      1) All connected clients (broadcast)
-      2) The specific bus room (bus:<bus_id>) for subscribers
-    """
     bus_id = _current_bus_id()
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
@@ -584,7 +619,24 @@ def broadcast():
             "bus_identifier": bus_identifier,
         }
 
-    
+        # 🔔 NEW: push immediately to commuters (scope: all commuters; narrow later if needed)
+        tokens = [
+            t.token
+            for t in DeviceToken.query
+            .join(User, User.id == DeviceToken.user_id)
+            .filter(User.role == "commuter")
+            .all()
+        ]
+        if tokens:
+            send_push_async(
+                tokens,
+                "🗞️ Announcement",
+                f"{bus_identifier}: {message}",
+                {"deeplink": "/commuter/notifications"},
+                channelId="announcements",
+            )
+
+
         return jsonify(
             {
                 "id": ann.id,
@@ -600,7 +652,6 @@ def broadcast():
         db.session.rollback()
         current_app.logger.exception("broadcast failed")
         return jsonify(error="internal server error"), 500
-
 
 @pao_bp.route("/broadcast", methods=["GET"])
 @require_role("pao")
