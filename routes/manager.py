@@ -312,9 +312,26 @@ def list_buses():
 @manager_bp.route("/route-insights", methods=["GET"])
 @require_role("manager")
 def route_data_insights():
+    """
+    Returns per-minute occupancy series with optional stop labels when a minute
+    matches a stop's arrive/depart time. Also includes meta window and metrics.
+    """
     trip_id = request.args.get("trip_id", type=int)
     use_snapshot = False
 
+    # ---- helpers -----------------------------------------------------------
+    def _trip_window(day_, start_t, end_t):
+        start_dt = datetime.combine(day_, start_t)
+        end_dt   = datetime.combine(day_, end_t)
+        if end_t <= start_t:  # crosses midnight
+            end_dt = end_dt + timedelta(days=1)
+        return start_dt, end_dt
+
+    def _overlaps(a0, a1, b0, b1):
+        # [a0,a1) overlaps [b0,b1) ?
+        return a0 < b1 and b0 < a1
+
+    # ---- resolve window + metrics snapshot --------------------------------
     if trip_id:
         trip = Trip.query.filter_by(id=trip_id).first()
         if not trip:
@@ -322,11 +339,7 @@ def route_data_insights():
 
         bus_id = trip.bus_id
         day = trip.service_date
-        window_from = datetime.combine(day, trip.start_time)
-        window_to = datetime.combine(day, trip.end_time)
-        if trip.end_time <= trip.start_time:
-            window_to = window_to + timedelta(days=1)
-
+        window_from, window_to = _trip_window(day, trip.start_time, trip.end_time)
         window_end_excl = window_to + timedelta(minutes=1)
 
         # If trip is over (give a 2-min grace) and we have a snapshot, use it
@@ -351,6 +364,13 @@ def route_data_insights():
             "window_from": window_from.isoformat(),
             "window_to": window_to.isoformat(),
         }
+
+        # Build stop lookup from THIS trip
+        stop_rows = (
+            StopTime.query.filter_by(trip_id=trip_id)
+            .order_by(StopTime.seq.asc())
+            .all()
+        )
     else:
         # ad-hoc window
         date_str = request.args.get("date")
@@ -381,7 +401,34 @@ def route_data_insights():
         }
         metrics = None
 
-    # Build the time series (1-minute buckets, max pax per minute + in/out sums)
+        # Collect stop times from any trips on this bus that overlap the window
+        trips_today = Trip.query.filter_by(bus_id=bus_id, service_date=day).all()
+        trip_ids_in_window = []
+        for t in trips_today:
+            t_from, t_to = _trip_window(day, t.start_time, t.end_time)
+            if _overlaps(t_from, t_to, window_from, window_end_excl):
+                trip_ids_in_window.append(t.id)
+
+        stop_rows = []
+        if trip_ids_in_window:
+            stop_rows = (
+                StopTime.query
+                .filter(StopTime.trip_id.in_(trip_ids_in_window))
+                .order_by(StopTime.trip_id.asc(), StopTime.seq.asc())
+                .all()
+            )
+
+    # ---- build a minute→stop mapping (e.g., {"07:35": "SM Tarlac City"}) ---
+    minute_to_stop = {}
+    for st in stop_rows:
+        if st.arrive_time:
+            k = st.arrive_time.strftime("%H:%M")
+            minute_to_stop.setdefault(k, set()).add(st.stop_name)
+        if st.depart_time:
+            k = st.depart_time.strftime("%H:%M")
+            minute_to_stop.setdefault(k, set()).add(st.stop_name)
+
+    # ---- time series (1-minute buckets) ------------------------------------
     occ_rows = (
         db.session.query(
             func.date_format(SensorReading.timestamp, "%H:%i").label("hhmm"),
@@ -398,17 +445,21 @@ def route_data_insights():
         .order_by("hhmm")
         .all()
     )
-    series = [
-        {
-            "time": r.hhmm,
+
+    series = []
+    for r in occ_rows:
+        hhmm = r.hhmm
+        stop_names = sorted(minute_to_stop.get(hhmm, []))
+        series.append({
+            "time": hhmm,
             "passengers": int(r.pax or 0),
             "in": int(r.ins or 0),
             "out": int(r.outs or 0),
-        }
-        for r in occ_rows
-    ]
+            # single string for convenience; join multiple stops if they share the same minute
+            "stop": " / ".join(stop_names) if stop_names else None,
+        })
 
-    # Compute metrics if no snapshot (or ad-hoc window)
+    # ---- metrics (when no snapshot) ----------------------------------------
     if not metrics:
         pax_values = [p["passengers"] for p in series]
         avg_pax  = round(sum(pax_values) / len(pax_values)) if pax_values else 0
@@ -427,7 +478,12 @@ def route_data_insights():
             "net_change": end_pax - start_pax,
         }
 
-    return jsonify(occupancy=series, meta=meta, metrics=metrics, snapshot=use_snapshot), 200
+    return jsonify(
+        occupancy=series,
+        meta=meta,
+        metrics=metrics,
+        snapshot=use_snapshot
+    ), 200
 
 
 @manager_bp.route("/metrics/tickets", methods=["GET"])
