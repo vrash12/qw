@@ -4,7 +4,7 @@ from flask import Blueprint, request, jsonify, g, current_app, url_for, redirect
 from sqlalchemy import func, case
 from sqlalchemy.orm import joinedload
 from typing import Any, Dict, List, Optional
-
+import os, textwrap
 from routes.auth import require_role
 from db import db
 from models.schedule import Trip, StopTime
@@ -37,6 +37,93 @@ except Exception:
 
 commuter_bp = Blueprint("commuter", __name__, url_prefix="/commuter")
 
+
+THEMES = {
+    "light": {
+        "bg": (248, 250, 248),
+        "card": (255, 255, 255),
+        "text": (28, 32, 28),
+        "subtle": (102, 114, 102),
+        "brand": (16, 122, 82),
+        "muted": (160, 168, 160),
+        "line": (226, 232, 226),
+        "accent": (20, 164, 108),
+        "qr_bg": (245, 247, 245),
+        "ribbon": (20, 164, 108),
+    },
+    "dark": {
+        "bg": (18, 18, 18),
+        "card": (28, 28, 28),
+        "text": (240, 240, 240),
+        "subtle": (189, 195, 199),
+        "brand": (66, 194, 133),
+        "muted": (120, 120, 120),
+        "line": (52, 52, 52),
+        "accent": (66, 194, 133),
+        "qr_bg": (36, 36, 36),
+        "ribbon": (50, 160, 110),
+    },
+}
+
+def _rounded_rect(draw: ImageDraw.ImageDraw, xy, radius, fill):
+    # Pillow >= 8.2 has rounded_rectangle; fall back to normal rect if missing
+    if hasattr(draw, "rounded_rectangle"):
+        draw.rounded_rectangle(xy, radius=radius, fill=fill)
+    else:
+        draw.rectangle(xy, fill=fill)
+
+def _load_font(name_candidates, size):
+    """
+    Try fonts in this order:
+      - /app static fonts (e.g., static/fonts/Inter.ttf, DejaVuSans.ttf)
+      - system fonts (Inter, DejaVuSans, Arial)
+      - PIL default
+    """
+    root = current_app.root_path if current_app else os.getcwd()
+    for nm in name_candidates:
+        # packaged in app
+        p = os.path.join(root, "static", "fonts", nm)
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+        # system lookup
+        try:
+            return ImageFont.truetype(nm, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+def _wrap(draw: ImageDraw.ImageDraw, text, font, max_width):
+    # simple word wrap using textbbox
+    if not text:
+        return [""]
+    words = text.split()
+    lines, line = [], []
+    for w in words:
+        test = " ".join(line + [w])
+        if draw.textlength(test, font=font) <= max_width:
+            line.append(w)
+        else:
+            if line:
+                lines.append(" ".join(line))
+            line = [w]
+    if line:
+        lines.append(" ".join(line))
+    return lines
+
+def _as_local(dt_obj: dt.datetime) -> dt.datetime:
+    """
+    Convert naive (assumed UTC) or aware datetime to LOCAL_TZ.
+    """
+    if dt_obj is None:
+        return dt.datetime.now(LOCAL_TZ)
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=dt.timezone.utc)
+    return dt_obj.astimezone(LOCAL_TZ)
+
+
 def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
@@ -44,9 +131,10 @@ def _debug_enabled() -> bool:
 @commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
 def commuter_ticket_image(ticket_id: int):
     """
-    Public, cacheable JPG of the exact receipt.
-    Optional query: ?download=1 → force download attachment.
+    Flat RGB-only JPG receipt renderer (no alpha, no rounded corners).
+    Optional: ?download=1 to force download.
     """
+    # --- fetch ticket ---
     t = (
         TicketSale.query.options(joinedload(TicketSale.user))
         .filter(TicketSale.id == ticket_id)
@@ -55,7 +143,7 @@ def commuter_ticket_image(ticket_id: int):
     if not t:
         return jsonify(error="ticket not found"), 404
 
-    # Resolve human names for stops (works for StopTime or TicketStop fallback)
+    # --- resolve stop names (StopTime or TicketStop fallback) ---
     if t.origin_stop_time:
         origin_name = t.origin_stop_time.stop_name
     else:
@@ -68,91 +156,153 @@ def commuter_ticket_image(ticket_id: int):
         tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
         destination_name = tsd.stop_name if tsd else ""
 
-    # Build the verification QR (pointing back to THIS image URL)
+    # --- QR that points back to THIS image URL ---
     img_link = url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True)
-    qr = qrcode.QRCode(box_size=10, border=2)
+    qr = qrcode.QRCode(box_size=10, border=1)
     qr.add_data(img_link)
     qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")  # RGB only
 
-    # Canvas
+    # --- canvas & palette (RGB only) ---
     W, H = 1080, 1600
-    bg = Image.new("RGB", (W, H), "white")
+    M = 48
+    GREEN        = (45, 80, 22)
+    LIGHT_GREEN  = (230, 244, 230)
+    MID_TEXT     = (85, 95, 85)
+    MUTED        = (140, 155, 140)
+    BORDER       = (210, 225, 210)
+    BG_TINT      = (245, 249, 245)
+    CARD_BG      = (255, 255, 255)
+
+    bg = Image.new("RGB", (W, H), BG_TINT)
     draw = ImageDraw.Draw(bg)
 
-    # Fonts (fallback to default if TTF not available on server)
-    try:
-        font_title = ImageFont.truetype("arial.ttf", 48)
-        font_label = ImageFont.truetype("arial.ttf", 28)
-        font_text  = ImageFont.truetype("arial.ttf", 40)
-        font_small = ImageFont.truetype("arial.ttf", 28)
-    except Exception:
-        font_title = font_label = font_text = font_small = ImageFont.load_default()
+    # fonts with safe fallbacks
+    def _font(name, size):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            try:
+                return ImageFont.truetype("DejaVuSans.ttf", size)
+            except Exception:
+                return ImageFont.load_default()
 
-    # Header
-    y = 80
-    draw.text((60, y), "PGT Onboard — Official Receipt", fill=(34, 85, 34), font=font_title)
-    y += 90
-    draw.line([(60, y), (W-60, y)], fill=(200, 220, 200), width=4)
-    y += 30
+    ft_h1   = _font("arialbd.ttf", 46)
+    ft_h2   = _font("arialbd.ttf", 38)
+    ft_lbl  = _font("arial.ttf",   26)
+    ft_val  = _font("arialbd.ttf", 32)
+    ft_big  = _font("arialbd.ttf", 56)
+    ft_foot = _font("arial.ttf",   22)
 
-    # Body fields
-    def row(label, value):
-        nonlocal y
-        draw.text((60, y), label, fill=(90, 110, 90), font=font_label)
-        draw.text((400, y-6), value, fill=(20, 20, 20), font=font_text)
-        y += 70
+    def tw(s, font): return draw.textlength(s, font=font)
+    def ellipsize(s: str, max_chars: int) -> str:
+        if len(s) <= max_chars: return s
+        keep = max(6, max_chars // 2 - 1)
+        return s[:keep] + "…" + s[-(max_chars - keep - 1):]
 
-    date_str = t.created_at.strftime("%B %d, %Y")
-    time_str = t.created_at.strftime("%I:%M %p").lstrip("0").lower()
-    passenger = t.passenger_type.title()
-    fare_str = f"PHP {float(t.price or 0):.2f}"
+    # --- white card (square corners, no alpha) ---
+    card_box = (M, M - 8, W - M, H - M - 8)
+    draw.rectangle(card_box, fill=CARD_BG, outline=BORDER, width=1)
 
-    row("Reference No.", t.reference_no)
-    row("Date / Time", f"{date_str}  ·  {time_str}")
-    row("From", origin_name or "—")
-    row("To", destination_name or "—")
-    row("Passenger Type", passenger)
-    row("Commuter", f"{t.user.first_name} {t.user.last_name}" if t.user else "—")
+    y = M + 20
 
-    y += 10
-    draw.line([(60, y), (W-60, y)], fill=(230, 235, 230), width=2)
-    y += 30
+    # --- header bar (square) ---
+    header_h = 96
+    head_box = (M, y, W - M, y + header_h)
+    draw.rectangle(head_box, fill=LIGHT_GREEN)
+    draw.text((M + 28, y + (header_h - 46) // 2), "PGT Onboard — Official Receipt", fill=GREEN, font=ft_h1)
+    y += header_h + 18
+    draw.line((M + 28, y, W - M - 28, y), fill=BORDER, width=2)
+    y += 24
 
-    # Fare summary
-    draw.text((60, y), "Total Amount", fill=(90, 110, 90), font=font_label)
-    draw.text((400, y-6), fare_str, fill=(20, 80, 40), font=font_text)
-    y += 90
+    # --- two-column fields ---
+    L = M + 28
+    R = W - M - 28
+    COL_GAP = 40
+    COL_W = (R - L - COL_GAP) // 2
 
-    # QR block (verification)
-    draw.text((60, y), "Scan to view/download this receipt", fill=(90, 110, 90), font=font_small)
-    y += 20
+    def field(x, y, label, value):
+        draw.text((x, y), label, fill=MUTED, font=ft_lbl)
+        y2 = y + ft_lbl.size + 8
+        val = value if tw(value, ft_val) <= COL_W else ellipsize(value, 28)
+        draw.text((x, y2), val, fill=(20, 20, 20), font=ft_val)
+        return y2 + ft_val.size + 18
+
+    yL = y
+    yR = y
+    yL = field(L, yL, "Reference No.", t.reference_no or "—")
+    yR = field(L + COL_W + COL_GAP, yR, "To", destination_name or "—")
+    yL = field(L, yL, "Date / Time",
+               f"{t.created_at.strftime('%B %d, %Y')}  ·  {t.created_at.strftime('%I:%M %p').lstrip('0').lower()}")
+    yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
+    yL = field(L, yL, "From", origin_name or "—")
+    yR = field(L + COL_W + COL_GAP, yR, "Commuter",
+               f"{t.user.first_name} {t.user.last_name}" if t.user else "—")
+
+    y = max(yL, yR) + 2
+    draw.line((L, y, R, y), fill=BORDER, width=2)
+    y += 22
+
+    # --- amount + status ---
+    draw.text((L, y), "Total Amount", fill=MUTED, font=ft_lbl)
+    draw.text((L, y + 30), f"PHP {float(t.price or 0):.2f}", fill=GREEN, font=ft_big)
+
+    state_txt = "PAID" if t.paid else "UNPAID"
+    state_bg  = (35, 140, 70) if t.paid else (200, 50, 50)
+    pill_w = int(tw(state_txt, ft_h2) + 36)
+    pill_x1 = R - pill_w
+    pill_y1 = y + 4
+    # square "pill" to avoid alpha; still looks fine
+    draw.rectangle((pill_x1, pill_y1, R, pill_y1 + 58), fill=state_bg)
+    draw.text((pill_x1 + 18, pill_y1 + 10), state_txt, fill=(255, 255, 255), font=ft_h2)
+
+    y += 100
+
+    # --- QR panel (square) ---
     qr_side = 520
-    qr_pos = (60, y)
-    qr_img = qr_img.resize((qr_side, qr_side), Image.NEAREST)
-    bg.paste(qr_img, qr_pos)
+    qr_pad  = 20
+    panel_w = qr_side + qr_pad * 2
+    panel_h = qr_side + qr_pad * 2 + 60
+    panel_box = (L, y, L + panel_w, y + panel_h)
+    draw.rectangle(panel_box, fill=(247, 251, 247), outline=BORDER, width=1)
 
-    # Footer
-    draw.text((60, H-120), f"Paid: {'Yes' if t.paid else 'No'}", fill=(80, 80, 80), font=font_small)
-    draw.text((400, H-120), f"Bus ID: {t.bus_id}", fill=(80, 80, 80), font=font_small)
-    draw.text((60, H-80), img_link, fill=(140, 140, 140), font=font_small)
+    qr_resized = qr_img.resize((qr_side, qr_side))
+    bg.paste(qr_resized, (L + qr_pad, y + qr_pad))  # qr is RGB; no mask
+    draw.text((L + qr_pad, y + qr_pad + qr_side + 14),
+              "Scan to view/download this receipt", fill=MUTED, font=ft_lbl)
 
-    # Encode to JPEG
+    # --- right column next to QR ---
+    right_x = L + panel_w + 28
+    draw.text((right_x, y), "Payment", fill=MUTED, font=ft_lbl)
+    draw.text((right_x, y + 30), state_txt, fill=state_bg, font=ft_h2)
+
+    yy = y + 110
+    for k, v in [
+        ("Bus ID",  str(getattr(t, "bus_id", "") or "—")),
+ 
+    ]:
+        draw.text((right_x, yy), k, fill=MUTED, font=ft_lbl)
+        draw.text((right_x, yy + 26), v, fill=MID_TEXT, font=ft_val)
+        yy += 64
+
+    # footer
+    draw.text((L, H - M - 40), ellipsize(img_link, 60), fill=(120, 130, 120), font=ft_foot)
+
+    # --- encode to JPEG ---
+    from flask import send_file, make_response
     bio = BytesIO()
     bg.save(bio, format="JPEG", quality=92)
     bio.seek(0)
 
-    from flask import send_file, make_response
-    as_download = (request.args.get("download") in {"1", "true", "yes"})
+    as_download = (request.args.get("download") or "").lower() in {"1", "true", "yes"}
     resp = make_response(send_file(
         bio,
         mimetype="image/jpeg",
         as_attachment=as_download,
-        download_name=f"receipt_{t.reference_no}.jpg"
+        download_name=f"receipt_{t.reference_no}.jpg",
     ))
     resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp
-
 
 @commuter_bp.app_errorhandler(Exception)
 def _commuter_errors(e: Exception):
@@ -224,6 +374,46 @@ def qr_image_for_ticket(ticket_id: int):
     return redirect(url_for("static", filename=f"qr/{filename}", _external=True), code=302)
 
 
+@commuter_bp.route("/tickets/<int:ticket_id>/view", methods=["GET"])
+def commuter_ticket_view(ticket_id: int):
+    """
+    Minimal HTML view with the same image + a download button.
+    Keeps the image URL canonical for QR verification flows.
+    """
+    img_url = url_for("commuter.commuter_ticket_image", ticket_id=ticket_id, _external=True)
+    dl_url = img_url + ("&" if "?" in img_url else "?") + "download=1"
+    return (
+        f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Receipt #{ticket_id}</title>
+    <style>
+      body {{ margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, sans-serif; background:#0b0b0b; color:#f2f2f2; }}
+      .wrap {{ max-width: 720px; margin: 24px auto; padding: 16px; }}
+      .card {{ background:#1c1c1c; border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.3) }}
+      img {{ width:100%; height:auto; border-radius:12px; display:block }}
+      .actions {{ margin-top:12px; display:flex; gap:8px }}
+      a.btn {{ text-decoration:none; padding:12px 16px; border-radius:12px; background:#42c285; color:#0b0b0b; font-weight:600; display:inline-block }}
+      a.link {{ color:#bdbdbd }}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <img src="{img_url}" alt="Receipt image"/>
+        <div class="actions">
+          <a class="btn" href="{dl_url}">Download JPG</a>
+          <a class="link" href="{img_url}">Open image</a>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>""",
+        200,
+        {"Content-Type": "text/html; charset=utf-8"},
+    )
 
 @commuter_bp.route("/tickets/<int:ticket_id>", methods=["GET"])
 @require_role("commuter")
