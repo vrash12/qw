@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from dateutil import parser as dtparse
-from flask import Blueprint, request, jsonify, g, current_app, url_for
+from flask import Blueprint, request, jsonify, g, current_app, url_for, abort
 from sqlalchemy import func
 from sqlalchemy.orm import joinedload
 
@@ -28,6 +28,62 @@ from utils.push import send_push_async
 pao_bp = Blueprint("pao", __name__, url_prefix="/pao")
 
 
+# --- helper (place near other helpers) ---
+def _ann_json(ann: Announcement) -> dict:
+    u = User.query.get(ann.created_by)
+    bus_row = Bus.query.get(getattr(u, "assigned_bus_id", None)) if u else None
+    bus_identifier = (bus_row.identifier or f"bus-{bus_row.id:02d}") if bus_row else "—"
+    return {
+        "id": ann.id,
+        "message": ann.message,
+        "timestamp": ann.timestamp.replace(tzinfo=timezone.utc).isoformat(),
+        "created_by": ann.created_by,
+        "author_name": f"{u.first_name} {u.last_name}" if u else "",
+        "bus": bus_identifier,
+    }
+
+@pao_bp.route("/broadcast/<int:ann_id>", methods=["PATCH"])
+@require_role("pao")
+def update_broadcast(ann_id: int):
+    ann = Announcement.query.get(ann_id)
+    if not ann:
+        return jsonify(error="announcement not found"), 404
+    if ann.created_by != g.user.id:
+        return jsonify(error="not allowed to modify this announcement"), 403
+
+    data = request.get_json(silent=True) or {}
+    msg = (data.get("message") or "").strip()
+    if not msg:
+        return jsonify(error="message is required"), 400
+
+    ann.message = msg
+    try:
+        db.session.commit()
+        return jsonify(_ann_json(ann)), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("update_broadcast failed")
+        return jsonify(error=str(e)), 500
+
+# --- DELETE an announcement (author-only) ---
+@pao_bp.route("/broadcast/<int:ann_id>", methods=["DELETE"])
+@require_role("pao")
+def delete_broadcast(ann_id: int):
+    ann = Announcement.query.get(ann_id)
+    if not ann:
+        return jsonify(error="announcement not found"), 404
+    if ann.created_by != g.user.id:
+        return jsonify(error="not allowed to delete this announcement"), 403
+
+    try:
+        db.session.delete(ann)
+        db.session.commit()
+        return jsonify(id=ann_id, deleted=True), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("delete_broadcast failed")
+        return jsonify(error=str(e)), 500
+        
 @pao_bp.route("/reset-live-stats", methods=["POST"])
 @require_role("pao")
 def reset_live_stats():
