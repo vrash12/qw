@@ -1,4 +1,5 @@
 # backend/routes/auth.py
+from __future__ import annotations
 from flask import Blueprint, request, jsonify, g, current_app
 from models.user import User
 from db import db
@@ -11,7 +12,20 @@ from sqlalchemy.exc import OperationalError
 auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
 
 SECRET_KEY = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+@auth_bp.route("/me", methods=["GET"])
+def me():
+    u = getattr(g, "user", None)
+    if not u:
+        return jsonify(error="unauthorized"), 401
 
+    return jsonify({
+        "id": u.id,
+        "email": getattr(u, "email", None),
+        "first_name": getattr(u, "first_name", ""),
+        "last_name": getattr(u, "last_name", ""),
+        "role": getattr(u, "role", None),
+        "assigned_bus_id": getattr(u, "assigned_bus_id", None),
+    }), 200
 @auth_bp.route('/signup', methods=['POST'])
 def signup():
     data = request.get_json() or {}

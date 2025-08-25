@@ -1,4 +1,4 @@
-# backend/routes/pao.py
+#backend/routes/pao.py
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -7,6 +7,12 @@ from dateutil import parser as dtparse
 from flask import Blueprint, request, jsonify, g, current_app, url_for, abort
 from sqlalchemy import func
 from sqlalchemy.orm import joinedload
+
+# ✅ make this resilient whether you run `python run.py` or via a package
+try:
+    from app.realtime import emit_announcement  # when app is a package
+except ImportError:
+    from realtime import emit_announcement      # when files are top-level
 
 from db import db
 from models.announcement import Announcement
@@ -21,9 +27,7 @@ from mqtt_ingest import publish
 from routes.auth import require_role
 from routes.tickets_static import jpg_name, QR_PATH
 from utils.qr import build_qr_payload
-from utils.push import send_push_async
-
-
+from utils.push import send_push_async  # ✅ keep this
 
 pao_bp = Blueprint("pao", __name__, url_prefix="/pao")
 
@@ -671,9 +675,11 @@ def broadcast():
         payload = {
             "id": ann.id,
             "message": ann.message,
+            # treat DB-naive as UTC for clients
             "timestamp": ann.timestamp.replace(tzinfo=timezone.utc).isoformat(),
             "bus_identifier": bus_identifier,
         }
+        emit_announcement(payload, bus_id=bus_id)
 
         # 🔔 NEW: push immediately to commuters (scope: all commuters; narrow later if needed)
         tokens = [
@@ -693,21 +699,20 @@ def broadcast():
             )
 
 
-        return jsonify(
-            {
-                "id": ann.id,
-                "message": ann.message,
-                "timestamp": ann.timestamp.replace(tzinfo=timezone.utc).isoformat(),
-                "created_by": ann.created_by,
-                "author_name": f"{g.user.first_name} {g.user.last_name}",
-                "bus": bus_identifier,
-            }
-        ), 201
+        return jsonify({
+            "id": ann.id,
+            "message": ann.message,
+            "timestamp": payload["timestamp"],
+            "created_by": ann.created_by,
+            "author_name": f"{g.user.first_name} {g.user.last_name}",
+            "bus": bus_identifier,
+        }), 201
 
     except Exception:
         db.session.rollback()
         current_app.logger.exception("broadcast failed")
         return jsonify(error="internal server error"), 500
+        
 
 @pao_bp.route("/broadcast", methods=["GET"])
 @require_role("pao")

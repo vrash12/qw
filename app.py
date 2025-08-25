@@ -18,7 +18,7 @@ from routes.pao           import pao_bp
 from routes.manager       import manager_bp
 
 from routes.tickets_static import tickets_bp
-
+from realtime import socketio
 # util (optional import, not strictly necessary here)
 from utils.push            import send_push, push_to_bus
 from flask_cors import CORS
@@ -36,7 +36,7 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
 
-
+    
 
     with app.app_context():
         @event.listens_for(db.engine, "connect")
@@ -74,5 +74,6 @@ def create_app():
         """Compute and store metrics for finished trips."""
         snap_finished_trips()
         print("Trip snapshots complete.")
+    socketio.init_app(app, cors_allowed_origins="*")
     return app
 
