@@ -387,18 +387,22 @@ def create_ticket():
         qr_bg_url = f"{request.url_root.rstrip('/')}/{QR_PATH}/{img}"
 
         # 🔔 push notification to the commuter's device(s)
+        # 🔔 push notification to the commuter's device(s) — NEW TICKET
         try:
             tokens = [t.token for t in DeviceToken.query.filter_by(user_id=user.id).all()]
             if tokens:
                 send_push_async(
                     tokens,
-                    "🎟️ Ticket Created",
+                    "🟢 New Ticket",
                     f"Ref {ref} • ₱{fare:.2f} • {o.stop_name} → {d.stop_name}",
-                    {"ticketId": ticket.id, "ref": ref},
-                    channelId="payments",
+                    {"deeplink": f"/commuter/receipt/{ticket.id}", "ticketId": ticket.id, "ref": ref},
+                    channelId="announcements",   # show in the commuter’s Announcements list
+                    priority="high",             # deliver now
+                    ttl=0,                       # no batching/queue delay
                 )
         except Exception:
             current_app.logger.exception("push to commuter failed")
+
 
         return jsonify({
             "id": ticket.id,

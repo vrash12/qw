@@ -1,9 +1,8 @@
 # routes/commuter.py
 import datetime as dt
-from functools import lru_cache
 from flask import Blueprint, request, jsonify, g, current_app, url_for, redirect
 from sqlalchemy import func, case
-from sqlalchemy.orm import joinedload, load_only
+from sqlalchemy.orm import joinedload
 from typing import Any, Dict, List, Optional
 import os, textwrap
 from routes.auth import require_role
@@ -23,6 +22,7 @@ import qrcode
 import traceback
 from werkzeug.exceptions import HTTPException
 from typing import Any, Optional
+from models.schedule import StopTime
 from datetime import timedelta
 
 # --- timezone setup ---
@@ -66,7 +66,6 @@ THEMES = {
     },
 }
 
-
 def _rounded_rect(draw: ImageDraw.ImageDraw, xy, radius, fill):
     # Pillow >= 8.2 has rounded_rectangle; fall back to normal rect if missing
     if hasattr(draw, "rounded_rectangle"):
@@ -74,32 +73,28 @@ def _rounded_rect(draw: ImageDraw.ImageDraw, xy, radius, fill):
     else:
         draw.rectangle(xy, fill=fill)
 
-
-@lru_cache(maxsize=64)
-def _font_cached(name: str, size: int):
+def _load_font(name_candidates, size):
     """
-    LRU-cached font loader. Tries:
-     - app static fonts
-     - system fonts
-     - PIL default
+    Try fonts in this order:
+      - /app static fonts (e.g., static/fonts/Inter.ttf, DejaVuSans.ttf)
+      - system fonts (Inter, DejaVuSans, Arial)
+      - PIL default
     """
     root = current_app.root_path if current_app else os.getcwd()
-    # packaged in app
-    p = os.path.join(root, "static", "fonts", name)
-    try:
+    for nm in name_candidates:
+        # packaged in app
+        p = os.path.join(root, "static", "fonts", nm)
         if os.path.exists(p):
-            return ImageFont.truetype(p, size)
-    except Exception:
-        pass
-    # system lookup
-    try:
-        return ImageFont.truetype(name, size)
-    except Exception:
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+        # system lookup
         try:
-            return ImageFont.truetype("DejaVuSans.ttf", size)
+            return ImageFont.truetype(nm, size)
         except Exception:
-            return ImageFont.load_default()
-
+            continue
+    return ImageFont.load_default()
 
 def _wrap(draw: ImageDraw.ImageDraw, text, font, max_width):
     # simple word wrap using textbbox
@@ -119,7 +114,6 @@ def _wrap(draw: ImageDraw.ImageDraw, text, font, max_width):
         lines.append(" ".join(line))
     return lines
 
-
 def _as_local(dt_obj: dt.datetime) -> dt.datetime:
     """
     Convert naive (assumed UTC) or aware datetime to LOCAL_TZ.
@@ -132,62 +126,78 @@ def _as_local(dt_obj: dt.datetime) -> dt.datetime:
 
 
 def _debug_enabled() -> bool:
-    return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1", "true", "yes"}
+    return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
 
-# ---------- Small in-memory caches to avoid recomputation ----------
-@lru_cache(maxsize=256)
-def _qr_rgb_for_data(data: str) -> Image.Image:
+@commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
+def commuter_ticket_image(ticket_id: int):
+    """
+    Flat RGB-only JPG receipt renderer (no alpha, no rounded corners).
+    Optional: ?download=1 to force download.
+    """
+    # --- fetch ticket ---
+    t = (
+        TicketSale.query.options(joinedload(TicketSale.user))
+        .filter(TicketSale.id == ticket_id)
+        .first()
+    )
+    if not t:
+        return jsonify(error="ticket not found"), 404
+
+    # --- resolve stop names (StopTime or TicketStop fallback) ---
+    if t.origin_stop_time:
+        origin_name = t.origin_stop_time.stop_name
+    else:
+        ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+        origin_name = ts.stop_name if ts else ""
+
+    if t.destination_stop_time:
+        destination_name = t.destination_stop_time.stop_name
+    else:
+        tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+        destination_name = tsd.stop_name if tsd else ""
+
+    # --- QR that points back to THIS image URL ---
+    img_link = url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True)
     qr = qrcode.QRCode(box_size=10, border=1)
-    qr.add_data(data)
+    qr.add_data(img_link)
     qr.make(fit=True)
-    return qr.make_image(fill_color="black", back_color="white").convert("RGB")  # RGB only
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")  # RGB only
 
-
-@lru_cache(maxsize=128)
-def _render_ticket_bytes_cached(
-    key: tuple,
-    *,
-    img_link: str,
-    ref_no: str,
-    created_at_dt: dt.datetime,
-    passenger_type: str,
-    price: float,
-    paid: bool,
-    destination_name: str,
-    origin_name: str,
-    commuter_name: str,
-) -> bytes:
-    """
-    Render the JPG bytes for a ticket. Cache key must include any fields that would change the pixels.
-    """
     # --- canvas & palette (RGB only) ---
     W, H = 1080, 1600
     M = 48
-    GREEN = (45, 80, 22)
-    LIGHT_GREEN = (230, 244, 230)
-    MID_TEXT = (85, 95, 85)
-    MUTED = (140, 155, 140)
-    BORDER = (210, 225, 210)
-    BG_TINT = (245, 249, 245)
-    CARD_BG = (255, 255, 255)
+    GREEN        = (45, 80, 22)
+    LIGHT_GREEN  = (230, 244, 230)
+    MID_TEXT     = (85, 95, 85)
+    MUTED        = (140, 155, 140)
+    BORDER       = (210, 225, 210)
+    BG_TINT      = (245, 249, 245)
+    CARD_BG      = (255, 255, 255)
 
     bg = Image.new("RGB", (W, H), BG_TINT)
     draw = ImageDraw.Draw(bg)
 
-    # fonts (cached)
-    ft_h1 = _font_cached("arialbd.ttf", 46)
-    ft_h2 = _font_cached("arialbd.ttf", 38)
-    ft_lbl = _font_cached("arial.ttf", 26)
-    ft_val = _font_cached("arialbd.ttf", 32)
-    ft_big = _font_cached("arialbd.ttf", 56)
-    ft_foot = _font_cached("arial.ttf", 22)
+    # fonts with safe fallbacks
+    def _font(name, size):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            try:
+                return ImageFont.truetype("DejaVuSans.ttf", size)
+            except Exception:
+                return ImageFont.load_default()
+
+    ft_h1   = _font("arialbd.ttf", 46)
+    ft_h2   = _font("arialbd.ttf", 38)
+    ft_lbl  = _font("arial.ttf",   26)
+    ft_val  = _font("arialbd.ttf", 32)
+    ft_big  = _font("arialbd.ttf", 56)
+    ft_foot = _font("arial.ttf",   22)
 
     def tw(s, font): return draw.textlength(s, font=font)
-
     def ellipsize(s: str, max_chars: int) -> str:
-        if len(s) <= max_chars:
-            return s
+        if len(s) <= max_chars: return s
         keep = max(6, max_chars // 2 - 1)
         return s[:keep] + "…" + s[-(max_chars - keep - 1):]
 
@@ -221,17 +231,14 @@ def _render_ticket_bytes_cached(
 
     yL = y
     yR = y
-    yL = field(L, yL, "Reference No.", ref_no or "—")
+    yL = field(L, yL, "Reference No.", t.reference_no or "—")
     yR = field(L + COL_W + COL_GAP, yR, "To", destination_name or "—")
-    yL = field(
-        L,
-        yL,
-        "Date / Time",
-        f"{created_at_dt.strftime('%B %d, %Y')}  ·  {created_at_dt.strftime('%I:%M %p').lstrip('0').lower()}",
-    )
-    yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (passenger_type or "").title() or "—")
+    yL = field(L, yL, "Date / Time",
+               f"{t.created_at.strftime('%B %d, %Y')}  ·  {t.created_at.strftime('%I:%M %p').lstrip('0').lower()}")
+    yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
     yL = field(L, yL, "From", origin_name or "—")
-    yR = field(L + COL_W + COL_GAP, yR, "Commuter", commuter_name or "—")
+    yR = field(L + COL_W + COL_GAP, yR, "Commuter",
+               f"{t.user.first_name} {t.user.last_name}" if t.user else "—")
 
     y = max(yL, yR) + 2
     draw.line((L, y, R, y), fill=BORDER, width=2)
@@ -239,13 +246,14 @@ def _render_ticket_bytes_cached(
 
     # --- amount + status ---
     draw.text((L, y), "Total Amount", fill=MUTED, font=ft_lbl)
-    draw.text((L, y + 30), f"PHP {float(price or 0):.2f}", fill=GREEN, font=ft_big)
+    draw.text((L, y + 30), f"PHP {float(t.price or 0):.2f}", fill=GREEN, font=ft_big)
 
-    state_txt = "PAID" if paid else "UNPAID"
-    state_bg = (35, 140, 70) if paid else (200, 50, 50)
+    state_txt = "PAID" if t.paid else "UNPAID"
+    state_bg  = (35, 140, 70) if t.paid else (200, 50, 50)
     pill_w = int(tw(state_txt, ft_h2) + 36)
     pill_x1 = R - pill_w
     pill_y1 = y + 4
+    # square "pill" to avoid alpha; still looks fine
     draw.rectangle((pill_x1, pill_y1, R, pill_y1 + 58), fill=state_bg)
     draw.text((pill_x1 + 18, pill_y1 + 10), state_txt, fill=(255, 255, 255), font=ft_h2)
 
@@ -253,20 +261,16 @@ def _render_ticket_bytes_cached(
 
     # --- QR panel (square) ---
     qr_side = 520
-    qr_pad = 20
+    qr_pad  = 20
     panel_w = qr_side + qr_pad * 2
     panel_h = qr_side + qr_pad * 2 + 60
     panel_box = (L, y, L + panel_w, y + panel_h)
     draw.rectangle(panel_box, fill=(247, 251, 247), outline=BORDER, width=1)
 
-    qr_img = _qr_rgb_for_data(img_link).resize((qr_side, qr_side))
-    bg.paste(qr_img, (L + qr_pad, y + qr_pad))
-    draw.text(
-        (L + qr_pad, y + qr_pad + qr_side + 14),
-        "Scan to view/download this receipt",
-        fill=MUTED,
-        font=ft_lbl,
-    )
+    qr_resized = qr_img.resize((qr_side, qr_side))
+    bg.paste(qr_resized, (L + qr_pad, y + qr_pad))  # qr is RGB; no mask
+    draw.text((L + qr_pad, y + qr_pad + qr_side + 14),
+              "Scan to view/download this receipt", fill=MUTED, font=ft_lbl)
 
     # --- right column next to QR ---
     right_x = L + panel_w + 28
@@ -275,124 +279,31 @@ def _render_ticket_bytes_cached(
 
     yy = y + 110
     for k, v in [
-        ("Bus ID", "—"),  # keep structure (value unknown here)
+        ("Bus ID",  str(getattr(t, "bus_id", "") or "—")),
+ 
     ]:
         draw.text((right_x, yy), k, fill=MUTED, font=ft_lbl)
         draw.text((right_x, yy + 26), v, fill=MID_TEXT, font=ft_val)
         yy += 64
 
     # footer
-    draw.text((L, H - M - 40), (img_link if len(img_link) <= 60 else img_link[:56] + "…"), fill=(120, 130, 120), font=ft_foot)
+    draw.text((L, H - M - 40), ellipsize(img_link, 60), fill=(120, 130, 120), font=ft_foot)
 
-    bio = BytesIO()
-    bg.save(bio, format="JPEG", quality=92, optimize=True)
-    return bio.getvalue()
-
-
-@commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
-def commuter_ticket_image(ticket_id: int):
-    """
-    Flat RGB-only JPG receipt renderer (no alpha, no rounded corners).
-    Optional: ?download=1 to force download.
-    Adds strong HTTP caching (ETag/Last-Modified) + in-process render cache.
-    """
-    # --- fetch ticket (eager-load minimal fields) ---
-    t: TicketSale = (
-        TicketSale.query.options(
-            joinedload(TicketSale.user).load_only(User.first_name, User.last_name),
-            joinedload(TicketSale.origin_stop_time).load_only(TicketStop.stop_name),
-            joinedload(TicketSale.destination_stop_time).load_only(TicketStop.stop_name),
-            load_only(
-                TicketSale.id,
-                TicketSale.reference_no,
-                TicketSale.created_at,
-                TicketSale.passenger_type,
-                TicketSale.price,
-                TicketSale.paid,
-                TicketSale.origin_stop_time_id,
-                TicketSale.destination_stop_time_id,
-                TicketSale.user_id,
-            ),
-        )
-        .filter(TicketSale.id == ticket_id)
-        .first()
-    )
-    if not t:
-        return jsonify(error="ticket not found"), 404
-
-    # --- resolve stop names (StopTime or TicketStop fallback) ---
-    if t.origin_stop_time:
-        origin_name = t.origin_stop_time.stop_name
-    else:
-        ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
-        origin_name = ts.stop_name if ts else ""
-
-    if t.destination_stop_time:
-        destination_name = t.destination_stop_time.stop_name
-    else:
-        tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
-        destination_name = tsd.stop_name if tsd else ""
-
-    commuter_name = f"{t.user.first_name} {t.user.last_name}" if t.user else "—"
-
-    # --- caching headers (use created_at as last-modified proxy) ---
-    last_mod = (t.created_at or dt.datetime.utcnow())
-    if last_mod.tzinfo is None:
-        last_mod = last_mod.replace(tzinfo=dt.timezone.utc)
-    last_mod_http = last_mod.strftime("%a, %d %b %Y %H:%M:%S GMT")
-    etag = f'W/"tkt:{t.id}:{int(last_mod.timestamp())}:{int(round(float(t.price or 0)*100))}:{1 if t.paid else 0}"'
-
-    inm = request.headers.get("If-None-Match")
-    ims = request.headers.get("If-Modified-Since")
-    if inm == etag or (ims and ims == last_mod_http):
-        return ("", 304, {"ETag": etag, "Last-Modified": last_mod_http})
-
-    # --- QR that points back to THIS image URL ---
-    img_link = url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True)
-
-    # --- render (cached) ---
-    cache_key = (
-        t.id,
-        t.reference_no or "",
-        float(t.price or 0),
-        bool(t.paid),
-        int(last_mod.timestamp()),
-        destination_name or "",
-        origin_name or "",
-        commuter_name or "",
-        (t.passenger_type or ""),
-    )
-    jpg_bytes = _render_ticket_bytes_cached(
-        cache_key,
-        img_link=img_link,
-        ref_no=t.reference_no or "",
-        created_at_dt=t.created_at,
-        passenger_type=t.passenger_type or "",
-        price=float(t.price or 0),
-        paid=bool(t.paid),
-        destination_name=destination_name or "",
-        origin_name=origin_name or "",
-        commuter_name=commuter_name or "",
-    )
-
-    # --- encode to response ---
+    # --- encode to JPEG ---
     from flask import send_file, make_response
-    as_download = (request.args.get("download") or "").lower() in {"1", "true", "yes"}
-    bio = BytesIO(jpg_bytes)
+    bio = BytesIO()
+    bg.save(bio, format="JPEG", quality=92)
     bio.seek(0)
-    resp = make_response(
-        send_file(
-            bio,
-            mimetype="image/jpeg",
-            as_attachment=as_download,
-            download_name=f"receipt_{t.reference_no}.jpg",
-        )
-    )
-    resp.headers["Cache-Control"] = "public, max-age=86400"
-    resp.headers["ETag"] = etag
-    resp.headers["Last-Modified"] = last_mod_http
-    return resp
 
+    as_download = (request.args.get("download") or "").lower() in {"1", "true", "yes"}
+    resp = make_response(send_file(
+        bio,
+        mimetype="image/jpeg",
+        as_attachment=as_download,
+        download_name=f"receipt_{t.reference_no}.jpg",
+    ))
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 
 @commuter_bp.app_errorhandler(Exception)
 def _commuter_errors(e: Exception):
@@ -409,22 +320,16 @@ def _commuter_errors(e: Exception):
 
     status = getattr(e, "code", 500)
     if _debug_enabled():
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "type": e.__class__.__name__,
-                    "error": str(e),
-                    "endpoint": request.endpoint,
-                    "path": request.path,
-                    "traceback": traceback.format_exc(),
-                }
-            ),
-            status,
-        )
+        return jsonify({
+            "ok": False,
+            "type": e.__class__.__name__,
+            "error": str(e),
+            "endpoint": request.endpoint,
+            "path": request.path,
+            "traceback": traceback.format_exc(),
+        }), status
 
     return jsonify({"error": "internal server error"}), status
-
 
 # -------- helpers --------
 def _as_time(v: Any) -> Optional[dt.time]:
@@ -511,17 +416,12 @@ def commuter_ticket_view(ticket_id: int):
         {"Content-Type": "text/html; charset=utf-8"},
     )
 
-
 @commuter_bp.route("/tickets/<int:ticket_id>", methods=["GET"])
 @require_role("commuter")
 def commuter_get_ticket(ticket_id: int):
     # Only allow the logged-in commuter to view their ticket
     t = (
-        TicketSale.query.options(
-            joinedload(TicketSale.user).load_only(User.first_name, User.last_name),
-            joinedload(TicketSale.origin_stop_time).load_only(TicketStop.stop_name),
-            joinedload(TicketSale.destination_stop_time).load_only(TicketStop.stop_name),
-        )
+        TicketSale.query.options(joinedload(TicketSale.user))
         .filter(TicketSale.id == ticket_id, TicketSale.user_id == g.user.id)
         .first()
     )
@@ -559,27 +459,22 @@ def commuter_get_ticket(ticket_id: int):
     )
     qr_link = url_for("commuter.qr_image_for_ticket", ticket_id=t.id, _external=True)
 
-    return (
-        jsonify(
-            {
-                "id": t.id,
-                "referenceNo": t.reference_no,
-                "date": t.created_at.strftime("%B %d, %Y"),
-                "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-                "origin": origin_name,
-                "destination": destination_name,
-                "passengerType": t.passenger_type.title(),
-                "commuter": f"{t.user.first_name} {t.user.last_name}",
-                "fare": f"{float(t.price or 0):.2f}",
-                "paid": bool(t.paid),
-                "qr": payload,  # JSON payload (schema/ids/names/link)
-                "qr_link": qr_link,  # dynamic redirect to static QR asset
-                "qr_url": qr_url,  # direct static asset URL
-                "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
-            }
-        ),
-        200,
-    )
+    return jsonify({
+        "id": t.id,
+        "referenceNo": t.reference_no,
+        "date": t.created_at.strftime("%B %d, %Y"),
+        "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+        "origin": origin_name,
+        "destination": destination_name,
+        "passengerType": t.passenger_type.title(),
+        "commuter": f"{t.user.first_name} {t.user.last_name}",
+        "fare": f"{float(t.price or 0):.2f}",
+        "paid": bool(t.paid),
+        "qr": payload,      # JSON payload (schema/ids/names/link)
+        "qr_link": qr_link, # dynamic redirect to static QR asset
+        "qr_url": qr_url,   # direct static asset URL
+        "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
+    }), 200
 
 
 @commuter_bp.route("/dashboard", methods=["GET"])
@@ -648,7 +543,7 @@ def dashboard():
         next_trip = None
 
     # -------- unread messages (for Announcements dashlet) --------
-    unread_msgs = db.session.query(func.count(Announcement.id)).scalar() or 0
+    unread_msgs = Announcement.query.count()
 
     # -------- last announcement pill --------
     last_ann_row = (
@@ -673,7 +568,7 @@ def dashboard():
             "bus_identifier": bid or "unassigned",
         }
 
-    # -------- LIVE NOW (bulk-fetch StopTimes to avoid N+1) --------
+    # -------- LIVE NOW (tolerant like route timeline) --------
     def _is_live_window(now_t: dt.time, s: Optional[dt.time], e: Optional[dt.time], *, grace_min: int = 3) -> bool:
         """
         True if now_t within [s,e). If s==e (zero-dwell), treat as ±grace_min minutes window.
@@ -690,7 +585,7 @@ def dashboard():
     live_now: List[Dict[str, Any]] = []
     debug_trips: List[Dict[str, Any]] = []
 
-    trips_today_rows = (
+    trips_today = (
         db.session.query(Trip, Bus.identifier.label("bus_identifier"))
         .join(Bus, Trip.bus_id == Bus.id)
         .filter(Trip.service_date == today_local)
@@ -698,51 +593,36 @@ def dashboard():
         .all()
     )
 
-    if trips_today_rows:
-        trip_ids = [t.id for (t, _) in trips_today_rows]
-        # One query for all stop times of today's trips
-        sts_all = (
-            StopTime.query.options(load_only(StopTime.trip_id, StopTime.seq, StopTime.arrive_time, StopTime.depart_time, StopTime.stop_name))
-            .filter(StopTime.trip_id.in_(trip_ids))
-            .order_by(StopTime.trip_id.asc(), StopTime.seq.asc(), StopTime.id.asc())
+    for t, bid in trips_today:
+        sts = (
+            StopTime.query.filter_by(trip_id=t.id)
+            .order_by(StopTime.seq.asc(), StopTime.id.asc())
             .all()
         )
-        stops_by_trip: Dict[int, List[StopTime]] = {}
-        for st in sts_all:
-            stops_by_trip.setdefault(st.trip_id, []).append(st)
-    else:
-        stops_by_trip = {}
-
-    for t, bid in trips_today_rows:
-        sts = stops_by_trip.get(t.id, [])
 
         events: List[Dict[str, Any]] = []
         if len(sts) < 2:
             # No usable stop list — fall back to full trip window
-            events.append(
-                {
-                    "type": "trip",
-                    "label": "In Transit",
-                    "start": _as_time(t.start_time),
-                    "end": _as_time(t.end_time),
-                    "description": "",
-                }
-            )
+            events.append({
+                "type": "trip",
+                "label": "In Transit",
+                "start": _as_time(t.start_time),
+                "end": _as_time(t.end_time),
+                "description": "",
+            })
         else:
             for idx, st in enumerate(sts):
                 # STOP window even if only one of arrive/depart exists
                 s = _as_time(st.arrive_time or st.depart_time)
                 e = _as_time(st.depart_time or st.arrive_time)
                 if s or e:
-                    events.append(
-                        {
-                            "type": "stop",
-                            "label": "At Stop",
-                            "start": s,
-                            "end": e,
-                            "description": st.stop_name,
-                        }
-                    )
+                    events.append({
+                        "type": "stop",
+                        "label": "At Stop",
+                        "start": s,
+                        "end": e,
+                        "description": st.stop_name,
+                    })
 
                 # TRIP window to next stop — be lenient with missing times
                 if idx < len(sts) - 1:
@@ -750,91 +630,77 @@ def dashboard():
                     s2 = _as_time(st.depart_time or st.arrive_time)
                     e2 = _as_time(nxt.arrive_time or nxt.depart_time)
                     if s2 and e2 and s2 != e2:
-                        events.append(
-                            {
-                                "type": "trip",
-                                "label": "In Transit",
-                                "start": s2,
-                                "end": e2,
-                                "description": f"{st.stop_name} → {nxt.stop_name}",
-                            }
-                        )
+                        events.append({
+                            "type": "trip",
+                            "label": "In Transit",
+                            "start": s2,
+                            "end": e2,
+                            "description": f"{st.stop_name} → {nxt.stop_name}",
+                        })
 
         # If still nothing, ensure one full window
         if not events:
-            events.append(
-                {
-                    "type": "trip",
-                    "label": "In Transit",
-                    "start": _as_time(t.start_time),
-                    "end": _as_time(t.end_time),
-                    "description": "",
-                }
-            )
+            events.append({
+                "type": "trip",
+                "label": "In Transit",
+                "start": _as_time(t.start_time),
+                "end": _as_time(t.end_time),
+                "description": "",
+            })
 
         chosen = None
         for ev in events:
             if _is_live_window(now_time_local, ev["start"], ev["end"], grace_min=3):
                 chosen = ev
-                live_now.append(
-                    {
-                        "bus_id": t.bus_id,
-                        "bus": (bid or "").replace("bus-", "Bus "),
-                        "trip_id": t.id,
-                        "type": ev["type"],
-                        "label": ev["label"],
-                        "start": ev["start"].strftime("%H:%M"),
-                        "end": ev["end"].strftime("%H:%M"),
-                        "description": ev["description"],
-                    }
-                )
-                break
-
-        # Final fallback: within the trip window -> In Transit
-        ts = _as_time(t.start_time)
-        te = _as_time(t.end_time)
-        if not chosen and ts and te and _is_live_window(now_time_local, ts, te, grace_min=0):
-            live_now.append(
-                {
+                live_now.append({
                     "bus_id": t.bus_id,
                     "bus": (bid or "").replace("bus-", "Bus "),
                     "trip_id": t.id,
-                    "type": "trip",
-                    "label": "In Transit",
-                    "start": ts.strftime("%H:%M"),
-                    "end": te.strftime("%H:%M"),
-                    "description": "",
-                }
-            )
+                    "type": ev["type"],
+                    "label": ev["label"],
+                    "start": ev["start"].strftime("%H:%M"),
+                    "end": ev["end"].strftime("%H:%M"),
+                    "description": ev["description"],
+                })
+                break
+
+        # Final fallback: if the specific segments didn't match but we're within the trip window, show In Transit
+        ts = _as_time(t.start_time)
+        te = _as_time(t.end_time)
+        if not chosen and ts and te and _is_live_window(now_time_local, ts, te, grace_min=0):
+            live_now.append({
+                "bus_id": t.bus_id,
+                "bus": (bid or "").replace("bus-", "Bus "),
+                "trip_id": t.id,
+                "type": "trip",
+                "label": "In Transit",
+                "start": ts.strftime("%H:%M"),
+                "end": te.strftime("%H:%M"),
+                "description": "",
+            })
 
         if debug_on:
             def _fmt(x: Optional[dt.datetime.time]) -> Optional[str]:
                 return x.strftime("%H:%M") if x else None
-
-            debug_trips.append(
-                {
-                    "trip_id": t.id,
-                    "bus": (bid or "").replace("bus-", "Bus "),
-                    "events": [
-                        {
-                            "type": ev["type"],
-                            "label": ev["label"],
-                            "start": _fmt(ev["start"]),
-                            "end": _fmt(ev["end"]),
-                            "desc": ev["description"],
-                            "hit": _is_live_window(now_time_local, ev["start"], ev["end"], grace_min=3),
-                        }
-                        for ev in events
-                    ],
-                    "chosen": None
-                    if not chosen
-                    else {
-                        "type": chosen["type"],
-                        "start": _fmt(chosen["start"]),
-                        "end": _fmt(chosen["end"]),
-                    },
-                }
-            )
+            debug_trips.append({
+                "trip_id": t.id,
+                "bus": (bid or "").replace("bus-", "Bus "),
+                "events": [
+                    {
+                        "type": ev["type"],
+                        "label": ev["label"],
+                        "start": _fmt(ev["start"]),
+                        "end": _fmt(ev["end"]),
+                        "desc": ev["description"],
+                        "hit": _is_live_window(now_time_local, ev["start"], ev["end"], grace_min=3),
+                    } for ev in events
+                ],
+                "chosen": None if not chosen else {
+                    "type": chosen["type"],
+                    "start": _fmt(chosen["start"]),
+                    "end": _fmt(chosen["end"]),
+                },
+            })
 
     # loud server logs
     current_app.logger.info(
@@ -842,7 +708,7 @@ def dashboard():
         len(live_now),
         now_time_local,
         today_local,
-        len(trips_today_rows),
+        len(trips_today),
     )
 
     payload: Dict[str, Any] = {
@@ -859,7 +725,7 @@ def dashboard():
             "now_local": now_local.strftime("%Y-%m-%d %H:%M:%S"),
             "today_local": str(today_local),
             "live_now_len": len(live_now),
-            "trips_today_len": len(trips_today_rows),
+            "trips_today_len": len(trips_today),
             "first_trip_debug": debug_trips[0] if debug_trips else None,
         }
 
@@ -884,10 +750,13 @@ def list_all_trips():
         .subquery()
     )
     first_stop_name_sq = (
-        db.session.query(StopTime.trip_id, StopTime.stop_name.label("origin"))
+        db.session.query(
+            StopTime.trip_id, StopTime.stop_name.label("origin")
+        )
         .join(
             first_stop_sq,
-            (StopTime.trip_id == first_stop_sq.c.trip_id) & (StopTime.seq == first_stop_sq.c.min_seq),
+            (StopTime.trip_id == first_stop_sq.c.trip_id)
+            & (StopTime.seq == first_stop_sq.c.min_seq),
         )
         .subquery()
     )
@@ -897,16 +766,24 @@ def list_all_trips():
         .subquery()
     )
     last_stop_name_sq = (
-        db.session.query(StopTime.trip_id, StopTime.stop_name.label("destination"))
+        db.session.query(
+            StopTime.trip_id, StopTime.stop_name.label("destination")
+        )
         .join(
             last_stop_sq,
-            (StopTime.trip_id == last_stop_sq.c.trip_id) & (StopTime.seq == last_stop_sq.c.max_seq),
+            (StopTime.trip_id == last_stop_sq.c.trip_id)
+            & (StopTime.seq == last_stop_sq.c.max_seq),
         )
         .subquery()
     )
 
     trips = (
-        db.session.query(Trip, Bus.identifier, first_stop_name_sq.c.origin, last_stop_name_sq.c.destination)
+        db.session.query(
+            Trip,
+            Bus.identifier,
+            first_stop_name_sq.c.origin,
+            last_stop_name_sq.c.destination,
+        )
         .join(Bus, Trip.bus_id == Bus.id)
         .outerjoin(first_stop_name_sq, Trip.id == first_stop_name_sq.c.trip_id)
         .outerjoin(last_stop_name_sq, Trip.id == last_stop_name_sq.c.trip_id)
@@ -955,7 +832,11 @@ def commuter_bus_trips():
     except ValueError:
         return jsonify(error="date must be YYYY-MM-DD"), 400
 
-    trips = Trip.query.filter_by(bus_id=bus_id, service_date=svc_date).order_by(Trip.start_time.asc()).all()
+    trips = (
+        Trip.query.filter_by(bus_id=bus_id, service_date=svc_date)
+        .order_by(Trip.start_time.asc())
+        .all()
+    )
     return (
         jsonify(
             [
@@ -979,7 +860,7 @@ def commuter_stop_times():
     if not trip_id:
         return jsonify(error="trip_id is required"), 400
 
-    sts = StopTime.query.filter_by(trip_id=trip_id).order_by(StopTime.seq.asc(), StopTime.id.asc()).all()
+    sts = StopTime.query.filter_by(trip_id=trip_id).order_by(StopTime.seq.asc()).all()
     return (
         jsonify(
             [
@@ -998,13 +879,7 @@ def commuter_stop_times():
 @commuter_bp.route("/location", methods=["GET"])
 @require_role("commuter")
 def vehicle_location():
-    sr = (
-        SensorReading.query.options(
-            load_only(SensorReading.lat, SensorReading.lng, SensorReading.occupied, SensorReading.timestamp)
-        )
-        .order_by(SensorReading.timestamp.desc())
-        .first()
-    )
+    sr = SensorReading.query.order_by(SensorReading.timestamp.desc()).first()
     if not sr:
         return jsonify(error="no sensor data"), 404
     return (
@@ -1016,8 +891,6 @@ def vehicle_location():
         ),
         200,
     )
-
-
 # --- date-window helper (local -> UTC) ---
 def _local_day_bounds_utc(day: dt.date):
     """
@@ -1025,9 +898,9 @@ def _local_day_bounds_utc(day: dt.date):
     We return *naive* UTC datetimes because your DB timestamps appear naive-UTC.
     """
     start_local = dt.datetime.combine(day, dt.time(0, 0, 0), tzinfo=LOCAL_TZ)
-    end_local = start_local + dt.timedelta(days=1)
-    start_utc = start_local.astimezone(dt.timezone.utc).replace(tzinfo=None)
-    end_utc = end_local.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    end_local   = start_local + dt.timedelta(days=1)
+    start_utc   = start_local.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    end_utc     = end_local.astimezone(dt.timezone.utc).replace(tzinfo=None)
     return start_utc, end_utc
 
 
@@ -1044,20 +917,20 @@ def my_receipts():
         bus_id=<int>          # filter tickets by bus (via Trip.bus_id)
         light=1               # keep for compatibility
     """
-    page = max(1, request.args.get("page", type=int, default=1))
+    page      = max(1, request.args.get("page", type=int, default=1))
     page_size = max(1, request.args.get("page_size", type=int, default=5))
-    date_str = request.args.get("date")
-    days = request.args.get("days")
-    bus_id = request.args.get("bus_id", type=int)
-    light = (request.args.get("light") or "").lower() in {"1", "true", "yes"}
+    date_str  = request.args.get("date")
+    days      = request.args.get("days")
+    bus_id    = request.args.get("bus_id", type=int)
+    light     = (request.args.get("light") or "").lower() in {"1", "true", "yes"}
 
     # ── base query: eager-load to avoid N+1s
     qs = (
         db.session.query(TicketSale)
         .options(
-            joinedload(TicketSale.user).load_only(User.first_name, User.last_name),
-            joinedload(TicketSale.origin_stop_time).load_only(TicketStop.stop_name),
-            joinedload(TicketSale.destination_stop_time).load_only(TicketStop.stop_name),
+            joinedload(TicketSale.user),
+            joinedload(TicketSale.origin_stop_time),
+            joinedload(TicketSale.destination_stop_time),
         )
         .filter(TicketSale.user_id == g.user.id)
     )
@@ -1080,17 +953,23 @@ def my_receipts():
         else:
             qs = qs.join(Trip, TicketSale.trip_id == Trip.id).filter(Trip.bus_id == bus_id)
 
-    # Fast COUNT(*) without ORDER BY
-    total = qs.order_by(None).with_entities(func.count(TicketSale.id)).scalar() or 0
+    total = qs.count()
 
-    rows = qs.order_by(TicketSale.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    rows = (
+        qs.order_by(TicketSale.created_at.desc())
+          .offset((page - 1) * page_size)
+          .limit(page_size)
+          .all()
+    )
 
     items = []
     for t in rows:
+        # choose QR asset
         amount = int(round(float(t.price or 0)))
         prefix = "discount" if t.passenger_type == "discount" else "regular"
         filename = f"{prefix}_{amount}.jpg"
         qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
+
 
         # resolve stop names
         if t.origin_stop_time:
@@ -1112,34 +991,29 @@ def my_receipts():
         )
         qr_link = url_for("commuter.qr_image_for_ticket", ticket_id=t.id, _external=True)
 
-        items.append(
-            {
-                "id": t.id,
-                "referenceNo": t.reference_no,
-                "date": t.created_at.strftime("%B %d, %Y"),
-                "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-                "origin": origin_name,
-                "destination": destination_name,
-                "passengerType": t.passenger_type.title(),
-                "commuter": f"{t.user.first_name} {t.user.last_name}",
-                "fare": f"{float(t.price or 0):.2f}",
-                "paid": bool(t.paid),
-                "qr_url": qr_url,
-                "qr": payload if not light else payload,
-                "qr_link": qr_link,
-            }
-        )
+        items.append({
+            "id": t.id,
+            "referenceNo": t.reference_no,
+            "date": t.created_at.strftime("%B %d, %Y"),
+            "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+            "origin": origin_name,
+            "destination": destination_name,
+            "passengerType": t.passenger_type.title(),
+            "commuter": f"{t.user.first_name} {t.user.last_name}",
+            "fare": f"{float(t.price or 0):.2f}",
+            "paid": bool(t.paid),
+            "qr_url": qr_url,
+            "qr": payload if not light else payload,
+            "qr_link": qr_link,
+        })
 
-    return (
-        jsonify(
-            items=items,
-            page=page,
-            page_size=page_size,
-            total=total,
-            has_more=(page * page_size) < total,
-        ),
-        200,
-    )
+    return jsonify(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=(page * page_size) < total,
+    ), 200
 
 
 @commuter_bp.route("/trips/<int:trip_id>", methods=["GET"])
@@ -1169,6 +1043,7 @@ def get_trip(trip_id: int):
         ),
         200,
     )
+
 
 
 @commuter_bp.route("/timetable", methods=["GET"])
@@ -1261,7 +1136,6 @@ def schedule():
 
     return jsonify(events=events), 200
 
-
 @commuter_bp.route("/announcements", methods=["GET"])
 def announcements():
     """
@@ -1271,9 +1145,9 @@ def announcements():
         date=YYYY-MM-DD     # local calendar day (defaults to *today* in LOCAL_TZ)
         limit=<int>         # cap the number of rows (newest first)
     """
-    bus_id = request.args.get("bus_id", type=int)
+    bus_id   = request.args.get("bus_id", type=int)
     date_str = request.args.get("date")
-    limit = request.args.get("limit", type=int)
+    limit    = request.args.get("limit", type=int)
 
     # Base query: author + that author's assigned bus (outer join so unassigned still show)
     q = (
