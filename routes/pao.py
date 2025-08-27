@@ -395,11 +395,12 @@ def create_ticket():
             price=fare,
             passenger_type=p,
             reference_no=ref,
-            paid=False,
+            paid=True,  # ← everything is digital: consider it paid
             created_at=ticket_dt,
             origin_stop_time_id=o.id,
             destination_stop_time_id=d.id,
         )
+
         db.session.add(ticket)
         db.session.commit()
 
