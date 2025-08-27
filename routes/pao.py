@@ -31,6 +31,30 @@ from utils.push import send_push_async  # ✅ keep this
 
 pao_bp = Blueprint("pao", __name__, url_prefix="/pao")
 
+# routes/pao.py
+@pao_bp.route("/device-token", methods=["POST"])
+@require_role("pao")
+def save_pao_device_token():
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "").strip() or None
+    if not token:
+        return jsonify(error="token required"), 400
+
+    created = False
+    row = DeviceToken.query.filter_by(token=token).first()
+    if not row:
+        row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
+        db.session.add(row)
+        created = True
+    else:
+        row.user_id = g.user.id
+        row.platform = platform or row.platform
+
+    db.session.commit()
+    current_app.logger.info(f"[push] saved PAO token token={token[:12]}… uid={g.user.id} created={created} platform={row.platform}")
+    return jsonify(ok=True, created=created), (201 if created else 200)
+
 
 # --- helper (place near other helpers) ---
 def _ann_json(ann: Announcement) -> dict:
@@ -251,7 +275,7 @@ def pickup_request():
     ]
 
     # SAFE push (no import-time coupling to Expo SDK)
-    send_push(
+    send_push_async(
         tokens,
         "🚍 New Pickup Request",
         f"Commuter #{commuter_id} is waiting.",
@@ -390,6 +414,7 @@ def create_ticket():
         # 🔔 push notification to the commuter's device(s) — NEW TICKET
         try:
             tokens = [t.token for t in DeviceToken.query.filter_by(user_id=user.id).all()]
+            current_app.logger.info(f"[push:new-ticket] user_id={user.id} tokens={len(tokens)}")
             if tokens:
                 send_push_async(
                     tokens,
@@ -417,6 +442,9 @@ def create_ticket():
             "fare": f"{fare:.2f}",
             "paid": False,
         }), 201
+
+        current_app.logger.info(f"[push] commuter_id={user.id} tokens={len(tokens)}")
+
 
     except Exception as e:
         current_app.logger.exception("!! create_ticket unexpected error")
@@ -576,6 +604,7 @@ def mark_ticket_paid(ticket_id: int):
                 import time
                 sent_at = int(time.time() * 1000)
                 tokens = [t.token for t in DeviceToken.query.filter_by(user_id=ticket.user_id).all()]
+                current_app.logger.info(f"[push:paid] user_id={ticket.user_id} tokens={len(tokens)}")
                 if tokens:
                     send_push_async(
                         tokens,

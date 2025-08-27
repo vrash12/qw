@@ -348,20 +348,32 @@ def _as_time(v: Any) -> Optional[dt.time]:
                 pass
     return None
 
-
+# routes/commuter.py
 @commuter_bp.route("/device-token", methods=["POST"])
 @require_role("commuter")
 def save_device_token():
     data = request.get_json(silent=True) or {}
-    tok = (data.get("token") or "").strip()
-    if not tok:
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "").strip() or None
+    if not token:
         return jsonify(error="token required"), 400
-    exists = DeviceToken.query.filter_by(user_id=g.user.id, token=tok).first()
-    if not exists:
-        db.session.add(DeviceToken(user_id=g.user.id, token=tok))
-        db.session.commit()
-        return jsonify(success=True, created=True), 201
-    return jsonify(success=True, created=False), 200
+
+    created = False
+    # 🔑 upsert by token (unique), then reassign to current user
+    row = DeviceToken.query.filter_by(token=token).first()
+    if not row:
+        row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
+        db.session.add(row)
+        created = True
+    else:
+        row.user_id = g.user.id
+        row.platform = platform or row.platform
+
+    db.session.commit()
+    current_app.logger.info(f"[push] saved token token={token[:12]}… uid={g.user.id} created={created} platform={row.platform}")
+    return jsonify(ok=True, created=created), (201 if created else 200)
+
+
 
 
 @commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
