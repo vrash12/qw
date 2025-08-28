@@ -10,39 +10,34 @@ class User(db.Model):
     username      = db.Column(db.String(64), unique=True, nullable=False)
     phone_number  = db.Column(db.String(32), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
-    role = db.Column(db.Enum("commuter", "pao", "manager"), nullable=False, default="commuter")
-    
-    # ... (assigned_bus_id and assigned_bus relationship are correct)
+    role          = db.Column(db.Enum("commuter", "pao", "manager"), nullable=False, default="commuter")
+
     assigned_bus_id = db.Column(db.Integer, db.ForeignKey("buses.id"))
     assigned_bus    = db.relationship("Bus", back_populates="pao", uselist=False)
 
-    # ... (ticket_sales relationship is correct)
-    ticket_sales = db.relationship('TicketSale', back_populates='user', cascade='all, delete-orphan')
+    # the tickets where this user is the *commuter/owner*
+    ticket_sales = db.relationship(
+        'TicketSale',
+        foreign_keys='TicketSale.user_id',
+        back_populates='user',
+        cascade='all, delete-orphan'
+    )
 
+    # the tickets where this user is the *PAO issuer*
+    issued_tickets = db.relationship(
+        'TicketSale',
+        foreign_keys='TicketSale.issued_by',
+        back_populates='issuer'
+    )
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
-    # ─── helpers ───────────────────────────────────────────────
-    @property
-    def is_pao(self):
-        return self.role == "pao"
 
     @property
-    def is_manager(self):
-        return self.role == "manager"
-    @property
-    def is_pao(self):
-        return self.role == 'pao'
+    def is_pao(self): return self.role == 'pao'
 
     @property
-    def is_manager(self):
-        return self.role == 'manager'
-    
-    ticket_sales = db.relationship(
-        'TicketSale',
-        back_populates='user',
-        cascade='all, delete-orphan'
-    )
+    def is_manager(self): return self.role == 'manager'

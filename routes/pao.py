@@ -399,13 +399,22 @@ def create_ticket():
             created_at=ticket_dt,
             origin_stop_time_id=o.id,
             destination_stop_time_id=d.id,
+            issued_by=g.user.id,
         )
 
         db.session.add(ticket)
         db.session.commit()
 
+        current_app.logger.info(
+            "[PAO:create_ticket] ticket_id=%s ref=%s bus_id=%s issued_by=%s g.user.id=%s",
+            ticket.id, ref, bus_id, getattr(ticket, "issued_by", None), getattr(getattr(g, "user", None), "id", None)
+        )
+        if not getattr(ticket, "issued_by", None):
+            current_app.logger.warning(
+                "[PAO:create_ticket] issued_by is NULL right after commit (unexpected)"
+            )
         payload = build_qr_payload(ticket, origin_name=o.stop_name, destination_name=d.stop_name)
-        qr_link = url_for("commuter.qr_image_for_ticket", ticket_id=ticket.id, _external=True)
+        qr_link = url_for("commuter.commuter_ticket_receipt_qr", ticket_id=ticket.id, _external=True)
 
         # background image for the ticket (static JPG)
         img = jpg_name(fare, p)
@@ -442,6 +451,7 @@ def create_ticket():
             "commuter": f"{user.first_name} {user.last_name}",
             "fare": f"{fare:.2f}",
             "paid": False,
+            "paoId": g.user.id, 
         }), 201
 
         current_app.logger.info(f"[push] commuter_id={user.id} tokens={len(tokens)}")
@@ -534,38 +544,71 @@ def list_tickets():
     return jsonify(out), 200
 
 
+# routes/pao.py
 @pao_bp.route("/tickets/<int:ticket_id>", methods=["GET"])
 @require_role("pao")
 def get_ticket(ticket_id):
-    ticket = (
-        TicketSale.query.options(joinedload(TicketSale.user))
+    t = (
+        TicketSale.query.options(
+            joinedload(TicketSale.user),
+            joinedload(TicketSale.origin_stop_time),
+            joinedload(TicketSale.destination_stop_time),
+        )
         .filter(TicketSale.id == ticket_id)
         .first()
     )
-    if not ticket:
+    if not t:
         return jsonify(error="ticket not found"), 404
 
-    origin_name = ticket.origin_stop_time.stop_name if ticket.origin_stop_time else (
-        TicketStop.query.get(getattr(ticket, "origin_stop_time_id", None)).stop_name
-        if getattr(ticket, "origin_stop_time_id", None) else ""
-    )
-    destination_name = ticket.destination_stop_time.stop_name if ticket.destination_stop_time else (
-        TicketStop.query.get(getattr(ticket, "destination_stop_time_id", None)).stop_name
-        if getattr(ticket, "destination_stop_time_id", None) else ""
-    )
+    # Resolve stop names with TicketStop fallback
+    if t.origin_stop_time:
+        origin_name = t.origin_stop_time.stop_name
+    else:
+        ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+        origin_name = ts.stop_name if ts else ""
 
+    if t.destination_stop_time:
+        destination_name = t.destination_stop_time.stop_name
+    else:
+        tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+        destination_name = tsd.stop_name if tsd else ""
+
+    # Choose QR asset(s)
+    amount = int(round(float(t.price or 0)))
+    prefix = "discount" if t.passenger_type == "discount" else "regular"
+    filename = f"{prefix}_{amount}.jpg"
+    qr_url  = url_for("static", filename=f"qr/{filename}", _external=True)
+    qr_link = url_for("commuter.commuter_ticket_receipt_qr", ticket_id=t.id, _external=True)
+
+    # Optional background like your POST response
+    img = jpg_name(amount, t.passenger_type)
+    qr_bg_url = f"{request.url_root.rstrip('/')}/{QR_PATH}/{img}"
+
+    payload = build_qr_payload(t, origin_name=origin_name, destination_name=destination_name)
+
+    current_app.logger.info(
+        "[PAO:get_ticket] ticket_id=%s ref=%s issued_by=%s caller_pao=%s",
+        t.id, t.reference_no,
+        getattr(t, "issued_by", None),
+        getattr(getattr(g, "user", None), "id", None),
+    )
     return jsonify({
-        "id": ticket.id,
-        "referenceNo": ticket.reference_no,
-        "date": ticket.created_at.strftime("%B %d, %Y"),
-        "time": ticket.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-        "fare": f"{float(ticket.price):.2f}",
-        "passengerType": ticket.passenger_type,
-        "paid": bool(ticket.paid),
-        "busId": ticket.bus_id,
-        "ticketUuid": ticket.ticket_uuid,
+        "id": t.id,
+        "referenceNo": t.reference_no,
+        "date": t.created_at.strftime("%B %d, %Y"),
+        "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
         "origin": origin_name,
         "destination": destination_name,
+        "passengerType": (t.passenger_type or "").title(),             # Title case
+        "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "",
+        "fare": f"{float(t.price or 0):.2f}",
+        "paid": bool(t.paid),
+        "qr": payload,
+        "qr_link": qr_link,
+        "qr_url": qr_url,
+        "qr_bg_url": qr_bg_url,
+        "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
+        "paoId": getattr(t, "issued_by", None) or getattr(g, "user", None).id,  # fallback to caller
     }), 200
 
 
