@@ -6,7 +6,11 @@ from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
 from sqlalchemy import func
 from sqlalchemy.orm import aliased
+from decimal import Decimal
+from io import StringIO
+import csv
 
+from models.wallet import WalletAccount, WalletLedger, TopUp
 from db import db
 from routes.auth import require_role
 from models.bus import Bus
@@ -24,6 +28,418 @@ UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 manager_bp = Blueprint("manager", __name__)
+
+
+def _parse_start_end_or_date():
+    try:
+        if request.args.get("date"):
+            d = datetime.strptime(request.args["date"], "%Y-%m-%d").date()
+            start_dt = datetime.combine(d, datetime.min.time())
+            end_dt   = datetime.combine(d + timedelta(days=1), datetime.min.time())  # exclusive
+            return start_dt, end_dt
+        # else: start/end
+        start_str = request.args.get("start")
+        end_str   = request.args.get("end") or start_str
+        if start_str:
+            d0 = datetime.strptime(start_str, "%Y-%m-%d").date()
+            d1 = datetime.strptime(end_str,   "%Y-%m-%d").date()
+        else:
+            # default: today
+            today = datetime.utcnow().date()
+            d0 = d1 = today
+        start_dt = datetime.combine(d0, datetime.min.time())
+        end_dt   = datetime.combine(d1 + timedelta(days=1), datetime.min.time())  # exclusive
+        return start_dt, end_dt
+    except ValueError:
+        return None, None
+
+
+@manager_bp.route("/topups", methods=["GET"])
+@require_role("manager")
+def manager_list_topups():
+    """
+    Manager-facing list of successful wallet top-ups.
+
+    Query params:
+      - date=YYYY-MM-DD                     (single day)    OR
+      - start=YYYY-MM-DD&end=YYYY-MM-DD     (inclusive range)
+      - Optional filters: ?pao_id=##, ?user_id=##
+
+    Response (shape matches the ManagerTopUps screen expectations):
+      {
+        "items": [
+          {
+            "id": 123,
+            "created_at": "2025-08-30T09:05:00",
+            "amount_php": 150.0,
+            "method": "cash",
+            "pao_id": 21,
+            "pao_name": "Jane Doe",
+            "user_id": 17,
+            "commuter_name": "Juan Dela Cruz"
+          },
+          ...
+        ],
+        "count": 42,
+        "total_php": 1234.5,
+        "start": "2025-08-30",
+        "end": "2025-08-30"
+      }
+    """
+    start_dt, end_dt = _parse_start_end_or_date()
+    if not start_dt:
+        return jsonify(error="invalid date range"), 400
+
+    PAO = aliased(User)
+    C   = aliased(User)
+
+    q = (
+        db.session.query(
+            TopUp.id,
+            TopUp.created_at,
+            TopUp.amount_cents,
+            TopUp.method,
+            PAO.id.label("pao_id"),
+            PAO.first_name.label("pao_first"),
+            PAO.last_name.label("pao_last"),
+            C.id.label("user_id"),
+            C.first_name.label("c_first"),
+            C.last_name.label("c_last"),
+        )
+        .join(WalletAccount, WalletAccount.id == TopUp.account_id)
+        .join(C, C.id == WalletAccount.user_id)
+        .join(PAO, PAO.id == TopUp.pao_id)
+        .filter(TopUp.status == "succeeded")
+        .filter(TopUp.created_at >= start_dt, TopUp.created_at < end_dt)
+        .order_by(TopUp.id.desc())
+    )
+
+    # Optional filters
+    if (pao_id := request.args.get("pao_id", type=int)):
+        q = q.filter(TopUp.pao_id == pao_id)
+    if (user_id := request.args.get("user_id", type=int)):
+        q = q.filter(WalletAccount.user_id == user_id)
+
+    rows = q.all()
+
+    items = []
+    total_php = 0.0
+    for r in rows:
+        amt_php = round(float(r.amount_cents or 0) / 100.0, 2)
+        total_php += amt_php
+        items.append({
+            "id": r.id,
+            "created_at": r.created_at.isoformat(),
+            "amount_php": amt_php,                 # ✅ PHP only (no cents field)
+            "method": (r.method or "cash"),
+            "pao_id": r.pao_id,
+            "pao_name": f"{r.pao_first} {r.pao_last}".strip(),
+            "user_id": r.user_id,
+            "commuter_name": f"{r.c_first} {r.c_last}".strip(),
+        })
+
+    # friendly window echo (inclusive calendar dates)
+    start_day = (start_dt.date()).isoformat()
+    end_day   = ((end_dt - timedelta(seconds=1)).date()).isoformat()
+
+    return jsonify(
+        items=items,
+        count=len(items),
+        total_php=round(total_php, 2),
+        start=start_day,
+        end=end_day,
+    ), 200
+    
+def _parse_window_default_days(default_days: int = 7):
+    """Return (start_dt, end_dt) UTC-naive using ?from=YYYY-MM-DD&to=YYYY-MM-DD (inclusive),
+    or last N days when missing."""
+    try:
+        to_str = request.args.get("to")
+        from_str = request.args.get("from")
+        if to_str:
+            to_day = datetime.strptime(to_str, "%Y-%m-%d").date()
+        else:
+            to_day = datetime.utcnow().date()
+        if from_str:
+            from_day = datetime.strptime(from_str, "%Y-%m-%d").date()
+        else:
+            from_day = to_day - timedelta(days=default_days-1)
+    except ValueError:
+        return None, None
+
+    start_dt = datetime.combine(from_day, datetime.min.time())
+    end_dt   = datetime.combine(to_day + timedelta(days=1), datetime.min.time())  # exclusive
+    return start_dt, end_dt
+
+@manager_bp.route("/wallet/liability", methods=["GET"])
+@require_role("manager")
+def wallet_liability():
+    """Total unearned revenue (sum of balances)."""
+    s = db.session.query(func.coalesce(func.sum(WalletAccount.balance_cents), 0)).scalar() or 0
+    return jsonify(
+        liability_cents=int(s),
+        liability_php=round(s/100.0, 2)
+    ), 200
+
+@manager_bp.route("/wallet/topups", methods=["GET"])
+@require_role("manager")
+def wallet_topups():
+    """
+    Successful top-ups within a window.
+    Filters:
+      ?from=YYYY-MM-DD&to=YYYY-MM-DD
+      &pao_id=<id>
+      &user_id=<id>
+      &station_id=<id>
+    """
+    start_dt, end_dt = _parse_window_default_days(7)
+    if not start_dt:
+        return jsonify(error="invalid date range"), 400
+
+    PAO = aliased(User)
+    C   = aliased(User)
+    q = (db.session.query(
+            TopUp.id, TopUp.created_at, TopUp.amount_cents, TopUp.status, TopUp.station_id,
+            PAO.id.label("pao_id"), PAO.first_name.label("pao_first"), PAO.last_name.label("pao_last"),
+            C.id.label("user_id"),  C.first_name.label("c_first"),   C.last_name.label("c_last")
+        )
+        .join(WalletAccount, WalletAccount.id == TopUp.account_id)
+        .join(C, C.id == WalletAccount.user_id)
+        .join(PAO, PAO.id == TopUp.pao_id)
+        .filter(TopUp.status == "succeeded")
+        .filter(TopUp.created_at >= start_dt, TopUp.created_at < end_dt)
+        .order_by(TopUp.id.desc())
+    )
+
+    if (pao_id := request.args.get("pao_id", type=int)):
+        q = q.filter(TopUp.pao_id == pao_id)
+    if (user_id := request.args.get("user_id", type=int)):
+        q = q.filter(WalletAccount.user_id == user_id)
+    if (station_id := request.args.get("station_id", type=int)):
+        q = q.filter(TopUp.station_id == station_id)
+
+    page, page_size = _page_args(50, 500)
+    total = q.count()
+    rows = q.offset((page-1)*page_size).limit(page_size).all()
+
+    items = [{
+        "id": r.id,
+        "timestamp": r.created_at.isoformat(),
+        "amount_cents": int(r.amount_cents or 0),
+        "amount_php": round((r.amount_cents or 0)/100.0, 2),
+        "status": r.status,
+        "station_id": r.station_id,
+        "pao": {"id": r.pao_id, "name": f"{r.pao_first} {r.pao_last}"},
+        "user": {"id": r.user_id, "name": f"{r.c_first} {r.c_last}"},
+    } for r in rows]
+
+    total_amount = sum(i["amount_cents"] for i in items)
+
+    return jsonify(
+        items=items,
+        page=page, page_size=page_size, total=total,
+        has_more=(page*page_size) < total,
+        page_total_php=round(total_amount/100.0, 2)
+    ), 200
+
+
+@manager_bp.route("/wallet/ledger/export.csv", methods=["GET"])
+@require_role("manager")
+def wallet_ledger_export_csv():
+    start_dt, end_dt = _parse_window_default_days(7)
+    if not start_dt:
+        return jsonify(error="invalid date range"), 400
+
+    PAO = aliased(User)
+    C   = aliased(User)
+    q = (db.session.query(
+            WalletLedger.id, WalletLedger.created_at, WalletLedger.direction,
+            WalletLedger.event, WalletLedger.amount_cents, WalletLedger.running_balance_cents,
+            WalletLedger.ref_table, WalletLedger.ref_id,
+            Bus.identifier.label("bus"),
+            PAO.first_name.label("pao_first"), PAO.last_name.label("pao_last"),
+            C.first_name.label("c_first"),   C.last_name.label("c_last"),
+        )
+        .join(WalletAccount, WalletAccount.id == WalletLedger.account_id)
+        .join(C, C.id == WalletAccount.user_id)
+        .outerjoin(PAO, PAO.id == WalletLedger.performed_by)
+        .outerjoin(Bus, Bus.id == WalletLedger.bus_id)
+        .filter(WalletLedger.created_at >= start_dt, WalletLedger.created_at < end_dt)
+        .order_by(WalletLedger.id.desc())
+    )
+
+    if (ev := (request.args.get("event") or "").strip()):
+        q = q.filter(WalletLedger.event == ev)
+    if (direction := (request.args.get("direction") or "").strip()):
+        q = q.filter(WalletLedger.direction == direction)
+    if (pao_id := request.args.get("pao_id", type=int)):
+        q = q.filter(WalletLedger.performed_by == pao_id)
+    if (user_id := request.args.get("user_id", type=int)):
+        q = q.filter(WalletAccount.user_id == user_id)
+    if (bus_id := request.args.get("bus_id", type=int)):
+        q = q.filter(WalletLedger.bus_id == bus_id)
+
+    rows = q.all()
+
+    sio = StringIO()
+    w = csv.writer(sio)
+    w.writerow(["id","timestamp","direction","event","amount_php","running_balance_php","bus","pao","commuter","ref"])
+    for r in rows:
+        w.writerow([
+            r.id,
+            r.created_at.isoformat(),
+            r.direction,
+            r.event,
+            f"{(r.amount_cents or 0)/100:.2f}",
+            f"{(r.running_balance_cents or 0)/100:.2f}",
+            r.bus or "",
+            f"{(r.pao_first or '')} {(r.pao_last or '')}".strip(),
+            f"{(r.c_first or '')} {(r.c_last or '')}".strip(),
+            f"{r.ref_table}:{r.ref_id}" if r.ref_table and r.ref_id else ""
+        ])
+
+    resp = current_app.response_class(sio.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = "attachment; filename=wallet_ledger.csv"
+    return resp, 200
+
+# backend/routes/manager.py
+@manager_bp.route("/wallet/topup", methods=["POST"])
+@require_role("manager")
+def manager_topup():
+    data = request.get_json(silent=True) or {}
+    wallet_token = (data.get("wallet_token") or "").strip()
+    amount_cents = int(data.get("amount_cents") or 0)
+    station_id   = data.get("station_id")
+
+    if not wallet_token or amount_cents <= 0:
+        return jsonify(error="wallet_token and positive amount_cents are required"), 400
+
+    # 1) Resolve commuter from token
+    try:
+        # tolerate different return shapes from verify_wallet_token
+        res = verify_wallet_token(wallet_token)
+        if isinstance(res, dict):
+            user_id = res.get("user_id") or res.get("uid")
+        elif isinstance(res, (list, tuple)):
+            ok, payload = res[0], (res[1] if len(res) > 1 else None)
+            if not ok: return jsonify(error="invalid wallet token"), 400
+            user_id = payload.get("user_id") if isinstance(payload, dict) else payload
+        else:
+            user_id = int(res)
+        if not user_id:
+            return jsonify(error="invalid wallet token"), 400
+    except Exception:
+        return jsonify(error="invalid wallet token"), 400
+
+    # 2) Ensure account exists
+    acct = WalletAccount.query.filter_by(user_id=user_id).first()
+    if not acct:
+        acct = WalletAccount(user_id=user_id, balance_cents=0)
+        db.session.add(acct)
+        db.session.flush()  # get acct.id
+
+    # 3) Record TopUp row
+    tu = TopUp(
+        account_id=acct.id,
+        method="cash",
+        amount_cents=amount_cents,
+        status="succeeded",
+        pao_id=g.user.id,
+        station_id=station_id,
+    )
+    db.session.add(tu)
+    db.session.flush()  # get tu.id
+
+    # 4) Credit wallet + ledger
+    try:
+        # If your services.wallet.credit_wallet already handles ledger + running balance, use it:
+        credit_wallet(
+            account=acct,
+            amount_cents=amount_cents,
+            event="topup:cash",
+            performed_by=g.user.id,
+            ref_table="wallet_topups",
+            ref_id=tu.id,
+            station_id=station_id,
+        )
+    except TypeError:
+        # Fallback manual bookkeeping if signature differs / function missing
+        old = int(acct.balance_cents or 0)
+        new = old + amount_cents
+        acct.balance_cents = new
+        led = WalletLedger(
+            account_id=acct.id,
+            direction="credit",
+            event="topup:cash",
+            amount_cents=amount_cents,
+            running_balance_cents=new,
+            performed_by=g.user.id,
+            ref_table="wallet_topups",
+            ref_id=tu.id,
+            station_id=station_id,
+        )
+        db.session.add(led)
+
+    db.session.commit()
+    return jsonify(
+        ok=True,
+        topup_id=tu.id,
+        user_id=user_id,
+        account_id=acct.id,
+        balance_cents=int(acct.balance_cents or 0),
+        balance_php=round((acct.balance_cents or 0)/100.0, 2),
+    ), 201
+
+
+@manager_bp.route("/wallet/accounts", methods=["GET"])
+@require_role("manager")
+def wallet_accounts():
+    """Paginated wallet accounts with balances and basic search (by user name or phone)."""
+    q = (db.session.query(
+            WalletAccount.id.label("account_id"),
+            WalletAccount.balance_cents,
+            User.id.label("user_id"),
+            User.first_name, User.last_name, User.phone_number
+        )
+        .join(User, User.id == WalletAccount.user_id)
+        .order_by(WalletAccount.balance_cents.desc())
+    )
+
+    search = (request.args.get("q") or "").strip()
+    if search:
+        like = f"%{search}%"
+        q = q.filter(
+            (User.first_name.ilike(like)) |
+            (User.last_name.ilike(like))  |
+            (User.phone_number.ilike(like)) |
+            (func.concat(User.first_name, " ", User.last_name).ilike(like))
+        )
+
+    page, page_size = _page_args()
+    total = q.count()
+    rows = q.offset((page-1)*page_size).limit(page_size).all()
+
+    items = [{
+        "account_id": r.account_id,
+        "user_id": r.user_id,
+        "name": f"{r.first_name} {r.last_name}",
+        "phone": r.phone_number,
+        "balance_cents": int(r.balance_cents or 0),
+        "balance_php": round((r.balance_cents or 0)/100.0, 2),
+    } for r in rows]
+
+    return jsonify(
+        items=items, page=page, page_size=page_size, total=total,
+        has_more=(page*page_size) < total
+    ), 200
+
+
+
+def _page_args(default_size=25, max_size=200):
+    page = max(1, request.args.get("page", type=int, default=1))
+    page_size = min(max(1, request.args.get("page_size", type=int, default=default_size)), max_size)
+    return page, page_size
+
 
 
 @manager_bp.route("/revenue-breakdown", methods=["GET"])

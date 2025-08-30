@@ -9,8 +9,10 @@ class TicketSale(db.Model):
 
     id          = db.Column(db.Integer, primary_key=True)
 
-    # points to the *commuter* who owns the ticket
-    user_id     = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)  # ← was NOT NULL before
+    guest   = db.Column(db.Boolean, nullable=False, default=False)             # NEW
+
+    user   = db.relationship('User', back_populates='ticket_sales', foreign_keys=[user_id])
 
     fare_segment_id = db.Column(db.Integer,
                                 db.ForeignKey('fare_segments.id', ondelete='CASCADE'),

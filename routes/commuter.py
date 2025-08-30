@@ -27,6 +27,11 @@ from models.schedule import StopTime
 from datetime import timedelta
 from flask import send_file, make_response
 import qrcode
+from decimal import Decimal
+from models.wallet import WalletAccount, WalletLedger, TopUp
+from services.wallet import credit_wallet
+from utils.wallet_qr import build_wallet_token, verify_wallet_token
+
 from io import BytesIO
 
 # --- timezone setup ---
@@ -432,6 +437,44 @@ def commuter_ticket_image(ticket_id: int):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
+def _get_or_create_wallet_account(user_id: int) -> WalletAccount:
+    acct = WalletAccount.query.filter_by(user_id=user_id).first()
+    if not acct:
+        acct = WalletAccount(user_id=user_id, balance_cents=0)
+        db.session.add(acct)
+        db.session.commit()
+    return acct
+
+@commuter_bp.route("/wallet/me", methods=["GET"])
+@require_role("commuter")
+def wallet_me():
+    acct = WalletAccount.query.filter_by(user_id=g.user.id).first()
+    bal = int(getattr(acct, "balance_cents", 0) or 0)
+    return jsonify(balance_cents=bal, balance_php=round(bal/100.0, 2)), 200
+
+@commuter_bp.route("/wallet/ledger", methods=["GET"])
+@require_role("commuter")
+def wallet_ledger():
+    acct = _get_or_create_wallet_account(g.user.id)
+    rows = (WalletLedger.query
+            .filter_by(account_id=acct.id)
+            .order_by(WalletLedger.id.desc())
+            .limit(50).all())
+    items = [{
+        "id": r.id,
+        "direction": r.direction,
+        "event": r.event,
+        "amount_cents": r.amount_cents,
+        "running_balance_cents": r.running_balance_cents,
+        "created_at": r.created_at.isoformat()
+    } for r in rows]
+    return jsonify(items=items), 200
+
+@commuter_bp.route("/wallet/qrcode", methods=["GET"])
+@require_role("commuter")
+def wallet_qrcode():
+    token = build_wallet_token(g.user.id)
+    return jsonify(wallet_token=token), 200
 
 
 @commuter_bp.route("/tickets/<int:ticket_id>/receipt-qr.png", methods=["GET"])

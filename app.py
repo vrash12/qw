@@ -16,6 +16,7 @@ from routes.auth          import auth_bp
 from routes.commuter      import commuter_bp
 from routes.pao           import pao_bp
 from routes.manager       import manager_bp
+from models.wallet import WalletAccount, WalletLedger, TopUp
 
 from routes.tickets_static import tickets_bp
 from realtime import socketio

@@ -25,3 +25,10 @@ class Config:
             "write_timeout": 10,
         },
     }
+
+    WALLET_QR_SECRET = os.environ.get("WALLET_QR_SECRET", "dev-wallet-secret-change-me")
+    MIN_TOPUP_CENTS = int(os.environ.get("MIN_TOPUP_CENTS", "2000"))       # ₱20
+    MAX_TOPUP_CENTS = int(os.environ.get("MAX_TOPUP_CENTS", "200000"))     # ₱2,000
+    PAO_DAILY_TOPUP_LIMIT_CENTS = int(os.environ.get("PAO_DAILY_TOPUP_LIMIT_CENTS", "5000000"))  # ₱50,000
+
+
