@@ -452,29 +452,79 @@ def wallet_me():
     bal = int(getattr(acct, "balance_cents", 0) or 0)
     return jsonify(balance_cents=bal, balance_php=round(bal/100.0, 2)), 200
 
+
+
 @commuter_bp.route("/wallet/ledger", methods=["GET"])
 @require_role("commuter")
 def wallet_ledger():
     acct = _get_or_create_wallet_account(g.user.id)
-    rows = (WalletLedger.query
-            .filter_by(account_id=acct.id)
-            .order_by(WalletLedger.id.desc())
-            .limit(50).all())
+
+    # Fixed pagination: always 5 per page
+    page = max(1, request.args.get("page", type=int, default=1))
+    page_size = 2
+
+    base_q = WalletLedger.query.filter_by(account_id=acct.id)
+    total = base_q.count()
+    rows = (
+        base_q.order_by(WalletLedger.id.desc())
+              .offset((page - 1) * page_size)
+              .limit(page_size)
+              .all()
+    )
+
+    # Map TopUp.id -> method for any ledger rows that came from topups
+    topup_ref_ids = [
+        int(r.ref_id)
+        for r in rows
+        if r.event == "topup" and getattr(r, "ref_table", None) == "wallet_topups" and r.ref_id
+    ]
+
+    methods_by_topup_id = {}
+    if topup_ref_ids:
+        for t in TopUp.query.filter(TopUp.id.in_(topup_ref_ids)).all():
+            methods_by_topup_id[int(t.id)] = (t.method or "cash")
+
     items = [{
         "id": r.id,
         "direction": r.direction,
         "event": r.event,
-        "amount_cents": r.amount_cents,
-        "running_balance_cents": r.running_balance_cents,
-        "created_at": r.created_at.isoformat()
+        "amount_cents": int(r.amount_cents),
+        "running_balance_cents": int(r.running_balance_cents),
+        "created_at": r.created_at.isoformat(),
+        "method": (
+            methods_by_topup_id.get(int(r.ref_id))
+            if r.event == "topup" and getattr(r, "ref_table", None) == "wallet_topups"
+            else None
+        ),
     } for r in rows]
-    return jsonify(items=items), 200
+
+    return jsonify(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=(page * page_size) < total,
+    ), 200
+
 
 @commuter_bp.route("/wallet/qrcode", methods=["GET"])
 @require_role("commuter")
 def wallet_qrcode():
-    token = build_wallet_token(g.user.id)
-    return jsonify(wallet_token=token), 200
+    token = build_wallet_token(g.user.id)  # now stable per commuter
+    # You can use any domain here; PAO scanner only needs the query param.
+    deep_link = f"https://pay.example/charge?wallet_token={token}&autopay=1"
+    return jsonify(wallet_token=token, deep_link=deep_link), 200
+
+# (optional) allow user to rotate their QR
+@commuter_bp.route("/wallet/qrcode/rotate", methods=["POST"])
+@require_role("commuter")
+def wallet_qrcode_rotate():
+    acct = WalletAccount.query.filter_by(user_id=g.user.id).with_for_update().first()
+    from utils.wallet_qr import _mint_token
+    acct.qr_token = _mint_token()
+    db.session.commit()
+    deep_link = f"https://pay.example/charge?wallet_token={acct.qr_token}&autopay=1"
+    return jsonify(wallet_token=acct.qr_token, deep_link=deep_link), 200
 
 
 @commuter_bp.route("/tickets/<int:ticket_id>/receipt-qr.png", methods=["GET"])

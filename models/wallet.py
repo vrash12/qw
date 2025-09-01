@@ -8,6 +8,7 @@ class WalletAccount(db.Model):
     user_id = db.Column(db.BigInteger, db.ForeignKey("users.id"), nullable=False, unique=True, index=True)
     balance_cents = db.Column(db.Integer, nullable=False, default=0)
     status = db.Column(db.Enum("active", "suspended"), nullable=False, server_default="active")
+    qr_token = db.Column(db.String(64), unique=True, index=True, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 

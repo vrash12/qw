@@ -39,6 +39,33 @@ from decimal import Decimal as _D
 pao_bp = Blueprint("pao", __name__, url_prefix="/pao")
 
 
+
+@pao_bp.route("/wallet/resolve", methods=["POST"])
+@require_role("pao")
+def pao_wallet_resolve():
+    """
+    Body: { "wallet_token": "..." }
+    → { "user_id": 123, "name": "First Last" }
+    """
+    data = request.get_json(silent=True) or {}
+    token = (data.get("wallet_token") or "").strip()
+    if not token:
+        return jsonify(error="wallet_token required"), 400
+
+    if verify_wallet_token is None:
+        return jsonify(error="wallet token not supported"), 400
+    try:
+        user_id = int(verify_wallet_token(token))
+    except Exception:
+        return jsonify(error="invalid wallet token"), 400
+
+    u = User.query.get(user_id)
+    if not u:
+        return jsonify(error="user not found"), 404
+
+    return jsonify(user_id=user_id, name=f"{u.first_name} {u.last_name}"), 200
+
+
 @pao_bp.route("/wallet/charge", methods=["POST"])
 @require_role("pao")
 def pao_wallet_charge():
@@ -79,48 +106,64 @@ def pao_wallet_charge():
     if not acct:
         return jsonify(error="wallet not found"), 404
 
-    if int(acct.balance_cents) < amount_cents:
-        return jsonify(error="insufficient balance"), 402  # Payment Required
+    ticket_id = data.get("ticket_id")
 
-    # debit
+    # 🔒 If charging a ticket, lock the ticket row and reject repeats
+    t = None
+    if ticket_id:
+        t = TicketSale.query.filter_by(id=int(ticket_id)).with_for_update().first()
+        if not t:
+            return jsonify(error="ticket not found"), 404
+        if t.paid:
+            return jsonify(error="already paid"), 409
+
+        dup = (
+            WalletLedger.query
+            .filter_by(
+                account_id=acct.id,
+                direction="debit",
+                event="ride",
+                ref_table="ticket_sale",
+                ref_id=int(ticket_id),
+            )
+            .with_for_update()
+            .first()
+        )
+        if dup:
+            return jsonify(error="already charged"), 409
+
+    # funds check
+    if int(acct.balance_cents) < amount_cents:
+        return jsonify(error="insufficient balance"), 402
+
+    # debit + ledger
     new_balance = int(acct.balance_cents) - amount_cents
     acct.balance_cents = new_balance
 
-    # ledger row
     led = WalletLedger(
-        account_id = acct.id,
-        direction  = "debit",
-        event      = "ride",
-        amount_cents = amount_cents,
-        running_balance_cents = new_balance,
-        ref_table = "ticket_sale" if data.get("ticket_id") else None,
-        ref_id    = int(data["ticket_id"]) if data.get("ticket_id") else None,
+        account_id=acct.id,
+        direction="debit",
+        event="ride",
+        amount_cents=amount_cents,
+        running_balance_cents=new_balance,
+        ref_table="ticket_sale" if ticket_id else None,
+        ref_id=int(ticket_id) if ticket_id else None,
     )
     db.session.add(led)
 
-    # optional: mark ticket paid
-    ticket_id = data.get("ticket_id", None)
-    if ticket_id:
-        t = TicketSale.query.get(ticket_id)
-        if not t:
-            return jsonify(error="ticket not found"), 404
+    if t:
         t.paid = True
 
     try:
         db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify(error="duplicate charge"), 409
     except Exception:
         db.session.rollback()
-        current_app.logger.exception("[PAO:wallet_charge] failed")
         return jsonify(error="internal error"), 500
 
-    current_app.logger.info(
-        f"[PAO:wallet_charge] user={user_id} amount_php={amount_php:.2f} new_balance={new_balance/100:.2f}"
-    )
-    return jsonify(
-        ok=True,
-        user_id=int(user_id),
-        new_balance_php=round(new_balance/100.0, 2)
-    ), 200
+    return jsonify(ok=True, user_id=int(user_id), new_balance_php=round(new_balance/100.0, 2)), 200
 
 @pao_bp.route("/wallet/<int:user_id>/overview", methods=["GET"])
 @require_role("pao")
@@ -599,6 +642,9 @@ def pao_stop_times():
 @require_role("pao")
 def pao_cash_topup():
     data = request.get_json(silent=True) or {}
+    method = (data.get("method") or "cash").strip().lower()
+    if method not in ("cash", "gcash"):
+        return jsonify(error="invalid method (must be 'cash' or 'gcash')"), 400
 
     # --- amount in PHP only ---
     try:
@@ -652,12 +698,42 @@ def pao_cash_topup():
             pao_id=g.user.id,
             user_id=int(user_id),
             amount_php=amount_php,
+            method=method,
         )
+
         db.session.commit()
+        
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("[PAO:topup] failed")
         return jsonify(error=str(e)), 500
+    
+
+        # 💬 Notify the commuter about the top-up
+    try:
+        tokens = [t.token for t in DeviceToken.query.filter_by(user_id=int(user_id)).all()]
+        if tokens:
+            import time
+            sent_at = int(time.time() * 1000)
+            kind = "GCash" if method == "gcash" else "Cash"
+            send_push_async(
+                tokens,
+                "💸 Wallet top-up",
+                f"{kind} +₱{amount_php:.2f} • New balance ₱{new_balance_php:.2f}",
+                {
+                    "deeplink": "/commuter/wallet",
+                    "amount": float(round(amount_php, 2)),
+                    "newBalance": float(round(new_balance_php, 2)),
+                    "method": method,
+                    "sentAt": sent_at,
+                },
+                channelId="payments",
+                priority="high",
+            )
+
+    except Exception:
+        current_app.logger.exception("[push] topup notify failed")
+
 
     current_app.logger.info(
         f"[PAO:topup] user={user_id} by={g.user.id} amount_php={amount_php:.2f} new_balance_php={new_balance_php:.2f}"

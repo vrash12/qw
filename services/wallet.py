@@ -49,7 +49,8 @@ def topup_cash(
     *,
     pao_id: int,
     user_id: int,
-    amount_php: float,                         # <-- PHP in, not cents
+    amount_php: float,
+    method: str = "cash",
 ):
     if float(amount_php) <= 0:
         raise ValueError("amount must be > 0")
@@ -58,14 +59,13 @@ def topup_cash(
 
     topup = TopUp(
         account_id=acct.id,
-        method="cash",
-        amount_cents=int(round(float(amount_php) * 100)),   # keep DB cents
+        method=method,  # ← now from caller
+        amount_cents=int(round(float(amount_php) * 100)),
         status="succeeded",
         pao_id=pao_id,
-        # station_id REMOVED
     )
     db.session.add(topup)
-    db.session.flush()  # topup.id
+    db.session.flush()
 
     ledger_id, new_balance_php = credit_wallet(
         account=acct,
