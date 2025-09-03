@@ -1,6 +1,8 @@
 # models/wallet.py
 from db import db
-from datetime import datetime
+from datetime import datetime, timezone
+
+UTCNOW = lambda: datetime.now(timezone.utc)
 
 class WalletAccount(db.Model):
     __tablename__ = "wallet_accounts"
@@ -9,8 +11,8 @@ class WalletAccount(db.Model):
     balance_cents = db.Column(db.Integer, nullable=False, default=0)
     status = db.Column(db.Enum("active", "suspended"), nullable=False, server_default="active")
     qr_token = db.Column(db.String(64), unique=True, index=True, nullable=True)
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=UTCNOW)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=UTCNOW, onupdate=UTCNOW)
 
 class WalletLedger(db.Model):
     __tablename__ = "wallet_ledger"
@@ -24,15 +26,15 @@ class WalletLedger(db.Model):
     ref_id = db.Column(db.Integer)
     performed_by = db.Column(db.BigInteger, db.ForeignKey("users.id"))
     bus_id = db.Column(db.Integer, db.ForeignKey("buses.id"))
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=UTCNOW)
 
 class TopUp(db.Model):
     __tablename__ = "wallet_topups"
     id = db.Column(db.Integer, primary_key=True)
     account_id = db.Column(db.Integer, db.ForeignKey("wallet_accounts.id"), nullable=False, index=True)
-    method = db.Column(db.Enum("cash"), nullable=False, server_default="cash")  # Phase 1 only
+    method = db.Column(db.Enum("cash", "gcash", name="topup_method"), nullable=False, server_default="cash")
     amount_cents = db.Column(db.Integer, nullable=False)
     status = db.Column(db.Enum("succeeded", "reversed"), nullable=False, server_default="succeeded")
     pao_id = db.Column(db.BigInteger, db.ForeignKey("users.id"), nullable=False, index=True)
-    station_id = db.Column(db.Integer)  # optional if you track terminals
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    station_id = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=UTCNOW)

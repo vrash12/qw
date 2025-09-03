@@ -1,24 +1,34 @@
 # utils/qr.py
-import json, os
+from __future__ import annotations
+import json
 from datetime import timezone
 from flask import url_for
+from routes.tickets_static import jpg_name
+
+def _iso_z(dt):
+    dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def build_qr_payload(ticket, *, origin_name=None, destination_name=None) -> str:
-    link = url_for("commuter.qr_image_for_ticket", ticket_id=ticket.id, _external=True)
-    data = {
-        "schema": "pgt.ticket.v1",
+    # Try dynamic receipt QR first
+    try:
+        link = url_for("commuter.commuter_ticket_receipt_qr", ticket_id=ticket.id, _external=True)
+    except Exception:
+        # Fallback to shipped JPG
+        prefix = "discount" if (ticket.passenger_type or "").lower() == "discount" else "regular"
+        fname  = jpg_name(int(round(float(getattr(ticket, "price", 0) or 0))), prefix)
+        link   = url_for("static", filename=f"qr/{fname}", _external=True)
+
+    payload = {
+        "version": 1,
+        "type": "ticket",
+        "id": int(ticket.id),
         "ref": ticket.reference_no,
-        "uuid": str(ticket.ticket_uuid),
-        "type": ticket.passenger_type,
-        "fare": round(float(ticket.price), 2),
-        "paid": bool(ticket.paid),
-        "createdAt": ticket.created_at.replace(tzinfo=timezone.utc).isoformat(),
-        "busId": ticket.bus_id,
-        "userId": ticket.user_id,
-        "originId": getattr(ticket, "origin_stop_time_id", None),
-        "destinationId": getattr(ticket, "destination_stop_time_id", None),
+        "fare": float(getattr(ticket, "price", 0) or 0),
+        "passengerType": (ticket.passenger_type or "").lower(),
         "origin": origin_name,
         "destination": destination_name,
-        "link": link,  # 👈 the image URL
+        "issuedAt": _iso_z(ticket.created_at),
+        "link": link,
     }
-    return json.dumps(data, separators=(",", ":"))
+    return json.dumps(payload, separators=(",", ":"))

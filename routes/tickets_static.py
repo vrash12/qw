@@ -8,7 +8,20 @@ from routes.auth        import require_role
 from sqlalchemy import func
 
 tickets_bp = Blueprint("tickets", __name__)
-QR_PATH    = "qr"  # matches <project_root>/static/qr/*.jpg
+QR_PATH = "static/qr"
+
+# routes/tickets_static.py
+REGULAR_VALUES  = [10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44]
+DISCOUNT_VALUES = [ 8,10,13,14,16,18,19,21,22,24,26,27,29,30,32,34,35]
+
+def _nearest(value: int, allowed: list[int]) -> int:
+    return min(allowed, key=lambda v: abs(v - value))
+
+def jpg_name(peso: int, passenger_type: str) -> str:
+    prefix  = "discount" if (passenger_type or "").lower() == "discount" else "regular"
+    allowed = DISCOUNT_VALUES if prefix == "discount" else REGULAR_VALUES
+    snap    = _nearest(int(round(float(peso or 0))), allowed)
+    return f"{prefix}_{snap}.jpg"
 
 # ─────────── helpers ───────────────────────────────────────────────────
 def hops_between(a: StopTime, b: StopTime) -> int:
