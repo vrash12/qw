@@ -38,7 +38,23 @@ def _valid_token(tok: str) -> bool:
     # Expo tokens typically look like: ExponentPushToken[xxxxxxxx...]
     return isinstance(tok, str) and tok.startswith("ExponentPushToken[")
 
+def push_to_user(db, DeviceToken, user_id: int, title: str, body: str, data=None, **expo_fields):
+    """
+    Look up all Expo tokens for a single user and send a push (async).
+    Returns True if at least one token existed (send is still fire-and-forget).
+    """
+    try:
+        tokens = [t.token for t in DeviceToken.query.filter_by(user_id=user_id).all()]
+        if not tokens:
+            current_app.logger.info("[push_to_user] no tokens for user_id=%s", user_id)
+            return False
+        send_push_async(tokens, title, body, data or {}, **expo_fields)
+        return True
+    except Exception as e:
+        current_app.logger.warning(f"[push_to_user] failed: {e}")
+        return False
 
+        
 def send_push(
     tokens: List[str],
     title: str,

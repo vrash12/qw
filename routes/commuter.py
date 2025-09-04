@@ -21,7 +21,7 @@ from models.user import User
 from models.ticket_stop import TicketStop
 from models.device_token import DeviceToken
 from utils.qr import build_qr_payload
-
+from utils.push import push_to_user
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import qrcode
@@ -78,6 +78,23 @@ def _as_local(dt_obj: dt.datetime) -> dt.datetime:
 
 def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
+
+
+
+# routes/commuter.py
+@commuter_bp.route("/notify-test", methods=["POST"])
+@require_role("commuter")
+def commuter_notify_test():
+    ok = push_to_user(
+        db, DeviceToken, g.user.id,
+        "🔔 Test notification",
+        "If you see this, push is working!",
+        {"deeplink": "/commuter/notifications"},
+        channelId="announcements", priority="high", ttl=600,
+    )
+    return jsonify(ok=ok), (200 if ok else 202)
+
+
 
 @commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
 def commuter_ticket_image(ticket_id: int):
@@ -227,8 +244,28 @@ def commuter_ticket_image(ticket_id: int):
     yL = field(L, yL, "Reference No.", t.reference_no or "—")
     yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—")
 
-    date_time = f"{t.created_at.strftime('%B %d, %Y')} at {t.created_at.strftime('%I:%M %p').lstrip('0').lower()}"
-    yL = field(L, yL, "Date & Time", date_time)
+    # Split into 2 lines: Date (line 1) and Time (line 2)
+    date_str = t.created_at.strftime('%B %d, %Y')
+    time_str = t.created_at.strftime('%I:%M %p').lstrip('0').lower()
+
+    # Label
+    if ft_label:
+        draw.text((L, yL), "DATE & TIME", fill=TEXT_MUTED, font=ft_label)
+
+    # First value line (Date)
+    y_value = yL + 42
+    if ft_value:
+        d_disp = date_str if tw(date_str, ft_value) <= COL_W else ellipsize(date_str, 32)
+        draw.text((L, y_value), d_disp, fill=TEXT_DARK, font=ft_value)
+
+    # Second value line (Time) just below the date
+    if ft_value:
+        t_disp = time_str if tw(time_str, ft_value) <= COL_W else ellipsize(time_str, 32)
+        draw.text((L, y_value + 44), t_disp, fill=TEXT_DARK, font=ft_value)
+
+    # Advance y as if this were a taller field
+    yL = y_value + 44 + 48 + 24
+
     yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
 
     yL = field(L, yL, "Origin", origin_name or "—")

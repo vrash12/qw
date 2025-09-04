@@ -25,8 +25,7 @@ from mqtt_ingest import publish
 from routes.auth import require_role
 from routes.tickets_static import jpg_name, QR_PATH
 from utils.qr import build_qr_payload
-from utils.push import send_push_async
-
+from utils.push import send_push_async, push_to_user
 # ---- Time helpers (UTC canonical; Manila convenience) ----
 from datetime import timezone as _tz, timedelta as _td
 _MNL = _tz(_td(hours=8))
@@ -75,9 +74,8 @@ def _serialize_ticket_json(t: TicketSale, origin_name: str, destination_name: st
 
 
 @pao_bp.route("/tickets/<int:ticket_id>/receipt.png", methods=["GET"])
-@require_role("pao")
 def pao_ticket_receipt_image(ticket_id: int):
-    # Reuse the existing commuter renderer but allow PAO to access it
+    # Public redirect to the commuter receipt image (no auth header needed)
     return redirect(url_for("commuter.commuter_ticket_image", ticket_id=ticket_id))
 
 
@@ -220,7 +218,7 @@ def pao_summary():
         .filter(
             TicketSale.bus_id == bus_id,
             TicketSale.created_at.between(start_dt, end_dt),
-            TicketSale.voided.is_(False),
+       
         )
         .scalar()
         or 0
@@ -232,7 +230,7 @@ def pao_summary():
             TicketSale.bus_id == bus_id,
             TicketSale.created_at.between(start_dt, end_dt),
             TicketSale.paid.is_(True),
-            TicketSale.voided.is_(False),
+      
         )
         .scalar()
         or 0
@@ -244,7 +242,7 @@ def pao_summary():
             TicketSale.bus_id == bus_id,
             TicketSale.created_at.between(start_dt, end_dt),
             TicketSale.paid.is_(True),
-            TicketSale.voided.is_(False),
+          
         )
         .scalar()
         or 0.0
@@ -285,7 +283,7 @@ def recent_tickets():
 
     rows = (
         TicketSale.query.options(joinedload(TicketSale.user))
-        .filter(TicketSale.bus_id == bus_id, TicketSale.voided.is_(False))
+        .filter(TicketSale.bus_id == bus_id)
         .order_by(TicketSale.id.desc())
         .limit(limit)
         .all()
@@ -311,12 +309,6 @@ def recent_tickets():
 def _current_bus_id() -> Optional[int]:
     return getattr(g.user, "assigned_bus_id", None)
 
-
-def _void_ticket(ticket: TicketSale, reason: Optional[str]) -> None:
-    ticket.voided = True
-    ticket.paid = False
-    ticket.void_reason = (reason or "").strip() or None
-    db.session.commit()
 
 
 @pao_bp.route("/pickup-request", methods=["POST"])
@@ -350,20 +342,6 @@ def pickup_request():
     return jsonify(success=True), 201
 
 
-@pao_bp.route("/tickets/<int:ticket_id>/void", methods=["PATCH"])
-@require_role("pao")
-def void_ticket(ticket_id: int):
-    t = TicketSale.query.get(ticket_id)
-    if not t:
-        return jsonify(error="ticket not found"), 404
-    if t.voided:
-        return jsonify(message="already voided"), 200
-
-    data = request.get_json(silent=True) or {}
-    reason = data.get("reason")
-    _void_ticket(t, reason)
-    current_app.logger.info(f"[PAO] voided ticket {t.reference_no} – {reason or 'no reason'}")
-    return jsonify(id=t.id, voided=True), 200
 
 
 @pao_bp.route("/bus-trips", methods=["GET"])
@@ -493,8 +471,7 @@ def create_ticket():
         for pt, qty in blocks:
             fare = _fare_for(o, d, pt)
             for _ in range(qty):
-                # If we have a commuter and assign_all is true, attach every ticket.
-                # Otherwise keep the old behavior (only the first/primary one).
+                # Attach to commuter depending on assign_all/primary rules
                 this_user_id = None
                 if user:
                     if assign_all:
@@ -521,7 +498,6 @@ def create_ticket():
                 t.reference_no = _gen_reference(bus_id, t.id)
                 items.append(t)
 
-
         db.session.commit()
 
         current_app.logger.info(
@@ -530,33 +506,39 @@ def create_ticket():
             any(t.passenger_type != items[0].passenger_type for t in items)
         )
 
-        # Push to the commuter
+        # 🔔 Push to the commuter (only if tickets are linked to a commuter account)
         if user and items:
             try:
-                tokens = [t.token for t in DeviceToken.query.filter_by(user_id=user.id).all()]
-                if tokens:
-                    if assign_all and len(items) > 1:
-                        total = sum(float(t.price or 0) for t in items)
-                        send_push_async(
-                            tokens,
-                            "🟢 Tickets created",
-                            f"{len(items)} tickets • ₱{total:.2f} • {o.stop_name} → {d.stop_name}",
-                            {"deeplink": "/commuter/receipts"},  # adjust to your commuter list page
-                            channelId="announcements", priority="high", ttl=0,
-                        )
-                    else:
-                        head = next((t for t in items if t.user_id == user.id), items[0])
-                        send_push_async(
-                            tokens,
-                            "🟢 New Ticket",
-                            f"Ref {head.reference_no} • ₱{float(head.price or 0):.2f} • {o.stop_name} → {d.stop_name}",
-                            {"deeplink": f"/commuter/receipt/{head.id}", "ticketId": head.id, "ref": head.reference_no},
-                            channelId="announcements", priority="high", ttl=0,
-                        )
+                if assign_all and len(items) > 1:
+                    total = sum(float(t.price or 0) for t in items)
+                    ok = push_to_user(
+                        db, DeviceToken, user.id,
+                        "🟢 Tickets created",
+                        f"{len(items)} tickets • ₱{total:.2f} • {o.stop_name} → {d.stop_name}",
+                        {"deeplink": "/commuter/receipts"},
+                        channelId="announcements", priority="high", ttl=600,
+                    )
+                    current_app.logger.info("[push] multi-ticket push_to_user(uid=%s) ok=%s", user.id, ok)
+                else:
+                    # in routes/pao.py, inside create_ticket() right before pushing:
+                    tok_count = db.session.query(DeviceToken).filter(DeviceToken.user_id == user.id).count()
+                    current_app.logger.info("[push] commuter uid=%s has %s device token(s)", user.id, tok_count)
+
+                    # single-ticket branch (replace ttl=0 with ttl=600)
+                    head = next((t for t in items if t.user_id == user.id), items[0])
+                    ok = push_to_user(
+                        db, DeviceToken, user.id,
+                        "🟢 New Ticket",
+                        f"Ref {head.reference_no} • ₱{float(head.price or 0):.2f} • {o.stop_name} → {d.stop_name}",
+                        {"deeplink": f"/commuter/receipt/{head.id}", "ticketId": head.id, "ref": head.reference_no},
+                        channelId="announcements", priority="high", ttl=600,
+                    )
+                    current_app.logger.info("[push] single-ticket push_to_user(uid=%s, ticket=%s) ok=%s", user.id, head.id, ok)
+
             except Exception:
                 current_app.logger.exception("push to commuter failed")
 
-
+        # Response
         serialized = [_serialize_ticket_json(t, o.stop_name, d.stop_name) for t in items]
         if len(items) == 1:
             return jsonify(serialized[0]), 201
@@ -571,6 +553,7 @@ def create_ticket():
     except Exception as e:
         current_app.logger.exception("!! create_ticket unexpected error")
         return jsonify(error=str(e)), 500
+
 
 
 @pao_bp.route("/tickets/preview", methods=["POST"])
@@ -670,8 +653,7 @@ def list_tickets():
                 "destination": destination_name,
                 "fare": f"{float(t.price):.2f}",
                 "paid": bool(t.paid),
-                "voided": bool(t.voided),
-                "void_reason": t.void_reason,
+        
             }
         )
     return jsonify(out), 200
@@ -737,7 +719,7 @@ def get_ticket(ticket_id):
         "qr_link": qr_link,
         "qr_url": qr_url,
         "qr_bg_url": qr_bg_url,
-        "receipt_image": url_for("pao.pao_ticket_receipt_image", ticket_id=t.id, _external=True),
+        "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
         "paoId": getattr(t, "issued_by", None) or getattr(g, "user", None).id,
     }), 200
 
@@ -748,6 +730,7 @@ def mark_ticket_paid(ticket_id: int):
     data = request.get_json(silent=True) or {}
     paid = bool(data.get("paid"))
 
+    # we need bus (for MQTT topic) and user (for push)
     ticket = (
         TicketSale.query.options(joinedload(TicketSale.bus), joinedload(TicketSale.user))
         .filter(TicketSale.id == ticket_id)
@@ -762,7 +745,7 @@ def mark_ticket_paid(ticket_id: int):
     try:
         db.session.commit()
 
-        # MQTT fare count update (UTC “today”)
+        # Update device’s live paid count via MQTT for *today* (UTC)
         from datetime import datetime as _dt
         start = _dt.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         end   = _dt.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)
@@ -771,24 +754,24 @@ def mark_ticket_paid(ticket_id: int):
             .filter(TicketSale.created_at.between(start, end))
             .count()
         )
-        topic = f"device/{ticket.bus.identifier}/fare"
-        publish(topic, {"paid": cnt})
-        current_app.logger.info(f"MQTT fare update → {topic}: {cnt}")
+        if ticket.bus and ticket.bus.identifier:
+            topic = f"device/{ticket.bus.identifier}/fare"
+            publish(topic, {"paid": cnt})
+            current_app.logger.info(f"MQTT fare update → {topic}: {cnt}")
 
+        # 🔔 Only push on the first transition to paid, and only for non-guest tickets
         if (not was_paid) and bool(ticket.paid) and ticket.user_id:
             try:
                 import time
                 sent_at = int(time.time() * 1000)
-                tokens = [t.token for t in DeviceToken.query.filter_by(user_id=ticket.user_id).all()]
-                current_app.logger.info(f"[push:paid] user_id={ticket.user_id} tokens={len(tokens)}")
-                if tokens:
-                    send_push_async(
-                        tokens,
-                        "✅ Payment confirmed",
-                        f"Ref {ticket.reference_no} • ₱{float(ticket.price or 0):.2f}",
-                        {"deeplink": f"/commuter/receipt/{ticket.id}", "ticketId": ticket.id, "sentAt": sent_at},
-                        channelId="payments",
-                    )
+
+                push_to_user(
+                    db, DeviceToken, ticket.user_id,
+                    "✅ Payment confirmed",
+                    f"Ref {ticket.reference_no} • ₱{float(ticket.price or 0):.2f}",
+                    {"deeplink": f"/commuter/receipt/{ticket.id}", "ticketId": ticket.id, "sentAt": sent_at},
+                    channelId="payments", priority="high", ttl=600,
+                )
             except Exception:
                 current_app.logger.exception("[push] paid-confirmation failed")
 

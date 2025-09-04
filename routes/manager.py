@@ -346,21 +346,22 @@ def list_buses():
 @require_role("manager")
 def route_data_insights():
     """
-    Returns per-minute occupancy series with optional stop labels when a minute
-    matches a stop's arrive/depart time. Also includes meta window and metrics.
+    Returns per-minute occupancy series (no stop labels).
+    Window selection:
+      - Preferred: ?trip_id=##
+      - Or: ?date=YYYY-MM-DD&bus_id=##&from=HH:MM&to=HH:MM
     """
+    from datetime import datetime as _dt, timedelta as _td
+
     trip_id = request.args.get("trip_id", type=int)
     use_snapshot = False
 
     def _trip_window(day_, start_t, end_t):
-        start_dt = datetime.combine(day_, start_t)
-        end_dt   = datetime.combine(day_, end_t)
+        start_dt = _dt.combine(day_, start_t)
+        end_dt   = _dt.combine(day_, end_t)
         if end_t <= start_t:  # crosses midnight
-            end_dt = end_dt + timedelta(days=1)
+            end_dt = end_dt + _td(days=1)
         return start_dt, end_dt
-
-    def _overlaps(a0, a1, b0, b1):
-        return a0 < b1 and b0 < a1
 
     if trip_id:
         trip = Trip.query.filter_by(id=trip_id).first()
@@ -370,9 +371,10 @@ def route_data_insights():
         bus_id = trip.bus_id
         day = trip.service_date
         window_from, window_to = _trip_window(day, trip.start_time, trip.end_time)
-        window_end_excl = window_to + timedelta(minutes=1)
+        window_end_excl = window_to + _td(minutes=1)
 
-        if datetime.utcnow() > window_to + timedelta(minutes=2):
+        # Use snapshot if trip is long finished and we have one
+        if _dt.utcnow() > window_to + _td(minutes=2):
             snap = TripMetric.query.filter_by(trip_id=trip_id).first()
             if snap:
                 use_snapshot = True
@@ -394,11 +396,6 @@ def route_data_insights():
             "window_to": window_to.isoformat(),
         }
 
-        stop_rows = (
-            StopTime.query.filter_by(trip_id=trip_id)
-            .order_by(StopTime.seq.asc())
-            .all()
-        )
     else:
         date_str = request.args.get("date")
         bus_id = request.args.get("bus_id", type=int)
@@ -406,7 +403,7 @@ def route_data_insights():
             return jsonify(error="date and bus_id are required when trip_id is omitted"), 400
 
         try:
-            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+            day = _dt.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
             return jsonify(error="invalid date format"), 400
 
@@ -415,11 +412,11 @@ def route_data_insights():
         except KeyError:
             return jsonify(error="from and to are required when trip_id is omitted"), 400
 
-        window_from = datetime.combine(day, datetime.strptime(start, "%H:%M").time())
-        window_to   = datetime.combine(day, datetime.strptime(end, "%H:%M").time())
+        window_from = _dt.combine(day, _dt.strptime(start, "%H:%M").time())
+        window_to   = _dt.combine(day, _dt.strptime(end, "%H:%M").time())
         if window_to <= window_from:
-            window_to = window_to + timedelta(days=1)
-        window_end_excl = window_to + timedelta(minutes=1)
+            window_to = window_to + _td(days=1)
+        window_end_excl = window_to + _td(minutes=1)
 
         meta = {
             "trip_id": None, "trip_number": None,
@@ -428,31 +425,7 @@ def route_data_insights():
         }
         metrics = None
 
-        trips_today = Trip.query.filter_by(bus_id=bus_id, service_date=day).all()
-        trip_ids_in_window = []
-        for t in trips_today:
-            t_from, t_to = _trip_window(day, t.start_time, t.end_time)
-            if _overlaps(t_from, t_to, window_from, window_end_excl):
-                trip_ids_in_window.append(t.id)
-
-        stop_rows = []
-        if trip_ids_in_window:
-            stop_rows = (
-                StopTime.query
-                .filter(StopTime.trip_id.in_(trip_ids_in_window))
-                .order_by(StopTime.trip_id.asc(), StopTime.seq.asc())
-                .all()
-            )
-
-    minute_to_stop = {}
-    for st in stop_rows:
-        if st.arrive_time:
-            k = st.arrive_time.strftime("%H:%M")
-            minute_to_stop.setdefault(k, set()).add(st.stop_name)
-        if st.depart_time:
-            k = st.depart_time.strftime("%H:%M")
-            minute_to_stop.setdefault(k, set()).add(st.stop_name)
-
+    # Per-minute occupancy only (no stop labels)
     occ_rows = (
         db.session.query(
             func.date_format(SensorReading.timestamp, "%H:%i").label("hhmm"),
@@ -470,19 +443,16 @@ def route_data_insights():
         .all()
     )
 
-    series = []
-    for r in occ_rows:
-        hhmm = r.hhmm
-        stop_names = sorted(minute_to_stop.get(hhmm, []))
-        series.append({
-            "time": hhmm,
-            "passengers": int(r.pax or 0),
-            "in": int(r.ins or 0),
-            "out": int(r.outs or 0),
-            "stop": " / ".join(stop_names) if stop_names else None,
-        })
+    series = [{
+        "time": r.hhmm,
+        "passengers": int(r.pax or 0),
+        "in": int(r.ins or 0),
+        "out": int(r.outs or 0),
+        # "stop" removed
+    } for r in occ_rows]
 
-    if not ('metrics' in locals() and metrics):
+    # Compute metrics if not using a snapshot
+    if not metrics:
         pax_values = [p["passengers"] for p in series]
         avg_pax  = round(sum(pax_values) / len(pax_values)) if pax_values else 0
         peak_pax = max(pax_values) if pax_values else 0
@@ -663,28 +633,11 @@ def list_bus_trips():
 @require_role("manager")
 def get_trip(trip_id: int):
     trip = Trip.query.get_or_404(trip_id)
-
-    first_stop = (
-        StopTime.query.filter_by(trip_id=trip_id)
-        .order_by(StopTime.seq.asc(), StopTime.id.asc())
-        .first()
-    )
-    last_stop = (
-        StopTime.query.filter_by(trip_id=trip_id)
-        .order_by(StopTime.seq.desc(), StopTime.id.desc())
-        .first()
-    )
-
-    origin = first_stop.stop_name if first_stop else ""
-    destination = last_stop.stop_name if last_stop else ""
-
     return jsonify(
         id=trip.id,
         bus_id=trip.bus_id,
         service_date=trip.service_date.isoformat(),
         number=trip.number,
-        origin=origin,
-        destination=destination,
         start_time=trip.start_time.strftime("%H:%M"),
         end_time=trip.end_time.strftime("%H:%M"),
     ), 200
