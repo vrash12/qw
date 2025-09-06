@@ -29,7 +29,8 @@ import traceback
 from werkzeug.exceptions import HTTPException
 from datetime import timedelta
 
-# --- timezone setup ---
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
 try:
     from zoneinfo import ZoneInfo
     try:
@@ -80,8 +81,40 @@ def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
 
+SALT_USER_QR = "user-qr-v1"
 
-# routes/commuter.py
+def _user_qr_sign(uid: int) -> str:
+    s = URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt=SALT_USER_QR)
+    return s.dumps({"uid": int(uid)})
+
+@commuter_bp.route("/users/me/qr.png", methods=["GET"])
+@require_role("commuter")
+def commuter_my_wallet_qr_png():
+    """
+    Returns a PNG QR for the logged-in commuter.
+    The QR encodes a URL to /pao/users/scan?token=...
+    """
+    size = max(240, min(1024, int(request.args.get("size", 360) or 360)))
+    token = _user_qr_sign(g.user.id)
+    scan_url = url_for("pao.user_qr_scan", _external=True) + f"?token={token}"
+
+    qr = qrcode.QRCode(box_size=10, border=2)
+    qr.add_data(scan_url)
+    qr.make(fit=True)
+    out = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+    # Normalize to requested square size
+    out = out.resize((size, size))
+
+    bio = BytesIO()
+    out.save(bio, format="PNG", optimize=True)
+    bio.seek(0)
+
+    resp = make_response(send_file(bio, mimetype="image/png"))
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
 @commuter_bp.route("/notify-test", methods=["POST"])
 @require_role("commuter")
 def commuter_notify_test():
@@ -99,7 +132,7 @@ def commuter_notify_test():
 @commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
 def commuter_ticket_image(ticket_id: int):
     """
-    Enhanced flat RGB-only JPG receipt renderer with larger fonts and better design.
+    High-contrast, LARGE-TYPE JPG receipt renderer.
     Optional: ?download=1 to force download.
     Includes detailed logging to verify where `issued_by` is coming from.
     """
@@ -158,10 +191,13 @@ def commuter_ticket_image(ticket_id: int):
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-    # --- enhanced canvas & palette ---
-    W, H = 1200, 1800
-    M = 60
+    # ───────────────────────────────────────────────────────────────
+    # Larger canvas + font sizes
+    # ───────────────────────────────────────────────────────────────
+    W, H = 1440, 2200   # was 1200x1800
+    M = 80              # was 60
 
+    # palette
     DARK_GREEN    = (21, 87, 36)
     LIGHT_GREEN   = (236, 248, 239)
     ACCENT_GREEN  = (34, 139, 58)
@@ -187,13 +223,14 @@ def commuter_ticket_image(ticket_id: int):
                 continue
         return ImageFont.load_default()
 
-    ft_title   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 56)
-    ft_header  = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 44)
-    ft_label   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 32)
-    ft_value   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 38)
-    ft_big     = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 68)
-    ft_medium  = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 36)
-    ft_small   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 28)
+    # ↑ bumped sizes significantly
+    ft_title   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 80)
+    ft_header  = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 60)
+    ft_label   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 40)
+    ft_value   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 52)
+    ft_big     = _safe_font(["Arial Black", "DejaVuSans-Bold.ttf", "arialbd.ttf"], 96)
+    ft_medium  = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 44)
+    ft_small   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 34)
 
     def tw(text, font):
         if not font or not text:
@@ -210,33 +247,33 @@ def commuter_ticket_image(ticket_id: int):
         return s[:keep] + "…" + s[-(max_chars - keep - 1):]
 
     # card & header
-    shadow_offset = 8
+    shadow_offset = 10
     draw.rectangle((M + shadow_offset, M + shadow_offset, W - M + shadow_offset, H - M + shadow_offset), fill=(0, 0, 0))
     draw.rectangle((M, M, W - M, H - M), fill=WHITE, outline=BORDER_LIGHT, width=2)
 
-    y = M + 32
-    header_h = 120
+    y = M + 40
+    header_h = 180  # was 120
     draw.rectangle((M, y, W - M, y + header_h), fill=LIGHT_GREEN, outline=DARK_GREEN, width=3)
     if ft_title:
-        draw.text((M + 40, y + (header_h - 56) // 2), "PGT Onboard — Official Receipt", fill=DARK_GREEN, font=ft_title)
-    y += header_h + 8
-    draw.rectangle((M + 40, y, W - M - 40, y + 4), fill=ACCENT_GREEN)
-    y += 32
+        draw.text((M + 48, y + (header_h - 80) // 2), "PGT Onboard — Official Receipt", fill=DARK_GREEN, font=ft_title)
+    y += header_h + 12
+    draw.rectangle((M + 48, y, W - M - 48, y + 5), fill=ACCENT_GREEN)
+    y += 40
 
     # fields
-    L = M + 40
-    R = W - M - 40
-    COL_GAP = 50
+    L = M + 48
+    R = W - M - 48
+    COL_GAP = 60
     COL_W = (R - L - COL_GAP) // 2
 
     def field(x, y, label, value, color=TEXT_DARK):
         if ft_label:
             draw.text((x, y), label.upper(), fill=TEXT_MUTED, font=ft_label)
-        y2 = y + 42
-        display_value = value if tw(value, ft_value) <= COL_W else ellipsize(value, 32)
+        y2 = y + 54  # label→value gap
+        display_value = value if tw(value, ft_value) <= COL_W else ellipsize(value, 36)
         if ft_value:
             draw.text((x, y2), display_value, fill=color, font=ft_value)
-        return y2 + 48 + 24
+        return y2 + 58 + 28  # value height + spacing
 
     yL = y
     yR = y
@@ -244,83 +281,78 @@ def commuter_ticket_image(ticket_id: int):
     yL = field(L, yL, "Reference No.", t.reference_no or "—")
     yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—")
 
-    # Split into 2 lines: Date (line 1) and Time (line 2)
+    # Date & Time on two stacked lines, larger
     date_str = t.created_at.strftime('%B %d, %Y')
     time_str = t.created_at.strftime('%I:%M %p').lstrip('0').lower()
 
-    # Label
     if ft_label:
         draw.text((L, yL), "DATE & TIME", fill=TEXT_MUTED, font=ft_label)
 
-    # First value line (Date)
-    y_value = yL + 42
+    y_value = yL + 54
     if ft_value:
-        d_disp = date_str if tw(date_str, ft_value) <= COL_W else ellipsize(date_str, 32)
+        d_disp = date_str if tw(date_str, ft_value) <= COL_W else ellipsize(date_str, 36)
         draw.text((L, y_value), d_disp, fill=TEXT_DARK, font=ft_value)
 
-    # Second value line (Time) just below the date
     if ft_value:
-        t_disp = time_str if tw(time_str, ft_value) <= COL_W else ellipsize(time_str, 32)
-        draw.text((L, y_value + 44), t_disp, fill=TEXT_DARK, font=ft_value)
+        t_disp = time_str if tw(time_str, ft_value) <= COL_W else ellipsize(time_str, 36)
+        draw.text((L, y_value + 52), t_disp, fill=TEXT_DARK, font=ft_value)
 
-    # Advance y as if this were a taller field
-    yL = y_value + 44 + 48 + 24
+    yL = y_value + 52 + 60  # stack time + extra spacing
 
     yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
-
     yL = field(L, yL, "Origin", origin_name or "—")
     yR = field(L + COL_W + COL_GAP, yR, "Passenger", passenger_name)
 
-    y = max(yL, yR) + 16
-    draw.rectangle((L, y, R, y + 3), fill=BORDER_LIGHT)
-    y += 40
+    y = max(yL, yR) + 20
+    draw.rectangle((L, y, R, y + 4), fill=BORDER_LIGHT)
+    y += 48
 
     # amount + pill
     amount_y = y
     if ft_label:
         draw.text((L, amount_y), "TOTAL AMOUNT", fill=TEXT_MUTED, font=ft_label)
     if ft_big:
-        draw.text((L, amount_y + 40), f"₱{float(t.price or 0):.2f}", fill=ACCENT_GREEN, font=ft_big)
+        draw.text((L, amount_y + 44), f"₱{float(t.price or 0):.2f}", fill=ACCENT_GREEN, font=ft_big)
 
     state_txt = "PAID" if t.paid else "UNPAID"
     state_bg = SUCCESS_BG if t.paid else ERROR_BG
     state_text_color = SUCCESS_TEXT if t.paid else ERROR_TEXT
 
     if ft_header:
-        pill_w = int(tw(state_txt, ft_header) + 48)
-        pill_h = 64
+        pill_w = int(tw(state_txt, ft_header) + 64)
+        pill_h = 76
         pill_x1 = R - pill_w
         pill_y1 = amount_y + 8
-        draw.rectangle((pill_x1 + 12, pill_y1, pill_x1 + pill_w - 12, pill_y1 + pill_h), fill=state_bg)
-        draw.rectangle((pill_x1, pill_y1 + 12, pill_x1 + pill_w, pill_y1 + pill_h - 12), fill=state_bg)
+        draw.rectangle((pill_x1 + 14, pill_y1, pill_x1 + pill_w - 14, pill_y1 + pill_h), fill=state_bg)
+        draw.rectangle((pill_x1, pill_y1 + 14, pill_x1 + pill_w, pill_y1 + pill_h - 14), fill=state_bg)
         text_x = pill_x1 + (pill_w - tw(state_txt, ft_header)) // 2
-        text_y = pill_y1 + (pill_h - 44) // 2
+        text_y = pill_y1 + (pill_h - 60) // 2
         draw.text((text_x, text_y), state_txt, fill=state_text_color, font=ft_header)
 
-    y += 140
+    y += 170  # more breathing room
 
-    # QR section
+    # QR section (bigger)
     qr_section_bg = (247, 251, 247)
-    qr_size = 400
-    qr_padding = 32
+    qr_size = 480
+    qr_padding = 36
     panel_w = qr_size + qr_padding * 2
-    panel_h = qr_size + qr_padding * 2 + 80
+    panel_h = qr_size + qr_padding * 2 + 96
 
     draw.rectangle((L, y, L + panel_w, y + panel_h), fill=qr_section_bg, outline=BORDER_LIGHT, width=2)
     bg.paste(qr_img.resize((qr_size, qr_size)), (L + qr_padding, y + qr_padding))
     if ft_medium:
-        draw.text((L + qr_padding, y + qr_padding + qr_size + 20), "Scan to view/download receipt", fill=TEXT_MEDIUM, font=ft_medium)
+        draw.text((L + qr_padding, y + qr_padding + qr_size + 24), "Scan to view/download receipt", fill=TEXT_MEDIUM, font=ft_medium)
 
-    # right column info
-    right_x = L + panel_w + 40
-    right_y = y + 20
+    # right column info (labels bigger)
+    right_x = L + panel_w + 56
+    right_y = y + 24
 
     if ft_label:
         draw.text((right_x, right_y), "PAYMENT STATUS", fill=TEXT_MUTED, font=ft_label)
     if ft_header:
-        draw.text((right_x, right_y + 36), state_txt, fill=(ACCENT_GREEN if t.paid else ERROR_TEXT), font=ft_header)
+        draw.text((right_x, right_y + 44), state_txt, fill=(ACCENT_GREEN if t.paid else ERROR_TEXT), font=ft_header)
 
-    info_y = right_y + 120
+    info_y = right_y + 140
     info_items = [
         ("Bus ID", str(getattr(t, "bus_id", "") or "—")),
         ("Issued By (PAO ID)", str(issuer_id or "—")),
@@ -329,15 +361,16 @@ def commuter_ticket_image(ticket_id: int):
         if ft_label:
             draw.text((right_x, info_y), label.upper(), fill=TEXT_MUTED, font=ft_label)
         if ft_value:
-            draw.text((right_x, info_y + 32), value, fill=TEXT_MEDIUM, font=ft_value)
-        info_y += 80
+            draw.text((right_x, info_y + 36), value, fill=TEXT_MEDIUM, font=ft_value)
+        info_y += 96
 
     # footer
-    footer_y = H - M - 60
+    footer_y = H - M - 72
     if ft_small:
         from datetime import datetime as _dt
-        draw.text((L, footer_y), (img_link[:65] + "…" if len(img_link) > 65 else img_link), fill=TEXT_MUTED, font=ft_small)
-        draw.text((L, footer_y + 32), _dt.now().strftime("Generated on %B %d, %Y at %I:%M %p"), fill=TEXT_MUTED, font=ft_small)
+        link_display = (img_link[:80] + "…") if len(img_link) > 80 else img_link
+        draw.text((L, footer_y), link_display, fill=TEXT_MUTED, font=ft_small)
+        draw.text((L, footer_y + 36), _dt.now().strftime("Generated on %B %d, %Y at %I:%M %p"), fill=TEXT_MUTED, font=ft_small)
 
     # encode JPEG
     bio = BytesIO()
