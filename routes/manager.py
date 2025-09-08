@@ -157,19 +157,22 @@ def update_trip(trip_id: int):
     except (KeyError, ValueError):
         return jsonify(error="Invalid payload or missing required fields"), 400
 
-
 @manager_bp.route("/trips/<int:trip_id>", methods=["DELETE"])
 @require_role("manager")
 def delete_trip(trip_id: int):
     try:
-        trip = Trip.query.get_or_404(trip_id)
-        # ⬇️ StopTime deletion removed (no more stop-times)
-        db.session.delete(trip)
+        # Use bulk delete to avoid ORM cascade/child loading
+        rows = Trip.query.filter_by(id=trip_id).delete(synchronize_session=False)
+        if rows == 0:
+            db.session.rollback()
+            return jsonify(error="Trip not found"), 404
+
         db.session.commit()
         return jsonify(message="Trip successfully deleted"), 200
     except Exception as e:
         db.session.rollback()
         return jsonify(error="Error deleting trip: " + str(e)), 500
+
 
 
 @manager_bp.route("/tickets/composition", methods=["GET"])
