@@ -445,10 +445,11 @@ def _get_or_create_wallet_account(user_id: int) -> WalletAccount:
         db.session.commit()
     return acct
 
+# /wallet/me should be tolerant and create on first read
 @commuter_bp.route("/wallet/me", methods=["GET"])
 @require_role("commuter")
 def wallet_me():
-    acct = WalletAccount.query.filter_by(user_id=g.user.id).first()
+    acct = _get_or_create_wallet_account(g.user.id)
     bal = int(getattr(acct, "balance_cents", 0) or 0)
     return jsonify(balance_cents=bal, balance_php=round(bal/100.0, 2)), 200
 
@@ -459,18 +460,16 @@ def wallet_me():
 def wallet_ledger():
     acct = _get_or_create_wallet_account(g.user.id)
 
-    # Fixed pagination: always 5 per page
     page = max(1, request.args.get("page", type=int, default=1))
-    page_size = 2
+    # honor the client's page_size (your RN app sends 5)
+    page_size = max(1, request.args.get("page_size", type=int, default=5))
 
-    base_q = WalletLedger.query.filter_by(account_id=acct.id)
+    base_q = WalletLedger.query.filter_by(account_id=acct.user_id)
     total = base_q.count()
-    rows = (
-        base_q.order_by(WalletLedger.id.desc())
-              .offset((page - 1) * page_size)
-              .limit(page_size)
-              .all()
-    )
+    rows = (base_q.order_by(WalletLedger.id.desc())
+                 .offset((page - 1) * page_size)
+                 .limit(page_size)
+                 .all())
 
     # Map TopUp.id -> method for any ledger rows that came from topups
     topup_ref_ids = [
@@ -515,12 +514,14 @@ def wallet_qrcode():
     deep_link = f"https://pay.example/charge?wallet_token={token}&autopay=1"
     return jsonify(wallet_token=token, deep_link=deep_link), 200
 
-# (optional) allow user to rotate their QR
 @commuter_bp.route("/wallet/qrcode/rotate", methods=["POST"])
 @require_role("commuter")
 def wallet_qrcode_rotate():
-    acct = WalletAccount.query.filter_by(user_id=g.user.id).with_for_update().first()
     from utils.wallet_qr import _mint_token
+    acct = WalletAccount.query.filter_by(user_id=g.user.id).with_for_update().first()
+    if not acct:
+        acct = WalletAccount(user_id=g.user.id, balance_cents=0)
+        db.session.add(acct)
     acct.qr_token = _mint_token()
     db.session.commit()
     deep_link = f"https://pay.example/charge?wallet_token={acct.qr_token}&autopay=1"
