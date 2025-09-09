@@ -1,40 +1,36 @@
 # routes/commuter.py
 from __future__ import annotations
 import datetime as dt
-from flask import Blueprint, request, jsonify, g, current_app, url_for, redirect
-from sqlalchemy import func, case
-from sqlalchemy.orm import joinedload
 from typing import Any, Dict, List, Optional
-import os, textwrap
-from routes.auth import require_role
+
+from flask import (
+    Blueprint, request, jsonify, g, current_app, url_for,
+    redirect, send_file, make_response
+)
+from sqlalchemy import func
+from sqlalchemy.orm import joinedload
+
 from db import db
+from routes.auth import require_role
 from models.schedule import Trip, StopTime
 from models.sensor_reading import SensorReading
 from models.announcement import Announcement
 from models.ticket_sale import TicketSale
 from models.bus import Bus
 from models.user import User
-from utils.qr import build_qr_payload
 from models.ticket_stop import TicketStop
 from models.device_token import DeviceToken
+from utils.qr import build_qr_payload
+from utils.push import push_to_user
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import qrcode
 import traceback
 from werkzeug.exceptions import HTTPException
-from typing import Any, Optional
-from models.schedule import StopTime
 from datetime import timedelta
-from flask import send_file, make_response
-import qrcode
-from decimal import Decimal
-from models.wallet import WalletAccount, WalletLedger, TopUp
-from services.wallet import credit_wallet
-from utils.wallet_qr import build_wallet_token, verify_wallet_token
 
-from io import BytesIO
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
-# --- timezone setup ---
 try:
     from zoneinfo import ZoneInfo
     try:
@@ -44,9 +40,7 @@ try:
 except Exception:
     LOCAL_TZ = dt.timezone(dt.timedelta(hours=8))
 
-
 commuter_bp = Blueprint("commuter", __name__, url_prefix="/commuter")
-
 
 THEMES = {
     "light": {
@@ -75,88 +69,73 @@ THEMES = {
     },
 }
 
-def _rounded_rect(draw: ImageDraw.ImageDraw, xy, radius, fill):
-    # Pillow >= 8.2 has rounded_rectangle; fall back to normal rect if missing
-    if hasattr(draw, "rounded_rectangle"):
-        draw.rounded_rectangle(xy, radius=radius, fill=fill)
-    else:
-        draw.rectangle(xy, fill=fill)
-
-def _load_font(name_candidates, size):
-    """
-    Try fonts in this order:
-      - /app static fonts (e.g., static/fonts/Inter.ttf, DejaVuSans.ttf)
-      - system fonts (Inter, DejaVuSans, Arial)
-      - PIL default
-    """
-    root = current_app.root_path if current_app else os.getcwd()
-    for nm in name_candidates:
-        # packaged in app
-        p = os.path.join(root, "static", "fonts", nm)
-        if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, size)
-            except Exception:
-                pass
-        # system lookup
-        try:
-            return ImageFont.truetype(nm, size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-def _wrap(draw: ImageDraw.ImageDraw, text, font, max_width):
-    # simple word wrap using textbbox
-    if not text:
-        return [""]
-    words = text.split()
-    lines, line = [], []
-    for w in words:
-        test = " ".join(line + [w])
-        if draw.textlength(test, font=font) <= max_width:
-            line.append(w)
-        else:
-            if line:
-                lines.append(" ".join(line))
-            line = [w]
-    if line:
-        lines.append(" ".join(line))
-    return lines
-
 def _as_local(dt_obj: dt.datetime) -> dt.datetime:
-    """
-    Convert naive (assumed UTC) or aware datetime to LOCAL_TZ.
-    """
+    """Convert naive (assumed UTC) or aware datetime to LOCAL_TZ."""
     if dt_obj is None:
         return dt.datetime.now(LOCAL_TZ)
     if dt_obj.tzinfo is None:
         dt_obj = dt_obj.replace(tzinfo=dt.timezone.utc)
     return dt_obj.astimezone(LOCAL_TZ)
 
-
 def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
+
+
+SALT_USER_QR = "user-qr-v1"
+
+def _user_qr_sign(uid: int) -> str:
+    s = URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt=SALT_USER_QR)
+    return s.dumps({"uid": int(uid)})
+
+@commuter_bp.route("/users/me/qr.png", methods=["GET"])
+@require_role("commuter")
+def commuter_my_wallet_qr_png():
+    """
+    Returns a PNG QR for the logged-in commuter.
+    The QR encodes a URL to /pao/users/scan?token=...
+    """
+    size = max(240, min(1024, int(request.args.get("size", 360) or 360)))
+    token = _user_qr_sign(g.user.id)
+    scan_url = url_for("pao.user_qr_scan", _external=True) + f"?token={token}"
+
+    qr = qrcode.QRCode(box_size=10, border=2)
+    qr.add_data(scan_url)
+    qr.make(fit=True)
+    out = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+    # Normalize to requested square size
+    out = out.resize((size, size))
+
+    bio = BytesIO()
+    out.save(bio, format="PNG", optimize=True)
+    bio.seek(0)
+
+    resp = make_response(send_file(bio, mimetype="image/png"))
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+@commuter_bp.route("/notify-test", methods=["POST"])
+@require_role("commuter")
+def commuter_notify_test():
+    ok = push_to_user(
+        db, DeviceToken, g.user.id,
+        "🔔 Test notification",
+        "If you see this, push is working!",
+        {"deeplink": "/commuter/notifications"},
+        channelId="announcements", priority="high", ttl=600,
+    )
+    return jsonify(ok=ok), (200 if ok else 202)
 
 
 
 @commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
 def commuter_ticket_image(ticket_id: int):
     """
-    Enhanced flat RGB-only JPG receipt renderer with larger fonts and better design.
+    High-contrast, LARGE-TYPE JPG receipt renderer.
     Optional: ?download=1 to force download.
     Includes detailed logging to verify where `issued_by` is coming from.
     """
-    # --- local imports to keep this route self-contained ---
-    from io import BytesIO
-    import datetime as dt
-    import qrcode
-    from PIL import Image, ImageDraw, ImageFont
-    from flask import url_for, request, jsonify, current_app, send_file, make_response
-    from sqlalchemy.orm import joinedload
-    from models.ticket_sale import TicketSale
-    from models.ticket_stop import TicketStop
-    from models.bus import Bus  # for joinedload(Bus.pao)
-
     # --- fetch ticket with the relationships we actually use ---
     t = (
         TicketSale.query.options(
@@ -212,58 +191,54 @@ def commuter_ticket_image(ticket_id: int):
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-    # --- enhanced canvas & color palette ---
-    W, H = 1200, 1800  # Slightly larger canvas
-    M = 60  # Increased margins
+    # ───────────────────────────────────────────────────────────────
+    # Larger canvas + font sizes
+    # ───────────────────────────────────────────────────────────────
+    W, H = 1440, 2200   # was 1200x1800
+    M = 80              # was 60
 
-    # Modern color palette
-    DARK_GREEN    = (21, 87, 36)      # Primary brand
-    LIGHT_GREEN   = (236, 248, 239)   # Soft background
-    ACCENT_GREEN  = (34, 139, 58)     # Accents
-    TEXT_DARK     = (33, 37, 41)      # Primary text
-    TEXT_MEDIUM   = (73, 80, 87)      # Secondary text
-    TEXT_MUTED    = (108, 117, 125)   # Muted text
-    BORDER_LIGHT  = (222, 226, 230)   # Light borders
-    WHITE         = (255, 255, 255)   # Pure white
-    BG_PAPER      = (250, 251, 252)   # Paper background
-    SUCCESS_BG    = (212, 237, 218)   # Success pill background
-    SUCCESS_TEXT  = (21, 87, 36)      # Success text
-    ERROR_BG      = (248, 215, 218)   # Error pill background
-    ERROR_TEXT    = (114, 28, 36)     # Error text
+    # palette
+    DARK_GREEN    = (21, 87, 36)
+    LIGHT_GREEN   = (236, 248, 239)
+    ACCENT_GREEN  = (34, 139, 58)
+    TEXT_DARK     = (33, 37, 41)
+    TEXT_MEDIUM   = (73, 80, 87)
+    TEXT_MUTED    = (108, 117, 125)
+    BORDER_LIGHT  = (222, 226, 230)
+    WHITE         = (255, 255, 255)
+    BG_PAPER      = (250, 251, 252)
+    SUCCESS_BG    = (212, 237, 218)
+    SUCCESS_TEXT  = (21, 87, 36)
+    ERROR_BG      = (248, 215, 218)
+    ERROR_TEXT    = (114, 28, 36)
 
     bg = Image.new("RGB", (W, H), BG_PAPER)
     draw = ImageDraw.Draw(bg)
 
-    # --- enhanced fonts with better fallbacks ---
     def _safe_font(candidates, size):
-        """Try multiple font candidates with proper fallbacks"""
         for candidate in candidates:
             try:
                 return ImageFont.truetype(candidate, size)
             except Exception:
                 continue
-        try:
-            return ImageFont.load_default()
-        except Exception:
-            return None
+        return ImageFont.load_default()
 
-    # Significantly larger font sizes for better readability
-    ft_title   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 56)  # Was 46
-    ft_header  = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 44)  # Was 38
-    ft_label   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 32)           # Was 26
-    ft_value   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 38)  # Was 32
-    ft_big     = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 68)  # Was 56
-    ft_medium  = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 36)           # New size
-    ft_small   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 28)           # Was 22
+    # ↑ bumped sizes significantly
+    ft_title   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 80)
+    ft_header  = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 60)
+    ft_label   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 40)
+    ft_value   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 52)
+    ft_big     = _safe_font(["Arial Black", "DejaVuSans-Bold.ttf", "arialbd.ttf"], 96)
+    ft_medium  = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 44)
+    ft_small   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 34)
 
     def tw(text, font):
-        """Get text width safely"""
         if not font or not text:
             return 0
         try:
             return draw.textlength(text, font=font)
         except Exception:
-            return len(text) * 10  # Rough estimate
+            return len(text) * 10
 
     def ellipsize(s: str, max_chars: int) -> str:
         if len(s) <= max_chars:
@@ -271,146 +246,133 @@ def commuter_ticket_image(ticket_id: int):
         keep = max(8, max_chars // 2 - 1)
         return s[:keep] + "…" + s[-(max_chars - keep - 1):]
 
-    # --- main white card with subtle shadow effect ---
-    shadow_offset = 8
-    shadow_box = (M + shadow_offset, M + shadow_offset, W - M + shadow_offset, H - M + shadow_offset)
-    draw.rectangle(shadow_box, fill=(0, 0, 0))  # simple shadow
-    card_box = (M, M, W - M, H - M)
-    draw.rectangle(card_box, fill=WHITE, outline=BORDER_LIGHT, width=2)
+    # card & header
+    shadow_offset = 10
+    draw.rectangle((M + shadow_offset, M + shadow_offset, W - M + shadow_offset, H - M + shadow_offset), fill=(0, 0, 0))
+    draw.rectangle((M, M, W - M, H - M), fill=WHITE, outline=BORDER_LIGHT, width=2)
 
-    y = M + 32
-
-    # --- enhanced header with gradient-like effect ---
-    header_h = 120
-    head_box = (M, y, W - M, y + header_h)
-    draw.rectangle(head_box, fill=LIGHT_GREEN, outline=DARK_GREEN, width=3)
-
-    header_text = "PGT Onboard — Official Receipt"
+    y = M + 40
+    header_h = 180  # was 120
+    draw.rectangle((M, y, W - M, y + header_h), fill=LIGHT_GREEN, outline=DARK_GREEN, width=3)
     if ft_title:
-        text_y = y + (header_h - 56) // 2
-        draw.text((M + 40, text_y), header_text, fill=DARK_GREEN, font=ft_title)
+        draw.text((M + 48, y + (header_h - 80) // 2), "PGT Onboard — Official Receipt", fill=DARK_GREEN, font=ft_title)
+    y += header_h + 12
+    draw.rectangle((M + 48, y, W - M - 48, y + 5), fill=ACCENT_GREEN)
+    y += 40
 
-    y += header_h + 8
-    draw.rectangle((M + 40, y, W - M - 40, y + 4), fill=ACCENT_GREEN)
-    y += 32
-
-    # --- ticket info section with better spacing ---
-    L = M + 40
-    R = W - M - 40
-    COL_GAP = 50
+    # fields
+    L = M + 48
+    R = W - M - 48
+    COL_GAP = 60
     COL_W = (R - L - COL_GAP) // 2
 
     def field(x, y, label, value, color=TEXT_DARK):
-        """Render a field with enhanced styling"""
         if ft_label:
             draw.text((x, y), label.upper(), fill=TEXT_MUTED, font=ft_label)
-        y2 = y + 42
-
-        # Ensure value fits in column
-        display_value = value if tw(value, ft_value) <= COL_W else ellipsize(value, 32)
+        y2 = y + 54  # label→value gap
+        display_value = value if tw(value, ft_value) <= COL_W else ellipsize(value, 36)
         if ft_value:
             draw.text((x, y2), display_value, fill=color, font=ft_value)
-
-        return y2 + 48 + 24  # spacing between fields
+        return y2 + 58 + 28  # value height + spacing
 
     yL = y
     yR = y
-
     passenger_name = f"{t.user.first_name} {t.user.last_name}" if t.user else "—"
-
     yL = field(L, yL, "Reference No.", t.reference_no or "—")
     yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—")
 
-    date_time = f"{t.created_at.strftime('%B %d, %Y')} at {t.created_at.strftime('%I:%M %p').lstrip('0').lower()}"
-    yL = field(L, yL, "Date & Time", date_time)
-    yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
+    # Date & Time on two stacked lines, larger
+    date_str = t.created_at.strftime('%B %d, %Y')
+    time_str = t.created_at.strftime('%I:%M %p').lstrip('0').lower()
 
+    if ft_label:
+        draw.text((L, yL), "DATE & TIME", fill=TEXT_MUTED, font=ft_label)
+
+    y_value = yL + 54
+    if ft_value:
+        d_disp = date_str if tw(date_str, ft_value) <= COL_W else ellipsize(date_str, 36)
+        draw.text((L, y_value), d_disp, fill=TEXT_DARK, font=ft_value)
+
+    if ft_value:
+        t_disp = time_str if tw(time_str, ft_value) <= COL_W else ellipsize(time_str, 36)
+        draw.text((L, y_value + 52), t_disp, fill=TEXT_DARK, font=ft_value)
+
+    yL = y_value + 52 + 60  # stack time + extra spacing
+
+    yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
     yL = field(L, yL, "Origin", origin_name or "—")
     yR = field(L + COL_W + COL_GAP, yR, "Passenger", passenger_name)
 
-    y = max(yL, yR) + 16
-    draw.rectangle((L, y, R, y + 3), fill=BORDER_LIGHT)
-    y += 40
+    y = max(yL, yR) + 20
+    draw.rectangle((L, y, R, y + 4), fill=BORDER_LIGHT)
+    y += 48
 
-    # --- amount and status section ---
+    # amount + pill
     amount_y = y
     if ft_label:
         draw.text((L, amount_y), "TOTAL AMOUNT", fill=TEXT_MUTED, font=ft_label)
     if ft_big:
-        draw.text((L, amount_y + 40), f"₱{float(t.price or 0):.2f}", fill=ACCENT_GREEN, font=ft_big)
+        draw.text((L, amount_y + 44), f"₱{float(t.price or 0):.2f}", fill=ACCENT_GREEN, font=ft_big)
 
-    # Status pill
     state_txt = "PAID" if t.paid else "UNPAID"
     state_bg = SUCCESS_BG if t.paid else ERROR_BG
     state_text_color = SUCCESS_TEXT if t.paid else ERROR_TEXT
 
     if ft_header:
-        pill_w = int(tw(state_txt, ft_header) + 48)
-        pill_h = 64
+        pill_w = int(tw(state_txt, ft_header) + 64)
+        pill_h = 76
         pill_x1 = R - pill_w
         pill_y1 = amount_y + 8
-
-        # Rounded rectangle effect (approximate)
-        corner_radius = 12
-        draw.rectangle((pill_x1 + corner_radius, pill_y1, pill_x1 + pill_w - corner_radius, pill_y1 + pill_h), fill=state_bg)
-        draw.rectangle((pill_x1, pill_y1 + corner_radius, pill_x1 + pill_w, pill_y1 + pill_h - corner_radius), fill=state_bg)
-
+        draw.rectangle((pill_x1 + 14, pill_y1, pill_x1 + pill_w - 14, pill_y1 + pill_h), fill=state_bg)
+        draw.rectangle((pill_x1, pill_y1 + 14, pill_x1 + pill_w, pill_y1 + pill_h - 14), fill=state_bg)
         text_x = pill_x1 + (pill_w - tw(state_txt, ft_header)) // 2
-        text_y = pill_y1 + (pill_h - 44) // 2
+        text_y = pill_y1 + (pill_h - 60) // 2
         draw.text((text_x, text_y), state_txt, fill=state_text_color, font=ft_header)
 
-    y += 140
+    y += 170  # more breathing room
 
-    # --- QR section ---
+    # QR section (bigger)
     qr_section_bg = (247, 251, 247)
-    qr_size = 400
-    qr_padding = 32
+    qr_size = 480
+    qr_padding = 36
     panel_w = qr_size + qr_padding * 2
-    panel_h = qr_size + qr_padding * 2 + 80
+    panel_h = qr_size + qr_padding * 2 + 96
 
-    panel_box = (L, y, L + panel_w, y + panel_h)
-    draw.rectangle(panel_box, fill=qr_section_bg, outline=BORDER_LIGHT, width=2)
-
-    qr_resized = qr_img.resize((qr_size, qr_size))
-    bg.paste(qr_resized, (L + qr_padding, y + qr_padding))
-
+    draw.rectangle((L, y, L + panel_w, y + panel_h), fill=qr_section_bg, outline=BORDER_LIGHT, width=2)
+    bg.paste(qr_img.resize((qr_size, qr_size)), (L + qr_padding, y + qr_padding))
     if ft_medium:
-        qr_desc_y = y + qr_padding + qr_size + 20
-        draw.text((L + qr_padding, qr_desc_y), "Scan to view/download receipt", fill=TEXT_MEDIUM, font=ft_medium)
+        draw.text((L + qr_padding, y + qr_padding + qr_size + 24), "Scan to view/download receipt", fill=TEXT_MEDIUM, font=ft_medium)
 
-    # --- right column info ---
-    right_x = L + panel_w + 40
-    right_y = y + 20
+    # right column info (labels bigger)
+    right_x = L + panel_w + 56
+    right_y = y + 24
 
     if ft_label:
         draw.text((right_x, right_y), "PAYMENT STATUS", fill=TEXT_MUTED, font=ft_label)
     if ft_header:
-        status_color = ACCENT_GREEN if t.paid else ERROR_TEXT
-        draw.text((right_x, right_y + 36), state_txt, fill=status_color, font=ft_header)
+        draw.text((right_x, right_y + 44), state_txt, fill=(ACCENT_GREEN if t.paid else ERROR_TEXT), font=ft_header)
 
-    info_y = right_y + 120
-
+    info_y = right_y + 140
     info_items = [
         ("Bus ID", str(getattr(t, "bus_id", "") or "—")),
-        ("Trip ID", str(getattr(t, "trip_id", "") or "—")),
         ("Issued By (PAO ID)", str(issuer_id or "—")),
     ]
     for label, value in info_items:
         if ft_label:
             draw.text((right_x, info_y), label.upper(), fill=TEXT_MUTED, font=ft_label)
         if ft_value:
-            draw.text((right_x, info_y + 32), value, fill=TEXT_MEDIUM, font=ft_value)
-        info_y += 80
+            draw.text((right_x, info_y + 36), value, fill=TEXT_MEDIUM, font=ft_value)
+        info_y += 96
 
-    # --- footer ---
-    footer_y = H - M - 60
+    # footer
+    footer_y = H - M - 72
     if ft_small:
-        footer_text = ellipsize(img_link, 65)
-        draw.text((L, footer_y), footer_text, fill=TEXT_MUTED, font=ft_small)
-        timestamp = dt.datetime.now().strftime("Generated on %B %d, %Y at %I:%M %p")
-        draw.text((L, footer_y + 32), timestamp, fill=TEXT_MUTED, font=ft_small)
+        from datetime import datetime as _dt
+        link_display = (img_link[:80] + "…") if len(img_link) > 80 else img_link
+        draw.text((L, footer_y), link_display, fill=TEXT_MUTED, font=ft_small)
+        draw.text((L, footer_y + 36), _dt.now().strftime("Generated on %B %d, %Y at %I:%M %p"), fill=TEXT_MUTED, font=ft_small)
 
-    # --- encode to high-quality JPEG ---
+    # encode JPEG
     bio = BytesIO()
     bg.save(bio, format="JPEG", quality=95, optimize=True)
     bio.seek(0)
@@ -425,7 +387,7 @@ def commuter_ticket_image(ticket_id: int):
         )
     )
 
-    # --- helpful debug headers ---
+    # debug headers
     try:
         resp.headers["X-Debug-Issued-By"] = str(issuer_id or "")
         resp.headers["X-Debug-Issued-By-Field"] = str(issuer_via_field or "")
@@ -437,6 +399,7 @@ def commuter_ticket_image(ticket_id: int):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
+<<<<<<< HEAD
 def _get_or_create_wallet_account(user_id: int) -> WalletAccount:
     acct = WalletAccount.query.filter_by(user_id=user_id).first()
     if not acct:
@@ -528,11 +491,12 @@ def wallet_qrcode_rotate():
     return jsonify(wallet_token=acct.qr_token, deep_link=deep_link), 200
 
 
+=======
+>>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
 @commuter_bp.route("/tickets/<int:ticket_id>/receipt-qr.png", methods=["GET"])
 def commuter_ticket_receipt_qr(ticket_id: int):
     # Encode the canonical receipt image URL (exactly what the receipt embeds)
     img_link = url_for("commuter.commuter_ticket_image", ticket_id=ticket_id, _external=True)
-
     qr = qrcode.QRCode(box_size=10, border=2)
     qr.add_data(img_link)
     qr.make(fit=True)
@@ -546,17 +510,16 @@ def commuter_ticket_receipt_qr(ticket_id: int):
     resp.headers["Cache-Control"] = "public, max-age=86400"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
+
 @commuter_bp.app_errorhandler(Exception)
 def _commuter_errors(e: Exception):
     """
     If ?debug=1 (or X-Debug: 1) => return JSON with error type + message + traceback.
     Otherwise: let HTTPExceptions pass through unchanged; others return a generic 500.
     """
-    # Log full traceback to server logs
     current_app.logger.exception("Unhandled error on %s %s", request.method, request.path)
 
     if isinstance(e, HTTPException) and not _debug_enabled():
-        # Preserve normal HTTP errors (401/403/404/400 etc.) unless debug is on
         return e
 
     status = getattr(e, "code", 500)
@@ -589,7 +552,6 @@ def _as_time(v: Any) -> Optional[dt.time]:
                 pass
     return None
 
-# routes/commuter.py
 @commuter_bp.route("/device-token", methods=["POST"])
 @require_role("commuter")
 def save_device_token():
@@ -600,7 +562,6 @@ def save_device_token():
         return jsonify(error="token required"), 400
 
     created = False
-    # 🔑 upsert by token (unique), then reassign to current user
     row = DeviceToken.query.filter_by(token=token).first()
     if not row:
         row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
@@ -614,26 +575,17 @@ def save_device_token():
     current_app.logger.info(f"[push] saved token token={token[:12]}… uid={g.user.id} created={created} platform={row.platform}")
     return jsonify(ok=True, created=created), (201 if created else 200)
 
-
-
-
 @commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
 def qr_image_for_ticket(ticket_id: int):
     t = TicketSale.query.get_or_404(ticket_id)
-
     amount = int(round(float(t.price or 0)))
     prefix = "discount" if t.passenger_type == "discount" else "regular"
     filename = f"{prefix}_{amount}.jpg"
-
     return redirect(url_for("static", filename=f"qr/{filename}", _external=True), code=302)
-
 
 @commuter_bp.route("/tickets/<int:ticket_id>/view", methods=["GET"])
 def commuter_ticket_view(ticket_id: int):
-    """
-    Minimal HTML view with the same image + a download button.
-    Keeps the image URL canonical for QR verification flows.
-    """
+    """Minimal HTML view with the same image + a download button."""
     img_url = url_for("commuter.commuter_ticket_image", ticket_id=ticket_id, _external=True)
     dl_url = img_url + ("&" if "?" in img_url else "?") + "download=1"
     return (
@@ -676,7 +628,7 @@ def commuter_get_ticket(ticket_id: int):
     t = (
         TicketSale.query.options(
             joinedload(TicketSale.user),
-            joinedload(TicketSale.bus).joinedload(Bus.pao),         # ⬅️ add this
+            joinedload(TicketSale.bus).joinedload(Bus.pao),
             joinedload(TicketSale.origin_stop_time),
             joinedload(TicketSale.destination_stop_time),
         )
@@ -686,7 +638,7 @@ def commuter_get_ticket(ticket_id: int):
     if not t:
         return jsonify(error="ticket not found"), 404
 
-    # Resolve names (works whether IDs point to StopTime or TicketStop)
+    # Resolve names
     if t.origin_stop_time:
         origin_name = t.origin_stop_time.stop_name
     else:
@@ -699,14 +651,13 @@ def commuter_get_ticket(ticket_id: int):
         tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
         destination_name = tsd.stop_name if tsd else ""
 
-    # Choose QR asset and guard for None prices
+    # Choose QR asset
     if t.passenger_type == "discount":
         base = round(float(t.price or 0) / 0.8)
         prefix = "discount"
     else:
         base = int(t.price or 0)
         prefix = "regular"
-
     filename = f"{prefix}_{base}.jpg"
     qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
 
@@ -717,10 +668,7 @@ def commuter_get_ticket(ticket_id: int):
     )
     qr_link = url_for("commuter.commuter_ticket_receipt_qr", ticket_id=t.id, _external=True)
 
-    issuer_id = (
-        getattr(t, "issued_by", None)
-        or (t.bus.pao.id if (t.bus and t.bus.pao) else None)         # ⬅️ fallback
-    )
+    issuer_id = getattr(t, "issued_by", None) or (t.bus.pao.id if (t.bus and t.bus.pao) else None)
 
     return jsonify({
         "id": t.id,
@@ -737,9 +685,8 @@ def commuter_get_ticket(ticket_id: int):
         "qr_link": qr_link,
         "qr_url": qr_url,
         "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
-        "paoId": issuer_id,                                           # ⬅️ use fallback
+        "paoId": issuer_id,
     }), 200
-
 
 @commuter_bp.route("/dashboard", methods=["GET"])
 @require_role("commuter")
@@ -754,7 +701,7 @@ def dashboard():
     """
     debug_on = (request.args.get("debug") or "").lower() in {"1", "true", "yes"}
 
-    # -------- Local "now" and service date (with optional overrides) --------
+    # Local "now" and service date (with optional overrides)
     now_local = dt.datetime.now(LOCAL_TZ) if LOCAL_TZ else dt.datetime.now()
     date_arg = (request.args.get("date") or "").strip()
     force_now = (request.args.get("now") or request.args.get("force_now") or "").strip()
@@ -774,7 +721,6 @@ def dashboard():
         except Exception:
             pass
 
-    # Compare purely on naive time values to match DB 'TIME' columns
     now_time_local = now_local.time().replace(tzinfo=None)
 
     def _choose_greeting() -> str:
@@ -785,7 +731,7 @@ def dashboard():
             return "Good afternoon"
         return "Good evening"
 
-    # -------- next trip (the next one from "now") --------
+    # next trip (the next one from "now")
     next_trip_row = (
         db.session.query(Trip, Bus.identifier.label("bus_identifier"))
         .join(Bus, Trip.bus_id == Bus.id)
@@ -806,10 +752,10 @@ def dashboard():
     else:
         next_trip = None
 
-    # -------- unread messages (for Announcements dashlet) --------
+    # unread messages count (simple example)
     unread_msgs = Announcement.query.count()
 
-    # -------- last announcement pill --------
+    # last announcement
     last_ann_row = (
         db.session.query(
             Announcement,
@@ -832,12 +778,9 @@ def dashboard():
             "bus_identifier": bid or "unassigned",
         }
 
-    # -------- LIVE NOW (tolerant like route timeline) --------
+    # LIVE NOW
     def _is_live_window(now_t: dt.time, s: Optional[dt.time], e: Optional[dt.time], *, grace_min: int = 3) -> bool:
-        """
-        True if now_t within [s,e). If s==e (zero-dwell), treat as ±grace_min minutes window.
-        All params are naive times (tzinfo=None).
-        """
+        """True if now_t within [s,e). If s==e, treat as ±grace_min minutes window."""
         if not s or not e:
             return False
         if s == e:
@@ -866,7 +809,6 @@ def dashboard():
 
         events: List[Dict[str, Any]] = []
         if len(sts) < 2:
-            # No usable stop list — fall back to full trip window
             events.append({
                 "type": "trip",
                 "label": "In Transit",
@@ -876,7 +818,6 @@ def dashboard():
             })
         else:
             for idx, st in enumerate(sts):
-                # STOP window even if only one of arrive/depart exists
                 s = _as_time(st.arrive_time or st.depart_time)
                 e = _as_time(st.depart_time or st.arrive_time)
                 if s or e:
@@ -887,8 +828,6 @@ def dashboard():
                         "end": e,
                         "description": st.stop_name,
                     })
-
-                # TRIP window to next stop — be lenient with missing times
                 if idx < len(sts) - 1:
                     nxt = sts[idx + 1]
                     s2 = _as_time(st.depart_time or st.arrive_time)
@@ -902,7 +841,6 @@ def dashboard():
                             "description": f"{st.stop_name} → {nxt.stop_name}",
                         })
 
-        # If still nothing, ensure one full window
         if not events:
             events.append({
                 "type": "trip",
@@ -928,7 +866,6 @@ def dashboard():
                 })
                 break
 
-        # Final fallback: if the specific segments didn't match but we're within the trip window, show In Transit
         ts = _as_time(t.start_time)
         te = _as_time(t.end_time)
         if not chosen and ts and te and _is_live_window(now_time_local, ts, te, grace_min=0):
@@ -944,7 +881,7 @@ def dashboard():
             })
 
         if debug_on:
-            def _fmt(x: Optional[dt.datetime.time]) -> Optional[str]:
+            def _fmt(x: Optional[dt.time]) -> Optional[str]:
                 return x.strftime("%H:%M") if x else None
             debug_trips.append({
                 "trip_id": t.id,
@@ -966,7 +903,6 @@ def dashboard():
                 },
             })
 
-    # loud server logs
     current_app.logger.info(
         "dashboard live_now=%d now=%s date=%s trips=%d",
         len(live_now),
@@ -997,7 +933,6 @@ def dashboard():
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp, 200
 
-
 @commuter_bp.route("/trips", methods=["GET"])
 def list_all_trips():
     date_str = request.args.get("date")
@@ -1014,14 +949,8 @@ def list_all_trips():
         .subquery()
     )
     first_stop_name_sq = (
-        db.session.query(
-            StopTime.trip_id, StopTime.stop_name.label("origin")
-        )
-        .join(
-            first_stop_sq,
-            (StopTime.trip_id == first_stop_sq.c.trip_id)
-            & (StopTime.seq == first_stop_sq.c.min_seq),
-        )
+        db.session.query(StopTime.trip_id, StopTime.stop_name.label("origin"))
+        .join(first_stop_sq, (StopTime.trip_id == first_stop_sq.c.trip_id) & (StopTime.seq == first_stop_sq.c.min_seq))
         .subquery()
     )
     last_stop_sq = (
@@ -1030,24 +959,13 @@ def list_all_trips():
         .subquery()
     )
     last_stop_name_sq = (
-        db.session.query(
-            StopTime.trip_id, StopTime.stop_name.label("destination")
-        )
-        .join(
-            last_stop_sq,
-            (StopTime.trip_id == last_stop_sq.c.trip_id)
-            & (StopTime.seq == last_stop_sq.c.max_seq),
-        )
+        db.session.query(StopTime.trip_id, StopTime.stop_name.label("destination"))
+        .join(last_stop_sq, (StopTime.trip_id == last_stop_sq.c.trip_id) & (StopTime.seq == last_stop_sq.c.max_seq))
         .subquery()
     )
 
     trips = (
-        db.session.query(
-            Trip,
-            Bus.identifier,
-            first_stop_name_sq.c.origin,
-            last_stop_name_sq.c.destination,
-        )
+        db.session.query(Trip, Bus.identifier, first_stop_name_sq.c.origin, last_stop_name_sq.c.destination)
         .join(Bus, Trip.bus_id == Bus.id)
         .outerjoin(first_stop_name_sq, Trip.id == first_stop_name_sq.c.trip_id)
         .outerjoin(last_stop_name_sq, Trip.id == last_stop_name_sq.c.trip_id)
@@ -1069,7 +987,6 @@ def list_all_trips():
     ]
     return jsonify(result), 200
 
-
 @commuter_bp.route("/buses", methods=["GET"])
 def list_buses():
     date_str = request.args.get("date")
@@ -1082,7 +999,6 @@ def list_buses():
         q = q.join(Trip, Bus.id == Trip.bus_id).filter(Trip.service_date == svc_date)
     buses = q.order_by(Bus.identifier.asc()).all()
     return jsonify([{"id": b.id, "identifier": b.identifier} for b in buses]), 200
-
 
 @commuter_bp.route("/bus-trips", methods=["GET"])
 @require_role("commuter")
@@ -1101,21 +1017,15 @@ def commuter_bus_trips():
         .order_by(Trip.start_time.asc())
         .all()
     )
-    return (
-        jsonify(
-            [
-                {
-                    "id": t.id,
-                    "number": t.number,
-                    "start_time": _as_time(t.start_time).strftime("%H:%M") if _as_time(t.start_time) else "",
-                    "end_time": _as_time(t.end_time).strftime("%H:%M") if _as_time(t.end_time) else "",
-                }
-                for t in trips
-            ]
-        ),
-        200,
-    )
-
+    return jsonify([
+        {
+            "id": t.id,
+            "number": t.number,
+            "start_time": _as_time(t.start_time).strftime("%H:%M") if _as_time(t.start_time) else "",
+            "end_time": _as_time(t.end_time).strftime("%H:%M") if _as_time(t.end_time) else "",
+        }
+        for t in trips
+    ]), 200
 
 @commuter_bp.route("/stop-times", methods=["GET"])
 @require_role("commuter")
@@ -1125,20 +1035,14 @@ def commuter_stop_times():
         return jsonify(error="trip_id is required"), 400
 
     sts = StopTime.query.filter_by(trip_id=trip_id).order_by(StopTime.seq.asc()).all()
-    return (
-        jsonify(
-            [
-                {
-                    "stop_name": st.stop_name,
-                    "arrive_time": (_as_time(st.arrive_time).strftime("%H:%M") if _as_time(st.arrive_time) else ""),
-                    "depart_time": (_as_time(st.depart_time).strftime("%H:%M") if _as_time(st.depart_time) else ""),
-                }
-                for st in sts
-            ]
-        ),
-        200,
-    )
-
+    return jsonify([
+        {
+            "stop_name": st.stop_name,
+            "arrive_time": (_as_time(st.arrive_time).strftime("%H:%M") if _as_time(st.arrive_time) else ""),
+            "depart_time": (_as_time(st.depart_time).strftime("%H:%M") if _as_time(st.depart_time) else ""),
+        }
+        for st in sts
+    ]), 200
 
 @commuter_bp.route("/location", methods=["GET"])
 @require_role("commuter")
@@ -1146,15 +1050,13 @@ def vehicle_location():
     sr = SensorReading.query.order_by(SensorReading.timestamp.desc()).first()
     if not sr:
         return jsonify(error="no sensor data"), 404
-    return (
-        jsonify(
-            lat=sr.lat,
-            lng=sr.lng,
-            occupied=sr.occupied,
-            timestamp=sr.timestamp.isoformat(),
-        ),
-        200,
-    )
+    return jsonify(
+        lat=sr.lat,
+        lng=sr.lng,
+        occupied=sr.occupied,
+        timestamp=sr.timestamp.isoformat(),
+    ), 200
+
 # --- date-window helper (local -> UTC) ---
 def _local_day_bounds_utc(day: dt.date):
     """
@@ -1166,7 +1068,6 @@ def _local_day_bounds_utc(day: dt.date):
     start_utc   = start_local.astimezone(dt.timezone.utc).replace(tzinfo=None)
     end_utc     = end_local.astimezone(dt.timezone.utc).replace(tzinfo=None)
     return start_utc, end_utc
-
 
 @commuter_bp.route("/tickets/mine", methods=["GET"])
 @require_role("commuter")
@@ -1188,7 +1089,6 @@ def my_receipts():
     bus_id    = request.args.get("bus_id", type=int)
     light     = (request.args.get("light") or "").lower() in {"1", "true", "yes"}
 
-    # ── base query: eager-load to avoid N+1s
     qs = (
         db.session.query(TicketSale)
         .options(
@@ -1199,7 +1099,6 @@ def my_receipts():
         .filter(TicketSale.user_id == g.user.id)
     )
 
-    # ── date filter (exact day)
     if date_str:
         try:
             day = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -1210,7 +1109,6 @@ def my_receipts():
         cutoff = dt.datetime.utcnow() - timedelta(days=int(days))
         qs = qs.filter(TicketSale.created_at >= cutoff)
 
-    # ── bus filter (via Trip.bus_id). If your TicketSale has bus_id, use that; else join Trip.
     if bus_id:
         if hasattr(TicketSale, "bus_id"):
             qs = qs.filter(TicketSale.bus_id == bus_id)
@@ -1218,24 +1116,15 @@ def my_receipts():
             qs = qs.join(Trip, TicketSale.trip_id == Trip.id).filter(Trip.bus_id == bus_id)
 
     total = qs.count()
-
-    rows = (
-        qs.order_by(TicketSale.created_at.desc())
-          .offset((page - 1) * page_size)
-          .limit(page_size)
-          .all()
-    )
+    rows = qs.order_by(TicketSale.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
 
     items = []
     for t in rows:
-        # choose QR asset
         amount = int(round(float(t.price or 0)))
         prefix = "discount" if t.passenger_type == "discount" else "regular"
         filename = f"{prefix}_{amount}.jpg"
         qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
 
-
-        # resolve stop names
         if t.origin_stop_time:
             origin_name = t.origin_stop_time.stop_name
         else:
@@ -1279,7 +1168,6 @@ def my_receipts():
         has_more=(page * page_size) < total,
     ), 200
 
-
 @commuter_bp.route("/trips/<int:trip_id>", methods=["GET"])
 @require_role("commuter")
 def get_trip(trip_id: int):
@@ -1296,19 +1184,14 @@ def get_trip(trip_id: int):
         .first()
     )
 
-    return (
-        jsonify(
-            id=trip.id,
-            number=trip.number,
-            origin=first_stop.stop_name if first_stop else "",
-            destination=last_stop.stop_name if last_stop else "",
-            start_time=_as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
-            end_time=_as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
-        ),
-        200,
-    )
-
-
+    return jsonify(
+        id=trip.id,
+        number=trip.number,
+        origin=first_stop.stop_name if first_stop else "",
+        destination=last_stop.stop_name if last_stop else "",
+        start_time=_as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
+        end_time=_as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
+    ), 200
 
 @commuter_bp.route("/timetable", methods=["GET"])
 @require_role("commuter")
@@ -1322,20 +1205,14 @@ def timetable():
         .order_by(StopTime.seq.asc(), StopTime.id.asc())
         .all()
     )
-    return (
-        jsonify(
-            [
-                {
-                    "stop": st.stop_name,
-                    "arrive": (_as_time(st.arrive_time).strftime("%H:%M") if _as_time(st.arrive_time) else ""),
-                    "depart": (_as_time(st.depart_time).strftime("%H:%M") if _as_time(st.depart_time) else ""),
-                }
-                for st in sts
-            ]
-        ),
-        200,
-    )
-
+    return jsonify([
+        {
+            "stop": st.stop_name,
+            "arrive": (_as_time(st.arrive_time).strftime("%H:%M") if _as_time(st.arrive_time) else ""),
+            "depart": (_as_time(st.depart_time).strftime("%H:%M") if _as_time(st.depart_time) else ""),
+        }
+        for st in sts
+    ]), 200
 
 @commuter_bp.route("/schedule", methods=["GET"])
 @require_role("commuter")
@@ -1348,7 +1225,7 @@ def schedule():
     trip = Trip.query.get_or_404(trip_id)
     stops = (
         StopTime.query.filter_by(trip_id=trip_id)
-        .order_by(StopTime.seq.asc(), StopTime.id.asc())   # stable ordering
+        .order_by(StopTime.seq.asc(), StopTime.id.asc())
         .all()
     )
 
@@ -1357,33 +1234,29 @@ def schedule():
         return tt.strftime("%H:%M") if tt else ""
 
     events = []
-
     if len(stops) == 0:
-        # no stop data at all → whole window is in-transit
         events.append({
             "id": 1,
             "type": "trip",
             "label": "In Transit",
             "start_time": fmt(trip.start_time),
-            "end_time":   fmt(trip.end_time),
+            "end_time": fmt(trip.end_time),
             "description": "",
         })
     else:
-        # always include stop windows (even if only one)
         for idx, st in enumerate(stops):
             s = _as_time(st.arrive_time) or _as_time(st.depart_time)
             e = _as_time(st.depart_time) or _as_time(st.arrive_time)
-            if s or e:  # skip truly empty rows
+            if s or e:
                 events.append({
                     "id": idx * 2 + 1,
                     "type": "stop",
                     "label": "At Stop",
                     "start_time": fmt(s),
-                    "end_time":   fmt(e),
+                    "end_time": fmt(e),
                     "description": st.stop_name,
                 })
 
-            # transit segment to next stop (only when both ends exist)
             if idx < len(stops) - 1:
                 nxt = stops[idx + 1]
                 s2 = _as_time(st.depart_time) or _as_time(st.arrive_time)
@@ -1394,7 +1267,7 @@ def schedule():
                         "type": "trip",
                         "label": "In Transit",
                         "start_time": fmt(s2),
-                        "end_time":   fmt(e2),
+                        "end_time": fmt(e2),
                         "description": f"{st.stop_name} → {nxt.stop_name}",
                     })
 
@@ -1413,7 +1286,6 @@ def announcements():
     date_str = request.args.get("date")
     limit    = request.args.get("limit", type=int)
 
-    # Base query: author + that author's assigned bus (outer join so unassigned still show)
     q = (
         db.session.query(
             Announcement,
@@ -1425,11 +1297,9 @@ def announcements():
         .outerjoin(Bus, User.assigned_bus_id == Bus.id)
     )
 
-    # Bus filter, if provided
     if bus_id:
         q = q.filter(User.assigned_bus_id == bus_id)
 
-    # Day filter: local day → [start_utc, end_utc)
     if date_str:
         try:
             day = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -1440,7 +1310,6 @@ def announcements():
 
     start_utc, end_utc = _local_day_bounds_utc(day)
     q = q.filter(Announcement.timestamp >= start_utc, Announcement.timestamp < end_utc)
-
     q = q.order_by(Announcement.timestamp.desc())
     if isinstance(limit, int) and limit > 0:
         q = q.limit(limit)
@@ -1450,7 +1319,6 @@ def announcements():
         {
             "id": ann.id,
             "message": ann.message,
-            # Treat DB naive timestamps as UTC when serializing
             "timestamp": (ann.timestamp.replace(tzinfo=dt.timezone.utc)).isoformat(),
             "author_name": f"{first} {last}",
             "bus_identifier": bus_identifier or "unassigned",
