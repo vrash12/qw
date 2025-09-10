@@ -25,19 +25,12 @@ from mqtt_ingest import publish
 from routes.auth import require_role
 from routes.tickets_static import jpg_name, QR_PATH
 from utils.qr import build_qr_payload
-<<<<<<< HEAD
 from utils.push import send_push_async  # ✅ keep this
 from decimal import Decimal
 import datetime as dt
 from models.wallet import TopUp                     # for daily-cap query
 from services.wallet import topup_cash, topup_gcash
 
-=======
-from utils.push import send_push_async, push_to_user
-# ---- Time helpers (UTC canonical; Manila convenience) ----
-from datetime import timezone as _tz, timedelta as _td
-_MNL = _tz(_td(hours=8))
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
 
 def _as_utc(x):
     if x is None:
@@ -88,7 +81,6 @@ def verify_user_qr_token(token: str, max_age: int = 60*60*24*30) -> dict:
 def user_qr_scan():
     token = (request.args.get("token") or "").strip()
     if not token:
-<<<<<<< HEAD
         return jsonify(error="wallet_token required"), 400
 
     if verify_wallet_token is None:
@@ -318,16 +310,6 @@ def wallet_overview(user_id: int):
             "cap_php": cap_php,
         },
     ), 200
-=======
-        return jsonify(valid=False, error="token required"), 400
-
-    try:
-        data = verify_user_qr_token(token)
-    except SignatureExpired:
-        return jsonify(valid=False, error="token expired"), 400
-    except BadSignature:
-        return jsonify(valid=False, error="invalid token"), 400
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
 
     uid = int(data.get("uid"))
     user = User.query.get(uid)
@@ -368,16 +350,9 @@ def _serialize_ticket_json(t: TicketSale, origin_name: str, destination_name: st
 
 @pao_bp.route("/tickets/<int:ticket_id>/receipt.png", methods=["GET"])
 def pao_ticket_receipt_image(ticket_id: int):
-<<<<<<< HEAD
     # Public shim that just redirects to the canonical commuter image
     return redirect(url_for("commuter.commuter_ticket_image", ticket_id=ticket_id), code=302)
     
-=======
-    # Public redirect to the commuter receipt image (no auth header needed)
-    return redirect(url_for("commuter.commuter_ticket_image", ticket_id=ticket_id))
-
-
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
 def _commuter_label(ticket: TicketSale) -> str:
     if getattr(ticket, "guest", False):
         return "Guest"
@@ -691,7 +666,6 @@ def pao_stop_times():
         ]
     ), 200
 
-<<<<<<< HEAD
 
 @pao_bp.route("/wallet/topups", methods=["POST"])
 @require_role("pao")
@@ -855,9 +829,6 @@ def pao_cash_topup():
     ), 201
 
 
-=======
-
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
 def _fare_for(o, d, passenger_type: str) -> int:
     hops = abs(o.seq - d.seq)
     base = 10 + max(hops - 1, 0) * 2
@@ -896,10 +867,6 @@ def create_ticket():
         if not o or not d:
             return jsonify(error="origin or destination not found"), 400
 
-<<<<<<< HEAD
-=======
-        # Items: allow either {items:[{passenger_type,quantity}...]} or single {passenger_type,quantity}
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
         items_spec = data.get("items")
         blocks: list[tuple[str, int]] = []
         if isinstance(items_spec, list):
@@ -922,10 +889,6 @@ def create_ticket():
         if not blocks:
             return jsonify(error="no passengers"), 400
 
-<<<<<<< HEAD
-=======
-        # Commuter (optional)
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
         user = None
         if not as_guest:
             if not uid:
@@ -944,13 +907,9 @@ def create_ticket():
         if total_qty > 20:
             return jsonify(error="quantity exceeds limit (20)"), 400
 
-<<<<<<< HEAD
         items: list[TicketSale] = []
         assigned_primary = False
 
-=======
-        # Ensure primary type appears first when mixed
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
         if primary_type in ("regular", "discount"):
             blocks.sort(key=lambda x: 0 if x[0] == primary_type else 1)
 
@@ -961,21 +920,10 @@ def create_ticket():
         for pt, qty in blocks:
             fare = _fare_for(o, d, pt)
             for _ in range(qty):
-<<<<<<< HEAD
                 this_user_id = None
                 if user and not assigned_primary:
                     this_user_id = user.id
                     assigned_primary = True
-=======
-                # Which ticket attaches to commuter (if provided)
-                this_user_id = None
-                if user:
-                    if assign_all:
-                        this_user_id = user.id
-                    elif not assigned_primary:
-                        this_user_id = user.id
-                        assigned_primary = True
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
 
                 t = TicketSale(
                     bus_id=bus_id,
@@ -984,11 +932,7 @@ def create_ticket():
                     price=fare,
                     passenger_type=pt,
                     reference_no="TEMP",
-<<<<<<< HEAD
                     paid=False,
-=======
-                    paid=True,                               # ← always paid on creation
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
                     created_at=ticket_dt,
                     origin_stop_time_id=o.id,
                     destination_stop_time_id=d.id,
@@ -1052,10 +996,6 @@ def create_ticket():
             except Exception:
                 current_app.logger.exception("[push] paid-confirmation failed")
 
-<<<<<<< HEAD
-=======
-        # ---- Response --------------------------------------------------------
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
         serialized = [_serialize_ticket_json(t, o.stop_name, d.stop_name) for t in items]
         if len(items) == 1:
             return jsonify(serialized[0]), 201
@@ -1235,11 +1175,7 @@ def get_ticket(ticket_id):
         "qr_link": qr_link,
         "qr_url": qr_url,
         "qr_bg_url": qr_bg_url,
-<<<<<<< HEAD
         "receipt_image": url_for("pao.pao_ticket_receipt_image", ticket_id=t.id, _external=True),
-=======
-        "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
         "paoId": getattr(t, "issued_by", None) or getattr(g, "user", None).id,
     }), 200
 
@@ -1265,11 +1201,7 @@ def mark_ticket_paid(ticket_id: int):
     try:
         db.session.commit()
 
-<<<<<<< HEAD
         # MQTT fare count update (UTC “today”)
-=======
-        # Update device’s live paid count via MQTT for *today* (UTC)
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
         from datetime import datetime as _dt
         start = _dt.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         end   = _dt.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)

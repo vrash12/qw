@@ -399,7 +399,7 @@ def commuter_ticket_image(ticket_id: int):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
-<<<<<<< HEAD
+
 def _get_or_create_wallet_account(user_id: int) -> WalletAccount:
     acct = WalletAccount.query.filter_by(user_id=user_id).first()
     if not acct:
@@ -491,8 +491,6 @@ def wallet_qrcode_rotate():
     return jsonify(wallet_token=acct.qr_token, deep_link=deep_link), 200
 
 
-=======
->>>>>>> 1a29b8b77ab124b7ddaf3563020cbcf5f994cd42
 @commuter_bp.route("/tickets/<int:ticket_id>/receipt-qr.png", methods=["GET"])
 def commuter_ticket_receipt_qr(ticket_id: int):
     # Encode the canonical receipt image URL (exactly what the receipt embeds)
