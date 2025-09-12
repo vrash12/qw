@@ -25,12 +25,28 @@ from mqtt_ingest import publish
 from routes.auth import require_role
 from routes.tickets_static import jpg_name, QR_PATH
 from utils.qr import build_qr_payload
-from utils.push import send_push_async  # ✅ keep this
+from utils.push import send_push_async, push_to_user  # ✅ now both are available
 from decimal import Decimal
 import datetime as dt
 from models.wallet import TopUp                     # for daily-cap query
 from services.wallet import topup_cash, topup_gcash
 
+
+from sqlalchemy import func, text
+from sqlalchemy.exc import IntegrityError
+
+# make sure we actually have these in this file:
+from models.wallet import WalletAccount, WalletLedger, TopUp
+
+# wallet token verifier (opaque WLT-* or similar)
+try:
+    from utils.wallet_qr import verify_wallet_token
+except Exception:
+    verify_wallet_token = None
+
+
+def _debug_enabled() -> bool:
+    return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
 def _as_utc(x):
     if x is None:
@@ -45,6 +61,42 @@ def _iso_utc(x):
     u = _as_utc(x)
     return u.strftime('%Y-%m-%dT%H:%M:%SZ')  # explicit 'Z'
 
+
+from threading import Thread
+
+def _post_commit_notify(bus_id:int, user_id:int|None, items_ids:list[int], o_name:str, d_name:str):
+    try:
+        with current_app.app_context():
+            # MQTT: recompute paid count
+            from datetime import datetime as _dt
+            start = _dt.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            end   = _dt.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)
+            cnt = (
+                db.session.query(func.count(TicketSale.id))
+                .filter(TicketSale.bus_id == bus_id, TicketSale.paid.is_(True))
+                .filter(TicketSale.created_at.between(start, end))
+                .scalar()
+            ) or 0
+
+            bus_row = Bus.query.get(bus_id)
+            if bus_row and bus_row.identifier:
+                publish(f"device/{bus_row.identifier}/fare", {"paid": cnt})
+
+            # Push (best-effort)
+            if user_id:
+                try:
+                    head_id = items_ids[0] if items_ids else None
+                    push_to_user(
+                        db, DeviceToken, user_id,
+                        "✅ Payment confirmed",
+                        f"Ref #{head_id} • {o_name} → {d_name}",
+                        {"deeplink": "/commuter/notifications","ticketId": head_id,"type":"payment","autonav": True},
+                        channelId="payments", priority="high", ttl=600,
+                    )
+                except Exception:
+                    current_app.logger.exception("[push] notify failed")
+    except Exception:
+        current_app.logger.exception("[post-commit] worker crashed")
 # ---- Time helpers (UTC canonical; Manila convenience) ----
 from datetime import timezone as _tz, timedelta as _td
 _MNL = _tz(_td(hours=8))
@@ -74,21 +126,18 @@ def verify_user_qr_token(token: str, max_age: int = 60*60*24*30) -> dict:
     # 30 days default validity; tweak as you like
     return _user_qr_serializer().loads(token, max_age=max_age)
 
-# …
-
-@pao_bp.route("/users/scan", methods=["GET"])   # <-- was @commuter_bp.route(...)
+@pao_bp.route("/users/scan", methods=["GET"])
 @require_role("pao")
 def user_qr_scan():
     token = (request.args.get("token") or "").strip()
     if not token:
-        return jsonify(error="wallet_token required"), 400
+        return jsonify(error="token required"), 400
 
-    if verify_wallet_token is None:
-        return jsonify(error="wallet token not supported"), 400
     try:
-        user_id = int(verify_wallet_token(token))
-    except Exception:
-        return jsonify(error="invalid wallet token"), 400
+        payload = verify_user_qr_token(token)  # ✅ use the signed-QR verifier
+        user_id = int(payload.get("uid"))
+    except (BadSignature, SignatureExpired):
+        return jsonify(error="invalid or expired token"), 400
 
     u = User.query.get(user_id)
     if not u:
@@ -101,12 +150,18 @@ def user_qr_scan():
 @require_role("pao")
 def pao_wallet_charge():
     """
-    Body:
+    Debit a commuter's wallet (whole pesos) and optionally mark a ticket as paid.
+    Body JSON:
       {
-        "amount_php": 25.00,
-        "wallet_token": "opaque-string"  # OR "user_id": 123,
-        "ticket_id": 456                 # optional; will be marked paid on success
+        "amount_php": 25,               # required, float or int
+        "wallet_token": "WLT-...",      # optional (opaque token → user_id)
+        "user_id": 123,                 # optional (alternative to wallet_token)
+        "ticket_id": 456                # optional (when charging a specific ticket)
       }
+    Returns 200 on success with {"ok": true, "user_id": <id>, "new_balance_php": <int>}.
+    Sends a push:
+      - type="wallet_debit" (and ticketId if provided)
+      - channelId="payments"
     """
     data = request.get_json(silent=True) or {}
 
@@ -117,210 +172,420 @@ def pao_wallet_charge():
         return jsonify(error="invalid amount_php"), 400
     if amount_php <= 0:
         return jsonify(error="amount must be > 0"), 400
-    amount_cents = int(round(amount_php * 100))
+    amount_pesos = int(round(amount_php))  # WHOLE PESOS (no *100)
 
     # --- resolve user ---
     token = (data.get("wallet_token") or "").strip()
-    user_id = data.get("user_id", None)
+    user_id = data.get("user_id")
     if token:
         if verify_wallet_token is None:
             return jsonify(error="wallet token not supported"), 400
         try:
             user_id = int(verify_wallet_token(token))
-        except ValueError:
+        except Exception:
             return jsonify(error="invalid wallet token"), 400
     if not user_id:
         return jsonify(error="missing wallet_token or user_id"), 400
-
-    # --- get/create account & debit atomically ---
-    acct = WalletAccount.query.filter_by(user_id=user_id).with_for_update().first()
-    if not acct:
-        return jsonify(error="wallet not found"), 404
+    user_id = int(user_id)
 
     ticket_id = data.get("ticket_id")
-
-    # 🔒 If charging a ticket, lock the ticket row and reject repeats
-    t = None
-    if ticket_id:
-        t = TicketSale.query.filter_by(id=int(ticket_id)).with_for_update().first()
-        if not t:
-            return jsonify(error="ticket not found"), 404
-        if t.paid:
-            return jsonify(error="already paid"), 409
-
-        dup = (
-            WalletLedger.query
-            .filter_by(
-                account_id=acct.id,
-                direction="debit",
-                event="ride",
-                ref_table="ticket_sale",
-                ref_id=int(ticket_id),
-            )
-            .with_for_update()
-            .first()
-        )
-        if dup:
-            return jsonify(error="already charged"), 409
-
-    # funds check
-    if int(acct.balance_cents) < amount_cents:
-        return jsonify(error="insufficient balance"), 402
-
-    # debit + ledger
-    new_balance = int(acct.balance_cents) - amount_cents
-    acct.balance_cents = new_balance
-
-    led = WalletLedger(
-        account_id=acct.id,
-        direction="debit",
-        event="ride",
-        amount_cents=amount_cents,
-        running_balance_cents=new_balance,
-        ref_table="ticket_sale" if ticket_id else None,
-        ref_id=int(ticket_id) if ticket_id else None,
-    )
-    db.session.add(led)
-
-    if t:
-        t.paid = True
+    t = None  # TicketSale row, if provided
 
     try:
+        # --- lock the wallet row (table has no 'id') ---
+        row = db.session.execute(
+            text(
+                "SELECT user_id, COALESCE(balance_pesos,0) AS balance_pesos "
+                "FROM wallet_accounts WHERE user_id=:uid FOR UPDATE"
+            ),
+            {"uid": user_id},
+        ).mappings().first()
+        if not row:
+            db.session.rollback()
+            return jsonify(error="wallet not found"), 404
+
+        balance_pesos = int(row["balance_pesos"])
+
+        # --- if charging a ticket, lock ticket & guard duplicates ---
+        if ticket_id is not None:
+            tid = int(ticket_id)
+            t = (
+                TicketSale.query
+                .filter_by(id=tid)
+                .with_for_update()
+                .first()
+            )
+            if not t:
+                db.session.rollback()
+                return jsonify(error="ticket not found"), 404
+            if t.paid:
+                db.session.rollback()
+                return jsonify(error="already paid"), 409
+
+            # Duplicate guard in ledger (same ticket already charged)
+            dup_id = db.session.execute(
+                text("""
+                    SELECT id
+                    FROM wallet_ledger
+                    WHERE account_id = :aid
+                      AND direction = 'debit'
+                      AND event = 'ride'
+                      AND ref_table = 'ticket_sale'
+                      AND ref_id = :rid
+                    LIMIT 1
+                    FOR UPDATE
+                """),
+                {"aid": user_id, "rid": tid},
+            ).scalar()
+            if dup_id:
+                db.session.rollback()
+                return jsonify(error="already charged"), 409
+
+        # --- funds check ---
+        if balance_pesos < amount_pesos:
+            # If a ticket exists and isn't paid, delete it to avoid stray UNPAID rows
+            if t is not None and not t.paid:
+                try:
+                    db.session.delete(t)
+                    db.session.commit()  # commit the delete to release locks
+                    current_app.logger.info(
+                        "[PAO:wallet_charge] insufficient funds → deleted ticket_id=%s", t.id
+                    )
+                except Exception:
+                    db.session.rollback()
+                    current_app.logger.exception(
+                        "[PAO:wallet_charge] failed deleting unpaid ticket after insufficient funds"
+                    )
+            return jsonify(
+                error="insufficient balance",
+                balance_php=float(balance_pesos),
+                required_php=float(amount_pesos),
+            ), 402
+
+        # --- apply debit ---
+        new_balance = balance_pesos - amount_pesos
+        db.session.execute(
+            text("UPDATE wallet_accounts SET balance_pesos=:bal WHERE user_id=:uid"),
+            {"bal": new_balance, "uid": user_id},
+        )
+
+        # Ledger insert
+        db.session.execute(
+            text("""
+                INSERT INTO wallet_ledger
+                    (account_id, direction, event, amount_pesos, running_balance_pesos,
+                     ref_table, ref_id, created_at)
+                VALUES
+                    (:aid, 'debit', 'ride', :amt, :run, :rt, :rid, NOW())
+            """),
+            {
+                "aid": user_id,
+                "amt": amount_pesos,
+                "run": new_balance,
+                "rt": ("ticket_sale" if ticket_id is not None else None),
+                "rid": (int(ticket_id) if ticket_id is not None else None),
+            },
+        )
+
+        if t is not None:
+            t.paid = True
+
         db.session.commit()
+
+        # --- Push notify commuter (best-effort) ---
+        try:
+            import time as _time
+            sent_at = int(_time.time() * 1000)
+
+            payload = {
+                "type": "wallet_debit",
+                "user_id": int(user_id),
+                "amount_php": float(amount_pesos),
+                "new_balance_php": float(new_balance),
+                "deeplink": "/commuter/wallet",
+                "sentAt": sent_at,
+            }
+            if ticket_id is not None:
+                payload["ticketId"] = int(ticket_id)
+
+            title = "✅ Payment confirmed" if ticket_id is not None else "💳 Wallet charged"
+            body = (
+                f"Ref #{int(ticket_id)} • ₱{amount_pesos:.2f}"
+                if ticket_id is not None
+                else f"₱{amount_pesos:.2f} deducted • New ₱{new_balance:.2f}"
+            )
+
+            push_to_user(
+                db, DeviceToken, user_id,
+                title, body, payload,
+                channelId="payments", priority="high", ttl=600,
+            )
+        except Exception:
+            current_app.logger.exception("[push] wallet-debit notify failed")
+
+        return jsonify(
+            ok=True,
+            user_id=user_id,
+            new_balance_php=float(new_balance)
+        ), 200
+
     except IntegrityError:
         db.session.rollback()
         return jsonify(error="duplicate charge"), 409
     except Exception:
+        current_app.logger.exception("[PAO:wallet_charge] unexpected failure")
         db.session.rollback()
         return jsonify(error="internal error"), 500
 
-    return jsonify(ok=True, user_id=int(user_id), new_balance_php=round(new_balance/100.0, 2)), 200
+
+@pao_bp.route("/wallet/resolve", methods=["POST", "GET"])
+@require_role("pao")
+def wallet_resolve():
+    """
+    Resolve a scanned QR into a commuter:
+      Accepts JSON body or query string:
+        { "token": "...", "wallet_token": "...", "raw": "full URL or token", "autopay": true|false }
+      Returns:
+        {
+          "valid": true,
+          "token_type": "user_qr" | "wallet_token",
+          "autopay": false,
+          "user": { "id": 123, "name": "First Last" },
+          "balance_php": 123.45
+        }
+    """
+    import time
+    from urllib.parse import urlparse, parse_qs
+
+    rid = request.headers.get("X-Request-ID") or f"resolve-{int(time.time()*1000)}"
+    data = request.get_json(silent=True) or {}
+
+    # --- collect inputs (works for POST or GET) ------------------------------
+    raw = (data.get("raw") or data.get("token") or data.get("wallet_token")
+           or request.args.get("token") or request.args.get("wallet_token") or "").strip()
+    qp_token = None
+    autopay = bool(data.get("autopay"))
+    try:
+        u = urlparse(raw)
+        if u.scheme and u.netloc:
+            qs = parse_qs(u.query)
+            qp_token = qs.get("wallet_token", [None])[0] or qs.get("token", [None])[0] or qs.get("wlt", [None])[0]
+            autopay = autopay or (qs.get("autopay", ["0"])[0] == "1")
+    except Exception:
+        pass
+
+    token = qp_token or raw or (data.get("token") or data.get("wallet_token") or "").strip()
+    if not token:
+        return jsonify(error="missing token"), 400
+
+    # --- try both token families --------------------------------------------
+    user_id = None
+    token_type = None
+    dbg = {"raw": raw, "parsed_token": token}
+
+    # First: commuter QR signed by itsdangerous (from /commuter/users/me/qr.png)
+    try:
+        payload = verify_user_qr_token(token)  # defined above in this file
+        uid = int(payload.get("uid"))
+        if uid > 0:
+            user_id = uid
+            token_type = "user_qr"
+    except (BadSignature, SignatureExpired) as e:
+        dbg["user_qr_error"] = f"{type(e).__name__}: {e}"
+    except Exception as e:
+        dbg["user_qr_error"] = f"{type(e).__name__}: {e}"
+
+    # Second: wallet_token (opaque, from utils.wallet_qr)
+    if user_id is None and verify_wallet_token:
+        try:
+            uid = int(verify_wallet_token(token))
+            if uid > 0:
+                user_id = uid
+                token_type = "wallet_token"
+        except Exception as e:
+            dbg["wallet_token_error"] = f"{type(e).__name__}: {e}"
+    elif user_id is None and verify_wallet_token is None:
+        dbg["wallet_token_error"] = "verify_wallet_token unavailable"
+
+    if not user_id:
+        current_app.logger.warning("[PAO:resolve][%s] invalid/expired token", rid)
+        out = {"valid": False, "error": "invalid or expired token"}
+        if _debug_enabled():
+            out["debug"] = dbg
+        return jsonify(out), 400
+
+    # --- look up user + balance ---------------------------------------------
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify(valid=False, error="user not found"), 404
+
+    # Raw SQL avoid ORM drift
+    balance_pesos = int(db.session.execute(
+        text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
+        {"uid": user_id}
+    ).scalar() or 0)
+
+    payload = {
+        "valid": True,
+        "token_type": token_type,
+        "autopay": bool(autopay),
+        "user": {"id": user.id, "name": f"{user.first_name} {user.last_name}"},
+        # convenience mirrors for older clients:
+        "user_id": int(user.id),
+        "name": f"{user.first_name} {user.last_name}",
+        "balance_php": float(balance_pesos),
+    }
+    resp = jsonify(payload)
+
+    # handy debug headers
+    if _debug_enabled():
+        resp.headers["X-Resolve-Raw"] = raw[:256]
+        resp.headers["X-Resolve-Token"] = (token or "")[:128]
+        resp.headers["X-Resolve-Type"] = token_type or ""
+        resp.headers["X-Resolve-Autopay"] = "1" if autopay else "0"
+        resp.headers["X-Resolve-UserId"] = str(user_id)
+        current_app.logger.info("[PAO:resolve][%s] ok user=%s type=%s autopay=%s",
+                                rid, user_id, token_type, autopay)
+    return resp, 200
 
 
 @pao_bp.route("/wallet/<int:user_id>/overview", methods=["GET"])
 @require_role("pao")
 def wallet_overview(user_id: int):
     """
-    Response:
-    {
-      "user_id": 123,
-      "balance_php": 123.45,
-      "recent_topups": [{ id, amount_php, created_at, pao_name, method }],
-      "recent_ledger": [{ id, direction, event, amount_php, running_balance_php, created_at, ref }],
-      "pao_today": { "count": 3, "sum_php": 500.0, "cap_php": 50000.0 }
-    }
+    Overview of a commuter wallet (amounts are whole pesos).
+    - recent_topups: last N successful topups to this account
+    - recent_ledger: last M ledger entries for this account
+    - pao_today: aggregate of successful topups performed by the current PAO today
     """
     limit_topups = request.args.get("limit_topups", type=int) or 10
     limit_ledger = request.args.get("limit_ledger", type=int) or 15
 
-    # resolve account
-    acct = WalletAccount.query.filter_by(user_id=user_id).first()
-    balance_cents = int(getattr(acct, "balance_cents", 0))
+    # --- account + balance (wallet_accounts uses user_id as the account id) ---
+    row = db.session.execute(
+        text(
+            "SELECT user_id, COALESCE(balance_pesos,0) AS balance_pesos "
+            "FROM wallet_accounts WHERE user_id=:uid"
+        ),
+        {"uid": user_id},
+    ).mappings().first()
 
-    # queries need account_id; if no account yet, just return zeros
-    account_id = getattr(acct, "id", None)
+    balance_pesos = int((row or {}).get("balance_pesos", 0))
+    account_id = int((row or {}).get("user_id", 0)) or None  # we use user_id as account_id
 
-    # recent top-ups (desc)
+    # --- recent top-ups (desc) ---
+    # Use raw SQL + explicit column list so we don't depend on ORM column mapping.
     topups = []
-    if account_id:
-        rows = (
-            TopUp.query
-            .filter_by(account_id=account_id, status="succeeded")
-            .order_by(TopUp.id.desc())
-            .limit(limit_topups)
-            .all()
-        )
-        # map PAO name (optional)
-        pao_map = {}
-        def _pao_name(pao_id):
-            if pao_id in pao_map: return pao_map[pao_id]
+    if account_id and limit_topups > 0:
+        rows = db.session.execute(
+            text(
+                """
+                SELECT id, account_id, method, amount_pesos, status, pao_id, created_at
+                FROM wallet_topups
+                WHERE account_id = :aid AND status = 'succeeded'
+                ORDER BY id DESC
+                LIMIT :lim
+                """
+            ),
+            {"aid": account_id, "lim": int(limit_topups)},
+        ).mappings().all()
+
+        pao_cache: dict[int, str] = {}
+
+        def _pao_name(pao_id: int | None) -> str:
+            if not pao_id:
+                return ""
+            if pao_id in pao_cache:
+                return pao_cache[pao_id]
             u = User.query.get(pao_id)
-            pao_map[pao_id] = (f"{u.first_name} {u.last_name}" if u else "")
-            return pao_map[pao_id]
+            pao_cache[pao_id] = (f"{u.first_name} {u.last_name}" if u else "")
+            return pao_cache[pao_id]
 
         topups = [
             {
-                "id": t.id,
-                "amount_php": round(int(t.amount_cents) / 100.0, 2),
-                "created_at": _iso_utc(t.created_at),
-                "pao_name": _pao_name(t.pao_id),
-                "method": t.method,
+                "id": r["id"],
+                "amount_php": float(r["amount_pesos"]),
+                "created_at": _iso_utc(r["created_at"]),
+                "pao_name": _pao_name(r.get("pao_id")),
+                "method": r.get("method"),
             }
-            for t in rows
+            for r in rows
         ]
 
-    # recent ledger (desc)
+    # --- recent ledger (desc) ---
     ledger = []
-    if account_id:
-        rows = (
-            WalletLedger.query
-            .filter_by(account_id=account_id)
-            .order_by(WalletLedger.id.desc())
-            .limit(limit_ledger)
-            .all()
-        )
+    if account_id and limit_ledger > 0:
+        rows = db.session.execute(
+            text(
+                """
+                SELECT id, account_id, direction, event, amount_pesos, running_balance_pesos,
+                       ref_table, ref_id, created_at
+                FROM wallet_ledger
+                WHERE account_id = :aid
+                ORDER BY id DESC
+                LIMIT :lim
+                """
+            ),
+            {"aid": account_id, "lim": int(limit_ledger)},
+        ).mappings().all()
+
         ledger = [
             {
-                "id": l.id,
-                "direction": l.direction,   # "credit" / "debit"
-                "event": l.event,           # "topup" / "ride" / ...
-                "amount_php": round(int(l.amount_cents) / 100.0, 2),
-                "running_balance_php": round(int(l.running_balance_cents) / 100.0, 2),
-                "created_at": _iso_utc(l.created_at),
-                "ref": {"table": l.ref_table, "id": l.ref_id},
+                "id": r["id"],
+                "direction": r["direction"],
+                "event": r["event"],
+                "amount_php": float(r["amount_pesos"]),
+                "running_balance_php": float(r["running_balance_pesos"]),
+                "created_at": _iso_utc(r["created_at"]),
+                "ref": {"table": r["ref_table"], "id": r["ref_id"]},
             }
-            for l in rows
+            for r in rows
         ]
 
-    # PAO daily usage (PHP only in response)
+    # --- PAO "today" usage stats (no cap enforcement) ---
     day = dt.datetime.utcnow().date()
     start_dt = dt.datetime.combine(day, dt.time.min)
-    end_dt   = dt.datetime.combine(day, dt.time.max)
+    end_dt = dt.datetime.combine(day, dt.time.max)
 
-    cap_php = float(current_app.config.get("PAO_DAILY_TOPUP_LIMIT_PHP", 50000))
-    used_cents_raw = (
-        db.session.query(func.coalesce(func.sum(TopUp.amount_cents), 0))
-        .filter(
-            TopUp.pao_id == g.user.id,
-            TopUp.created_at.between(start_dt, end_dt),
-            TopUp.status == "succeeded",
-        )
-        .scalar() or 0
-    )
-    used_cents = int(used_cents_raw)  # normalize (SUM may return Decimal)
+    used_sum = db.session.execute(
+        text(
+            """
+            SELECT COALESCE(SUM(amount_pesos), 0)
+            FROM wallet_topups
+            WHERE pao_id = :pid
+              AND status = 'succeeded'
+              AND created_at BETWEEN :s AND :e
+            """
+        ),
+        {"pid": g.user.id, "s": start_dt, "e": end_dt},
+    ).scalar() or 0
 
-    used_count = (
-        db.session.query(func.count(TopUp.id))
-        .filter(
-            TopUp.pao_id == g.user.id,
-            TopUp.created_at.between(start_dt, end_dt),
-            TopUp.status == "succeeded",
-        )
-        .scalar() or 0
-    )
+    used_count = db.session.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM wallet_topups
+            WHERE pao_id = :pid
+              AND status = 'succeeded'
+              AND created_at BETWEEN :s AND :e
+            """
+        ),
+        {"pid": g.user.id, "s": start_dt, "e": end_dt},
+    ).scalar() or 0
 
     return jsonify(
         user_id=user_id,
-        balance_php=round(balance_cents / 100.0, 2),
+        balance_php=float(balance_pesos),
         recent_topups=topups,
         recent_ledger=ledger,
         pao_today={
             "count": int(used_count),
-            "sum_php": round(used_cents / 100.0, 2),
-            "cap_php": cap_php,
+            "sum_php": float(used_sum),
+            # keep `cap_php` out (or set to None for client compat if needed)
         },
     ), 200
 
-    uid = int(data.get("uid"))
-    user = User.query.get(uid)
-    if not user:
-        return jsonify(valid=False, error="user not found"), 404
 
-    return jsonify(valid=True, user={
-        "id": user.id,
-        "name": f"{user.first_name} {user.last_name}",
-        "role": user.role,
-    }), 200
 def _serialize_ticket_json(t: TicketSale, origin_name: str, destination_name: str) -> dict:
     amount = int(round(float(t.price or 0)))
     prefix = "discount" if t.passenger_type == "discount" else "regular"
@@ -557,7 +822,7 @@ def recent_tickets():
 
     rows = (
         TicketSale.query.options(joinedload(TicketSale.user))
-        .filter(TicketSale.bus_id == bus_id)
+        .filter(TicketSale.bus_id == bus_id, TicketSale.paid.is_(True))
         .order_by(TicketSale.id.desc())
         .limit(limit)
         .all()
@@ -672,7 +937,13 @@ def pao_stop_times():
 def pao_cash_topup():
     """
     POST /pao/wallet/topups
-    Body: { amount, method?, wallet_token? | user_id?, gcash_ref? }
+    Body: {
+      "amount": 500,
+      "method": "cash" | "gcash",
+      "wallet_token": "opaque" |  null,
+      "user_id": 123 | null,
+      "gcash_ref": "PSP-REF-123" | null
+    }
     """
     import time as _time
 
@@ -695,11 +966,12 @@ def pao_cash_topup():
         rid, pao_id, method, data.get("amount"), user_id, _mask_token(token)
     )
 
+    # validate method
     if method not in ("cash", "gcash"):
         current_app.logger.warning("[PAO:topup][%s] reject: invalid method %r", rid, method)
         return jsonify(error="invalid method (must be 'cash' or 'gcash')"), 400
 
-    # amount validation
+    # validate amount
     try:
         from decimal import Decimal as _D
         amount_php = float(_D(str(data.get("amount"))))
@@ -716,14 +988,14 @@ def pao_cash_topup():
         )
         return jsonify(error=f"amount must be between ₱{min_php:.0f} and ₱{max_php:.0f}"), 400
 
-    # resolve user via token or provided user_id
+    # resolve user via token or user_id
     if token:
         if verify_wallet_token is None:
             current_app.logger.warning("[PAO:topup][%s] reject: wallet token not supported", rid)
             return jsonify(error="wallet token not supported"), 400
         try:
-            user_id = verify_wallet_token(token)
-        except ValueError:
+            user_id = int(verify_wallet_token(token))
+        except Exception:
             current_app.logger.warning(
                 "[PAO:topup][%s] reject: invalid wallet token token=%s", rid, _mask_token(token)
             )
@@ -733,67 +1005,37 @@ def pao_cash_topup():
         current_app.logger.warning("[PAO:topup][%s] reject: missing wallet_token or user_id", rid)
         return jsonify(error="missing wallet_token or user_id"), 400
 
-    # PAO daily cap
-    day = dt.datetime.utcnow().date()
-    start_dt = dt.datetime.combine(day, dt.time.min)
-    end_dt   = dt.datetime.combine(day, dt.time.max)
 
-    used_cents_raw = (
-        db.session.query(func.coalesce(func.sum(TopUp.amount_cents), 0))
-        .filter(
-            TopUp.pao_id == g.user.id,
-            TopUp.created_at.between(start_dt, end_dt),
-            TopUp.status == "succeeded",
-        )
-        .scalar() or 0
-    )
-    used_cents = int(used_cents_raw)
-    cap_php  = float(current_app.config.get("PAO_DAILY_TOPUP_LIMIT_PHP", 50000))
-    used_php = used_cents / 100.0
-
-    current_app.logger.debug(
-        "[PAO:topup][%s] cap-check: used_php=%.2f + amount_php=%.2f <= cap_php=%.2f ? %s",
-        rid, used_php, amount_php, cap_php, (used_php + amount_php) <= cap_php
-    )
-
-    if used_php + amount_php > cap_php:
-        current_app.logger.warning(
-            "[PAO:topup][%s] reject: PAO daily cap exceeded used=%.2f add=%.2f cap=%.2f",
-            rid, used_php, amount_php, cap_php
-        )
-        return jsonify(error="pao daily limit exceeded"), 403
 
     # ---- perform top-up via services ----
     try:
-        amount_cents = int(round(amount_php * 100))
+        amount_pesos = int(round(amount_php))  
         account_id = int(user_id)
 
         if method == "gcash":
-            external_ref = (data.get("gcash_ref") or "").strip() or None
+            # accept either "gcash_ref" or generic "external_ref"
+            external_ref = (data.get("gcash_ref") or data.get("external_ref") or "").strip() or None
             topup_id, ledger_id, new_balance_php = topup_gcash(
                 account_id=account_id,
                 pao_id=g.user.id,
-                amount_cents=amount_cents,
+                amount_pesos=amount_pesos,
                 external_ref=external_ref,
             )
         else:
             topup_id, ledger_id, new_balance_php = topup_cash(
                 account_id=account_id,
                 pao_id=g.user.id,
-                amount_cents=amount_cents,
+                amount_pesos=amount_pesos,
             )
-
-        # services commit internally; extra commit is harmless
-        db.session.commit()
 
         current_app.logger.info(
             "[PAO:topup][%s] success: topup_id=%s ledger_id=%s user_id=%s amount=%.2f new_balance=%.2f",
             rid, topup_id, ledger_id, user_id, amount_php, new_balance_php
         )
-    except Exception as e:
+    except Exception:
         db.session.rollback()
         current_app.logger.exception("[PAO:topup][%s] DB failure", rid)
-        return jsonify(error=str(e)), 500
+        return jsonify(error="internal error"), 500
 
     # Push notify commuter (best-effort)
     try:
@@ -801,25 +1043,42 @@ def pao_cash_topup():
         if tokens:
             sent_at = int(_time.time() * 1000)
             kind = "GCash" if method == "gcash" else "Cash"
-            send_push_async(
-                tokens,
-                "💸 Wallet top-up",
-                f"{kind} +₱{amount_php:.2f} • New balance ₱{new_balance_php:.2f}",
-                {
-                    "deeplink": "/commuter/wallet",
+
+            # Push notify commuter (best-effort)
+            try:
+                import time as _time
+                sent_at = int(_time.time() * 1000)
+                kind = "GCash" if method == "gcash" else "Cash"
+
+                payload = {
+                    "type": "wallet_topup",
+                    "topup_id": int(topup_id),
+                    "user_id": int(user_id),
+                    "method": method,
+                    "amount_php": float(round(amount_php, 2)),
+                    "new_balance_php": float(round(new_balance_php, 2)),
                     "amount": float(round(amount_php, 2)),
                     "newBalance": float(round(new_balance_php, 2)),
-                    "method": method,
+                    "deeplink": "/commuter/wallet",
                     "sentAt": sent_at,
-                },
-                channelId="payments",
-                priority="high",
-            )
+                }
+
+                push_to_user(
+                    db, DeviceToken, int(user_id),
+                    "💸 Wallet top-up",
+                    f"{kind} +₱{amount_php:.2f} • New balance ₱{new_balance_php:.2f}",
+                    payload,
+                    channelId="payments", priority="high", ttl=600, sound="default",
+                )
+            except Exception:
+                current_app.logger.exception("[push] topup notify failed")
+
             current_app.logger.info("[PAO:topup][%s] push: sent tokens=%d user_id=%s", rid, len(tokens), user_id)
         else:
             current_app.logger.debug("[PAO:topup][%s] push: no device tokens user_id=%s", rid, user_id)
     except Exception:
         current_app.logger.exception("[PAO:topup][%s] push notify failed", rid)
+
 
     return jsonify(
         topup_id=int(topup_id),
@@ -839,10 +1098,14 @@ def _fare_for(o, d, passenger_type: str) -> int:
 @require_role("pao")
 def create_ticket():
     """
-    PAID-ONLY CREATION:
-    - No pending tickets are ever written.
-    - Every created row is saved with paid=True.
-    - Immediately updates MQTT paid count and (if linked) pushes a 'Payment confirmed' notification.
+    PAID-ONLY CREATION
+    - Cash: create tickets with paid=True.
+    - Wallet: charge inside the same transaction; if insufficient, nothing is created.
+    Request body (existing fields kept) + optional:
+      pay_method: "cash" | "wallet"          (default: "cash")
+      wallet_token: "<opaque>"               (for wallet)
+      user_id: 123                           (alternative to wallet_token)
+      autopay: true|false                    (treat true as wallet)
     """
     data = request.get_json(silent=True) or {}
     current_app.logger.debug(f"[PAO:/tickets] raw payload: {data}")
@@ -853,8 +1116,20 @@ def create_ticket():
         d_id = data.get("destination_stop_id") or data.get("destination_stop_time_id")
         uid  = data.get("commuter_id")
         as_guest = bool(data.get("guest"))
-        primary_type = data.get("primary_type")          # 'regular' | 'discount' (optional)
+        primary_type = data.get("primary_type")
         assign_all   = bool(data.get("assign_all_to_commuter") or False)
+
+        wallet_token   = (data.get("wallet_token") or "").strip()
+        wallet_user_id = data.get("user_id")
+        autopay_on     = str(data.get("autopay")).lower() in {"1", "true", "yes"}
+        has_wallet_cred = bool(wallet_token) or (wallet_user_id not in (None, "", 0))
+
+        explicit = (data.get("pay_method") or "").strip().lower()
+        pay_method = explicit or ("wallet" if (has_wallet_cred or autopay_on) else "cash")
+
+        # prevent accidental free rides if wallet hints are present but pay_method=cash
+        if pay_method == "cash" and (has_wallet_cred or autopay_on):
+            return jsonify(error="conflicting inputs: wallet info/autopay present but pay_method=cash"), 400
 
         client_ts = data.get("created_at")
         try:
@@ -867,23 +1142,22 @@ def create_ticket():
         if not o or not d:
             return jsonify(error="origin or destination not found"), 400
 
+        # Passenger blocks
         items_spec = data.get("items")
         blocks: list[tuple[str, int]] = []
         if isinstance(items_spec, list):
             for b in items_spec:
                 pt = (b or {}).get("passenger_type")
                 qty = int((b or {}).get("quantity") or 0)
-                if pt not in ("regular", "discount"):
-                    return jsonify(error="invalid passenger_type in items"), 400
-                qty = max(0, min(qty, 20))
+                if pt not in ("regular", "discount") or qty < 0:
+                    return jsonify(error="invalid passenger_type/quantity"), 400
                 if qty > 0:
-                    blocks.append((pt, qty))
+                    blocks.append((pt, min(qty, 20)))
         else:
             pt = data.get("passenger_type")
             if pt not in ("regular", "discount"):
                 return jsonify(error="invalid passenger_type"), 400
-            qty = int(data.get("quantity") or 1)
-            qty = max(1, min(qty, 20))
+            qty = max(1, min(int(data.get("quantity") or 1), 20))
             blocks = [(pt, qty)]
 
         if not blocks:
@@ -897,28 +1171,69 @@ def create_ticket():
             if not user:
                 return jsonify(error="invalid commuter_id"), 400
 
-        # PAO must be assigned to a bus
         bus_id = _current_bus_id()
         if not bus_id:
             return jsonify(error="PAO has no assigned bus"), 400
 
-        # Cap total quantity
-        total_qty = sum(q for _, q in blocks)
-        if total_qty > 20:
+        if sum(q for _, q in blocks) > 20:
             return jsonify(error="quantity exceeds limit (20)"), 400
-
-        items: list[TicketSale] = []
-        assigned_primary = False
 
         if primary_type in ("regular", "discount"):
             blocks.sort(key=lambda x: 0 if x[0] == primary_type else 1)
 
-        # ---- Create rows (PAID-ONLY) ----------------------------------------
-        items: list[TicketSale] = []
-        assigned_primary = False
+        # ---- Compute total fare (WHOLE PESOS) --------------------------------
+        def _fare_for_local(pt: str) -> int:
+            hops = abs(o.seq - d.seq)
+            base = 10 + max(hops - 1, 0) * 2
+            return round(base * 0.8) if pt == "discount" else base
 
+        total_pesos = int(round(sum(_fare_for_local(pt) * qty for pt, qty in blocks)))
+
+        # ---- If wallet, resolve account & precheck balance -------------------
+        account_user_id = None
+        if pay_method == "wallet":
+            if wallet_token:
+                if verify_wallet_token is None:
+                    return jsonify(error="wallet token not supported"), 400
+                try:
+                    account_user_id = int(verify_wallet_token(wallet_token))
+                except Exception:
+                    return jsonify(error="invalid wallet token"), 400
+            elif wallet_user_id:
+                account_user_id = int(wallet_user_id)
+            elif user:  # fallback: charge the linked commuter
+                account_user_id = int(user.id)
+
+            if not account_user_id:
+                return jsonify(error="missing wallet_token or user_id for wallet"), 400
+
+        # ---- One atomic transaction -----------------------------------------
+        items: list[TicketSale] = []
+
+        if pay_method == "wallet":
+            # Atomically deduct only if there are enough funds
+            upd = db.session.execute(
+                text("""
+                    UPDATE wallet_accounts
+                    SET balance_pesos = balance_pesos - :amt
+                    WHERE user_id = :uid AND balance_pesos >= :amt
+                """),
+                {"uid": account_user_id, "amt": total_pesos},
+            )
+            if upd.rowcount != 1:
+                # not enough funds — no ticket is created
+                resp = jsonify({
+                    "error": "insufficient balance",
+                    "account_user_id": int(account_user_id),
+                    "required_php": float(total_pesos),
+                })
+                return resp, 402
+
+         
+        # Create tickets (paid=True by design)
+        assigned_primary = False
         for pt, qty in blocks:
-            fare = _fare_for(o, d, pt)
+            fare = _fare_for_local(pt)
             for _ in range(qty):
                 this_user_id = None
                 if user and not assigned_primary:
@@ -929,85 +1244,59 @@ def create_ticket():
                     bus_id=bus_id,
                     user_id=this_user_id,
                     guest=bool(not this_user_id),
-                    price=fare,
+                    price=fare,  # whole pesos
                     passenger_type=pt,
                     reference_no="TEMP",
-                    paid=False,
+                    paid=True,                         # 🔑 always paid
                     created_at=ticket_dt,
                     origin_stop_time_id=o.id,
                     destination_stop_time_id=d.id,
                     issued_by=g.user.id,
                 )
                 db.session.add(t)
-                db.session.flush()
+                db.session.flush()   # get t.id
                 t.reference_no = _gen_reference(bus_id, t.id)
                 items.append(t)
 
+        # If wallet, finalize debit + ledger now (after we know ticket ids)
+        if pay_method == "wallet":
+            new_balance = db.session.execute(
+                text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
+                {"uid": account_user_id}
+            ).scalar() or 0
+
+            head_id = items[0].id if items else None
+            db.session.execute(
+                text("""
+                    INSERT INTO wallet_ledger
+                        (account_id, direction, event, amount_pesos, running_balance_pesos,
+                        ref_table, ref_id, created_at)
+                    VALUES
+                        (:aid, 'debit', 'ride', :amt, :run, 'ticket_sale', :rid, NOW())
+                """),
+                {"aid": account_user_id, "amt": total_pesos, "run": int(new_balance), "rid": head_id},
+            )
+
+
         db.session.commit()
 
-        current_app.logger.info(
-            "[PAO:create_ticket] created %s paid ticket(s) bus_id=%s issued_by=%s mixed=%s",
-            len(items), bus_id, getattr(g.user, "id", None),
-            any(t.passenger_type != items[0].passenger_type for t in items)
-        )
+        # async notifications
+        Thread(
+            target=_post_commit_notify,
+            args=(bus_id, int(user.id) if user else None, [t.id for t in items], o.stop_name, d.stop_name),
+            daemon=True
+        ).start()
 
-        # ---- MQTT: publish latest paid count for today -----------------------
-        from datetime import datetime as _dt
-        start = _dt.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        end   = _dt.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)
-        cnt = (
-            TicketSale.query.filter_by(bus_id=bus_id, paid=True)
-            .filter(TicketSale.created_at.between(start, end))
-            .count()
-        )
-        bus_row = Bus.query.get(bus_id)
-        if bus_row and bus_row.identifier:
-            topic = f"device/{bus_row.identifier}/fare"
-            publish(topic, {"paid": cnt})
-            current_app.logger.info(f"MQTT fare update → {topic}: {cnt}")
+        # respond with the first ticket (UI expects one)
+        if not items:
+            return jsonify(error="no ticket created"), 500
 
-        # ---- Push: payment confirmed (only if ticket is linked to a user) ----
-        if user and items:
-            try:
-                # If assign_all produced multiple tickets, notify summary; else one head ticket.
-                if assign_all and len(items) > 1:
-                    total = sum(float(t.price or 0) for t in items)
-                    push_to_user(
-                        db, DeviceToken, user.id,
-                        "✅ Payment confirmed",
-                        f"{len(items)} tickets • ₱{total:.2f} • {o.stop_name} → {d.stop_name}",
-                        {"deeplink": "/commuter/notifications", "type": "payment", "autonav": True},
-                        channelId="payments", priority="high", ttl=600,
-                    )
-                else:
-                    head = next((t for t in items if t.user_id == user.id), items[0])
-                    push_to_user(
-                        db, DeviceToken, user.id,
-                        "✅ Payment confirmed",
-                        f"Ref {head.reference_no} • ₱{float(head.price or 0):.2f} • {o.stop_name} → {d.stop_name}",
-                        {
-                        "deeplink": "/commuter/notifications",
-                        "ticketId": head.id,
-                        "type": "payment",
-                        "autonav": True
-                        },
-                        channelId="payments", priority="high", ttl=600,
-                    )
-            except Exception:
-                current_app.logger.exception("[push] paid-confirmation failed")
+        head = items[0]
+        return jsonify(_serialize_ticket_json(head, o.stop_name, d.stop_name)), 201
 
-        serialized = [_serialize_ticket_json(t, o.stop_name, d.stop_name) for t in items]
-        if len(items) == 1:
-            return jsonify(serialized[0]), 201
-        else:
-            total = sum(float(t.price or 0.0) for t in items)
-            return jsonify({
-                "count": len(items),
-                "total_fare": f"{float(total):.2f}",
-                "items": serialized
-            }), 201
 
     except Exception as e:
+        db.session.rollback()
         current_app.logger.exception("!! create_ticket unexpected error")
         return jsonify(error=str(e)), 500
 
@@ -1080,7 +1369,11 @@ def list_tickets():
 
     qs = (
         TicketSale.query.options(joinedload(TicketSale.user))
-        .filter(TicketSale.bus_id == bus_id, TicketSale.created_at.between(start_dt, end_dt))
+        .filter(
+            TicketSale.bus_id == bus_id,
+            TicketSale.created_at.between(start_dt, end_dt),
+            TicketSale.paid.is_(True),
+        )
         .order_by(TicketSale.id.asc())
     )
 

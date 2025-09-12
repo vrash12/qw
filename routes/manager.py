@@ -4,7 +4,7 @@ import os
 import uuid
 from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
-from sqlalchemy import func
+from sqlalchemy import func, text  # ⬅️ import text
 from sqlalchemy.orm import aliased
 
 from db import db
@@ -43,6 +43,360 @@ def _active_trip_for(bus_id: int, ts: datetime):
             return t
     return None
 
+# ⬇️ /manager/commuters
+@manager_bp.route("/commuters", methods=["GET"])
+@require_role("manager")
+def list_commuters():
+    """
+    List commuters with basic profile info, ticket stats, search and pagination.
+    Query params:
+      q: optional search across first_name, last_name, username, phone_number
+      page: 1-based page index (default 1)
+      page_size: items per page (default 25, max 100)
+    """
+    from sqlalchemy import or_
+
+    q = (request.args.get("q") or "").strip()
+    page = request.args.get("page", default=1, type=int) or 1
+    page_size = request.args.get("page_size", default=25, type=int) or 25
+    page_size = min(max(page_size, 1), 100)
+
+    base = User.query.filter(User.role == "commuter")
+
+    if q:
+        like = f"%{q}%"
+        base = base.filter(
+            or_(
+                User.first_name.ilike(like),
+                User.last_name.ilike(like),
+                User.username.ilike(like),
+                User.phone_number.ilike(like),
+            )
+        )
+
+    total = base.count()
+
+    users = (
+        base.order_by(User.last_name.asc(), User.first_name.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    if users:
+        ids = [u.id for u in users]
+        stats_rows = (
+            db.session.query(
+                TicketSale.user_id.label("uid"),
+                func.count(TicketSale.id).label("tickets"),
+                func.max(TicketSale.created_at).label("last_ticket_at"),
+            )
+            .filter(TicketSale.user_id.in_(ids))
+            .group_by("uid")
+            .all()
+        )
+        stats = {r.uid: {"tickets": int(r.tickets or 0),
+                         "last_ticket_at": (r.last_ticket_at.isoformat() if r.last_ticket_at else None)}
+                 for r in stats_rows}
+    else:
+        stats = {}
+
+    items = []
+    for u in users:
+        s = stats.get(u.id, {"tickets": 0, "last_ticket_at": None})
+        items.append({
+            "id": u.id,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "name": f"{u.first_name} {u.last_name}".strip(),
+            "username": u.username,
+            "phone_number": u.phone_number,
+            "tickets": s["tickets"],
+            "last_ticket_at": s["last_ticket_at"],
+        })
+
+    pages = (total + page_size - 1) // page_size
+    return jsonify({
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": pages
+    }), 200
+
+# ⬇️ commuter detail (profile + quick stats)
+@manager_bp.route("/commuters/<int:user_id>", methods=["GET"])
+@require_role("manager")
+def commuter_detail(user_id: int):
+    from sqlalchemy import func as F
+
+    u = User.query.filter(User.id == user_id, User.role == "commuter").first()
+    if not u:
+        return jsonify(error="commuter not found"), 404
+
+    # Tickets stats
+    t_stats = (
+        db.session.query(
+            F.count(TicketSale.id),
+            F.max(TicketSale.created_at),
+            F.coalesce(F.sum(TicketSale.price), 0.0),
+        )
+        .filter(TicketSale.user_id == user_id, TicketSale.voided.is_(False))
+        .first()
+    )
+    tickets_total = int(t_stats[0] or 0)
+    last_ticket_at = t_stats[1].isoformat() if t_stats[1] else None
+    tickets_revenue = float(t_stats[2] or 0.0)
+
+    # Top-ups stats — use account_id + amount_pesos (whole pesos)
+    topup_stats = db.session.execute(
+        text("""
+            SELECT 
+                COALESCE(SUM(t.amount_pesos), 0) AS sum_pesos,
+                MAX(t.created_at)               AS last_at
+            FROM wallet_topups t
+            WHERE t.account_id = :uid
+              AND t.status = 'succeeded'
+        """),
+        {"uid": user_id}
+    ).mappings().first() or {}
+    topups_total_pesos = int(topup_stats.get("sum_pesos", 0))
+    last_topup_dt = topup_stats.get("last_at")
+    last_topup_at = last_topup_dt.isoformat() if last_topup_dt else None
+
+    return jsonify({
+        "id": u.id,
+        "first_name": u.first_name,
+        "last_name": u.last_name,
+        "name": f"{u.first_name} {u.last_name}".strip(),
+        "username": u.username,
+        "phone_number": u.phone_number,
+        "tickets": {
+            "count": tickets_total,
+            "revenue_php": round(tickets_revenue, 2),
+            "last_at": last_ticket_at,
+        },
+        "topups": {
+            "count": None,
+            "total_php": float(topups_total_pesos),
+            "last_at": last_topup_at,
+        }
+    }), 200
+
+
+# ⬇️ commuter tickets with date range + paging
+@manager_bp.route("/commuters/<int:user_id>/tickets", methods=["GET"])
+@require_role("manager")
+def commuter_tickets(user_id: int):
+    try:
+        to_str   = request.args.get("to")
+        from_str = request.args.get("from")
+        page     = request.args.get("page", type=int, default=1)
+        size     = min(max(request.args.get("page_size", type=int, default=25), 1), 100)
+
+        to_dt = datetime.strptime(to_str, "%Y-%m-%d") if to_str else datetime.utcnow()
+        fr_dt = datetime.strptime(from_str, "%Y-%m-%d") if from_str else (to_dt - timedelta(days=30))
+
+        O = aliased(TicketStop); D = aliased(TicketStop)
+
+        base = (
+            db.session.query(
+                TicketSale.id,
+                TicketSale.created_at,
+                TicketSale.price,
+                TicketSale.paid,
+                TicketSale.passenger_type,
+                Bus.identifier.label("bus"),
+                O.stop_name.label("origin"),
+                D.stop_name.label("destination"),
+            )
+            .join(Bus, TicketSale.bus_id == Bus.id)
+            .outerjoin(O, TicketSale.origin_stop_time_id == O.id)
+            .outerjoin(D, TicketSale.destination_stop_time_id == D.id)
+            .filter(TicketSale.user_id == user_id)
+            .filter(TicketSale.voided.is_(False))
+            .filter(TicketSale.created_at.between(fr_dt, to_dt + timedelta(days=1)))
+            .order_by(TicketSale.created_at.desc())
+        )
+
+        total = base.count()
+        rows = base.offset((page - 1) * size).limit(size).all()
+
+        items = [{
+            "id": r.id,
+            "created_at": r.created_at.isoformat(),
+            "time": r.created_at.strftime("%Y-%m-%d %H:%M"),
+            "fare": f"{float(r.price or 0):.2f}",
+            "paid": bool(r.paid),
+            "passenger_type": (r.passenger_type or "regular"),
+            "bus": r.bus,
+            "origin": r.origin or "",
+            "destination": r.destination or "",
+        } for r in rows]
+
+        return jsonify({
+            "items": items,
+            "page": page, "page_size": size,
+            "total": total, "pages": (total + size - 1)//size
+        }), 200
+    except Exception as e:
+        current_app.logger.exception("ERROR in commuter_tickets")
+        return jsonify(error="Failed to load tickets"), 500
+
+
+# ⬇️ commuter top-ups with date range + paging (raw SQL; whole pesos)
+@manager_bp.route("/commuters/<int:user_id>/topups", methods=["GET"])
+@require_role("manager")
+def commuter_topups(user_id: int):
+    try:
+        to_str   = request.args.get("to")
+        from_str = request.args.get("from")
+        page     = request.args.get("page", type=int, default=1)
+        size     = min(max(request.args.get("page_size", type=int, default=25), 1), 100)
+
+        to_dt = datetime.strptime(to_str, "%Y-%m-%d") if to_str else datetime.utcnow()
+        fr_dt = datetime.strptime(from_str, "%Y-%m-%d") if from_str else (to_dt - timedelta(days=30))
+
+        offset = (page - 1) * size
+
+        # total count
+        total_row = db.session.execute(
+            text("""
+                SELECT COUNT(*) AS c
+                FROM wallet_topups t
+                WHERE t.account_id = :uid
+                  AND t.status = 'succeeded'
+                  AND t.created_at >= :fr
+                  AND t.created_at <  :to_plus
+            """),
+            {"uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1)}
+        ).mappings().first() or {}
+        total = int(total_row.get("c", 0))
+
+        rows = db.session.execute(
+            text("""
+                SELECT 
+                    t.id,
+                    t.created_at,
+                    t.amount_pesos,
+                    COALESCE(t.method, 'cash') AS method,
+                    t.pao_id,
+                    pu.first_name AS pao_first,
+                    pu.last_name  AS pao_last
+                FROM wallet_topups t
+                LEFT JOIN users pu ON pu.id = t.pao_id
+                WHERE t.account_id = :uid
+                  AND t.status = 'succeeded'
+                  AND t.created_at >= :fr
+                  AND t.created_at <  :to_plus
+                ORDER BY t.created_at DESC
+                LIMIT :lim OFFSET :off
+            """),
+            {
+                "uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1),
+                "lim": size, "off": offset
+            }
+        ).mappings().all()
+
+        items = [{
+            "id": r["id"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "amount_php": float(r["amount_pesos"] or 0.0),  # whole pesos
+            "method": r["method"],
+            "pao_id": r["pao_id"],
+            "pao_name": ("{} {}".format(r.get("pao_first") or "", r.get("pao_last") or "").strip() or None),
+        } for r in rows]
+
+        return jsonify({
+            "items": items,
+            "page": page, "page_size": size,
+            "total": total, "pages": (total + size - 1)//size
+        }), 200
+
+    except Exception as e:
+        current_app.logger.exception("ERROR in commuter_topups")
+        return jsonify(error="Failed to load top-ups"), 500
+
+@manager_bp.route("/topups", methods=["GET"])
+@require_role("manager")
+def manager_topups():
+    """
+    Supports:
+      - ?date=YYYY-MM-DD          (single day)
+      - ?start=YYYY-MM-DD&end=YYYY-MM-DD  (inclusive range)
+      - ?method=cash|gcash (optional)
+      - ?pao_id=123        (optional)
+    Returns: list of topups with status='succeeded'
+    """
+    # --- choose window ---
+    date_str  = (request.args.get("date") or "").strip()
+    start_str = (request.args.get("start") or "").strip()
+    end_str   = (request.args.get("end") or "").strip()
+
+    try:
+        if date_str:
+            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+            start_dt = datetime.combine(day, datetime.min.time())
+            end_dt   = datetime.combine(day, datetime.max.time())
+        elif start_str and end_str:
+            start_day = datetime.strptime(start_str, "%Y-%m-%d").date()
+            end_day   = datetime.strptime(end_str,   "%Y-%m-%d").date()
+            if end_day < start_day:
+                return jsonify(error="end must be >= start"), 400
+            start_dt = datetime.combine(start_day, datetime.min.time())
+            end_dt   = datetime.combine(end_day,   datetime.max.time())
+        else:
+            # default: today
+            day = datetime.utcnow().date()
+            start_dt = datetime.combine(day, datetime.min.time())
+            end_dt   = datetime.combine(day, datetime.max.time())
+    except ValueError:
+        return jsonify(error="invalid date format (use YYYY-MM-DD)"), 400
+
+    method = (request.args.get("method") or "").strip().lower() or None
+    pao_id = request.args.get("pao_id", type=int)
+
+    # --- build SQL ---
+    sql = """
+        SELECT t.id, t.account_id, t.pao_id, t.method, t.amount_pesos, t.status, t.created_at,
+               cu.first_name  AS commuter_first,  cu.last_name  AS commuter_last,
+               pu.first_name  AS pao_first,       pu.last_name  AS pao_last
+        FROM wallet_topups t
+        LEFT JOIN users cu ON cu.id = t.account_id
+        LEFT JOIN users pu ON pu.id = t.pao_id
+        WHERE t.status = 'succeeded'
+          AND t.created_at BETWEEN :s AND :e
+    """
+    params = {"s": start_dt, "e": end_dt}
+
+    if method in ("cash", "gcash"):
+        sql += " AND t.method = :m"
+        params["m"] = method
+    if pao_id:
+        sql += " AND t.pao_id = :pid"
+        params["pid"] = pao_id
+
+    sql += " ORDER BY t.id DESC"
+
+    # IMPORTANT: requires `from sqlalchemy import text` at the top of this file
+    rows = db.session.execute(text(sql), params).mappings().all()
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": r["id"],
+            "method": r["method"],
+            "amount_php": float(r["amount_pesos"]),  # stored as whole pesos
+            "status": r["status"],
+            "created_at": r["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "commuter": f"{(r['commuter_first'] or '').strip()} {(r['commuter_last'] or '').strip()}".strip(),
+            "pao": f"{(r['pao_first'] or '').strip()} {(r['pao_last'] or '').strip()}".strip(),
+            "account_id": int(r["account_id"]) if r["account_id"] is not None else None,
+            "pao_id": int(r["pao_id"]) if r["pao_id"] is not None else None,
+        })
+
+    total_php = sum(i["amount_php"] for i in items)
+    return jsonify(items=items, count=len(items), total_php=float(total_php)), 200
 
 @manager_bp.route("/revenue-breakdown", methods=["GET"])
 @require_role("manager")
@@ -161,7 +515,6 @@ def update_trip(trip_id: int):
 @require_role("manager")
 def delete_trip(trip_id: int):
     try:
-        # Use bulk delete to avoid ORM cascade/child loading
         rows = Trip.query.filter_by(id=trip_id).delete(synchronize_session=False)
         if rows == 0:
             db.session.rollback()
@@ -250,7 +603,6 @@ def tickets_for_day():
 
     rows = qs.order_by(TicketSale.id.asc()).all()
 
-    # window-match to trips (unchanged)
     trips_by_bus: dict[int, list[Trip]] = {}
     prev = day - timedelta(days=1)
 
@@ -629,7 +981,7 @@ def list_bus_readings(device_id: str):
     ]), 200
 
 
-# ⬇️ ADD THIS: list trips for a bus on a given service_date
+# ⬇️ list trips for a bus on a given service_date
 @manager_bp.route("/bus-trips", methods=["GET"])
 @require_role("manager")
 def list_bus_trips():
@@ -661,7 +1013,7 @@ def list_bus_trips():
         for t in trips
     ]), 200
 
-# ⬇️ ADD THIS: create a new trip
+# ⬇️ create a new trip
 @manager_bp.route("/trips", methods=["POST"])
 @require_role("manager")
 def create_trip():
@@ -670,7 +1022,6 @@ def create_trip():
     if missing:
         return jsonify(error=f"Missing field(s): {', '.join(missing)}"), 400
 
-    # Validate & parse fields
     try:
         service_date = datetime.strptime(str(data["service_date"]), "%Y-%m-%d").date()
         start_time   = datetime.strptime(str(data["start_time"]),   "%H:%M").time()
@@ -681,16 +1032,13 @@ def create_trip():
     number = str(data["number"]).strip()
     bus_id = int(data["bus_id"])
 
-    # Ensure bus exists
     bus = Bus.query.get(bus_id)
     if not bus:
         return jsonify(error="invalid bus_id"), 400
 
-    # Same-day window only (UI already enforces this)
     if end_time <= start_time:
         return jsonify(error="end_time must be after start_time"), 400
 
-    # Overlap check against existing trips for that bus/day
     existing = Trip.query.filter(
         Trip.bus_id == bus_id,
         Trip.service_date == service_date
@@ -707,7 +1055,6 @@ def create_trip():
                 error=f"Overlaps with {t.number} ({t.start_time.strftime('%H:%M')}–{t.end_time.strftime('%H:%M')})"
             ), 409
 
-    # Create the trip
     trip = Trip(
         bus_id=bus_id,
         service_date=service_date,
