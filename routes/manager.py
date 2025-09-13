@@ -244,7 +244,7 @@ def commuter_tickets(user_id: int):
         return jsonify(error="Failed to load tickets"), 500
 
 
-# ⬇️ commuter top-ups with date range + paging (raw SQL; whole pesos)
+# ⬇️ commuter top-ups with date range + paging (whole pesos) — TELLER-first, PAO fallback
 @manager_bp.route("/commuters/<int:user_id>/topups", methods=["GET"])
 @require_role("manager")
 def commuter_topups(user_id: int):
@@ -273,6 +273,7 @@ def commuter_topups(user_id: int):
         ).mappings().first() or {}
         total = int(total_row.get("c", 0))
 
+        # Prefer teller_id; fall back to pao_id if your schema hasn't been migrated yet
         rows = db.session.execute(
             text("""
                 SELECT 
@@ -280,10 +281,11 @@ def commuter_topups(user_id: int):
                     t.created_at,
                     t.amount_pesos,
                     COALESCE(t.method, 'cash') AS method,
-                    t.pao_id,
-                    pu.first_name AS pao_first,
-                    pu.last_name  AS pao_last
+                    COALESCE(t.teller_id, t.pao_id) AS teller_id,
+                    COALESCE(tu.first_name, pu.first_name) AS teller_first,
+                    COALESCE(tu.last_name,  pu.last_name)  AS teller_last
                 FROM wallet_topups t
+                LEFT JOIN users tu ON tu.id = t.teller_id
                 LEFT JOIN users pu ON pu.id = t.pao_id
                 WHERE t.account_id = :uid
                   AND t.status = 'succeeded'
@@ -303,8 +305,8 @@ def commuter_topups(user_id: int):
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             "amount_php": float(r["amount_pesos"] or 0.0),  # whole pesos
             "method": r["method"],
-            "pao_id": r["pao_id"],
-            "pao_name": ("{} {}".format(r.get("pao_first") or "", r.get("pao_last") or "").strip() or None),
+            "teller_id": r["teller_id"],
+            "teller_name": ("{} {}".format(r.get("teller_first") or "", r.get("teller_last") or "").strip() or None),
         } for r in rows]
 
         return jsonify({
@@ -313,19 +315,21 @@ def commuter_topups(user_id: int):
             "total": total, "pages": (total + size - 1)//size
         }), 200
 
-    except Exception as e:
+    except Exception:
         current_app.logger.exception("ERROR in commuter_topups")
         return jsonify(error="Failed to load top-ups"), 500
+
+
 
 @manager_bp.route("/topups", methods=["GET"])
 @require_role("manager")
 def manager_topups():
     """
     Supports:
-      - ?date=YYYY-MM-DD          (single day)
-      - ?start=YYYY-MM-DD&end=YYYY-MM-DD  (inclusive range)
-      - ?method=cash|gcash (optional)
-      - ?pao_id=123        (optional)
+      - ?date=YYYY-MM-DD                    (single day)
+      - ?start=YYYY-MM-DD&end=YYYY-MM-DD    (inclusive range)
+      - ?method=cash|gcash                  (optional)
+      - ?teller_id=123                      (optional; legacy ?pao_id still accepted)
     Returns: list of topups with status='succeeded'
     """
     # --- choose window ---
@@ -346,7 +350,7 @@ def manager_topups():
             start_dt = datetime.combine(start_day, datetime.min.time())
             end_dt   = datetime.combine(end_day,   datetime.max.time())
         else:
-            # default: today
+            # default: today (UTC)
             day = datetime.utcnow().date()
             start_dt = datetime.combine(day, datetime.min.time())
             end_dt   = datetime.combine(day, datetime.max.time())
@@ -354,16 +358,23 @@ def manager_topups():
         return jsonify(error="invalid date format (use YYYY-MM-DD)"), 400
 
     method = (request.args.get("method") or "").strip().lower() or None
-    pao_id = request.args.get("pao_id", type=int)
+    teller_id = request.args.get("teller_id", type=int)
+
+    # Legacy support: allow ?pao_id until DB is fully migrated
+    legacy_pao_id = request.args.get("pao_id", type=int)
+    if legacy_pao_id and not teller_id:
+        teller_id = legacy_pao_id
 
     # --- build SQL ---
+    # Use COALESCE(t.teller_id, t.pao_id) to support both schemas during migration.
     sql = """
-        SELECT t.id, t.account_id, t.pao_id, t.method, t.amount_pesos, t.status, t.created_at,
+        SELECT t.id, t.account_id, COALESCE(t.teller_id, t.pao_id) AS teller_id,
+               t.method, t.amount_pesos, t.status, t.created_at,
                cu.first_name  AS commuter_first,  cu.last_name  AS commuter_last,
-               pu.first_name  AS pao_first,       pu.last_name  AS pao_last
+               au.first_name  AS teller_first,    au.last_name  AS teller_last
         FROM wallet_topups t
         LEFT JOIN users cu ON cu.id = t.account_id
-        LEFT JOIN users pu ON pu.id = t.pao_id
+        LEFT JOIN users au ON au.id = COALESCE(t.teller_id, t.pao_id)
         WHERE t.status = 'succeeded'
           AND t.created_at BETWEEN :s AND :e
     """
@@ -372,13 +383,12 @@ def manager_topups():
     if method in ("cash", "gcash"):
         sql += " AND t.method = :m"
         params["m"] = method
-    if pao_id:
-        sql += " AND t.pao_id = :pid"
-        params["pid"] = pao_id
+    if teller_id:
+        sql += " AND COALESCE(t.teller_id, t.pao_id) = :tid"
+        params["tid"] = teller_id
 
     sql += " ORDER BY t.id DESC"
 
-    # IMPORTANT: requires `from sqlalchemy import text` at the top of this file
     rows = db.session.execute(text(sql), params).mappings().all()
 
     items = []
@@ -390,13 +400,15 @@ def manager_topups():
             "status": r["status"],
             "created_at": r["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
             "commuter": f"{(r['commuter_first'] or '').strip()} {(r['commuter_last'] or '').strip()}".strip(),
-            "pao": f"{(r['pao_first'] or '').strip()} {(r['pao_last'] or '').strip()}".strip(),
+            "teller":   f"{(r['teller_first']   or '').strip()} {(r['teller_last']   or '').strip()}".strip(),
             "account_id": int(r["account_id"]) if r["account_id"] is not None else None,
-            "pao_id": int(r["pao_id"]) if r["pao_id"] is not None else None,
+            "teller_id":  int(r["teller_id"])  if r["teller_id"]  is not None else None,
         })
 
     total_php = sum(i["amount_php"] for i in items)
     return jsonify(items=items, count=len(items), total_php=float(total_php)), 200
+
+
 
 @manager_bp.route("/revenue-breakdown", methods=["GET"])
 @require_role("manager")

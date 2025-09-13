@@ -140,16 +140,59 @@ def _user_qr_sign(uid: int) -> str:
     s = URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt=SALT_USER_QR)
     return s.dumps({"uid": int(uid)})
 
+# ADD this near your other wallet routes in routes/commuter.py
+
+@commuter_bp.route("/wallet/share-text", methods=["GET"])
+@require_role("commuter")
+def wallet_share_text():
+    """
+    Returns a pre-filled message the commuter can copy/share to a Teller.
+    Optional query params:
+      - amount: int pesos (e.g., 250)
+      - receipt: str (free-form GCash text, link or reference no.)
+      - method: 'gcash' | 'cash' (default 'gcash')
+    """
+    amount = max(0, request.args.get("amount", type=int, default=0))
+    method = (request.args.get("method") or "gcash").lower().strip()
+    receipt = (request.args.get("receipt") or "").strip()
+
+    # Stable wallet token + deep link (you already have this)
+    token = build_wallet_token(g.user.id)
+    deep_link = f"https://pay.example/charge?wallet_token={token}&autopay=1"
+
+    # Compose a short, Teller-friendly note
+    pretty = []
+    pretty.append("PGT Onboard — Wallet Top-up")
+    pretty.append(f"Name: {g.user.first_name} {g.user.last_name}")
+    pretty.append(f"Method: {'GCash' if method == 'gcash' else 'Cash'}")
+    if amount > 0:
+        pretty.append(f"Amount: ₱{amount:,}")
+    if receipt:
+        pretty.append(f"Receipt/Ref: {receipt}")
+    pretty.append(f"Wallet Token: {token}")
+    pretty.append(f"Deep Link: {deep_link}")
+
+    return jsonify({
+        "wallet_token": token,
+        "deep_link": deep_link,
+        "message": "\n".join(pretty),
+    }), 200
+
+
 @commuter_bp.route("/users/me/qr.png", methods=["GET"])
 @require_role("commuter")
 def commuter_my_wallet_qr_png():
     """
     Returns a PNG QR for the logged-in commuter.
-    The QR encodes a URL to /pao/users/scan?token=...
+    The QR encodes a URL to /teller/users/scan?token=...
     """
     size = max(240, min(1024, int(request.args.get("size", 360) or 360)))
+
+    # signed short-lived token that represents this user id
     token = _user_qr_sign(g.user.id)
-    scan_url = url_for("pao.user_qr_scan", _external=True) + f"?token={token}"
+
+    # 🔁 moved from PAO → Teller
+    scan_url = url_for("teller.user_qr_scan", _external=True) + f"?token={token}"
 
     qr = qrcode.QRCode(box_size=10, border=2)
     qr.add_data(scan_url)
@@ -165,6 +208,7 @@ def commuter_my_wallet_qr_png():
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
+
 
 @commuter_bp.route("/notify-test", methods=["POST"])
 @require_role("commuter")

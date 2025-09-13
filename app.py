@@ -16,7 +16,7 @@ from routes.commuter      import commuter_bp
 from routes.pao           import pao_bp
 from routes.manager       import manager_bp
 from models.wallet import WalletAccount, WalletLedger, TopUp
-
+from routes.teller        import teller_bp
 from routes.tickets_static import tickets_bp
 from realtime import socketio
 # util (optional import, not strictly necessary here)
@@ -67,6 +67,8 @@ def create_app():
     app.register_blueprint(pao_bp,      url_prefix="/pao")
     app.register_blueprint(manager_bp,  url_prefix="/manager")
     app.register_blueprint(tickets_bp,  url_prefix="/tickets")
+    app.register_blueprint(teller_bp,  url_prefix="/teller")  # ✅ ADD THIS
+
 
 
     @app.cli.command("snap-trips")
