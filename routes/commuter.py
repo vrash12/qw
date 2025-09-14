@@ -31,8 +31,10 @@ from werkzeug.exceptions import HTTPException
 from datetime import timedelta
 from sqlalchemy.exc import OperationalError
 
+from sqlalchemy import desc
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-
+import os, uuid, time
+from werkzeug.utils import secure_filename
 try:
     from zoneinfo import ZoneInfo
     try:
@@ -71,6 +73,39 @@ THEMES = {
     },
 }
 
+RECEIPTS_DIR = "topup_receipts"
+ALLOWED_EXTS = {"jpg", "jpeg", "png", "webp"}
+
+def _unique_ref(prefix: str) -> str:
+    return f"{prefix}-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
+
+def _save_receipt(file_storage, topup_id: int) -> Optional[str]:
+    if not file_storage or not getattr(file_storage, "filename", None):
+        return None
+    fname = secure_filename(file_storage.filename or "")
+    ext = (fname.rsplit(".", 1)[-1].lower() if "." in fname else "jpg")
+    if ext not in ALLOWED_EXTS:
+        ext = "jpg"
+
+    base_dir = os.path.join(current_app.root_path, "static", RECEIPTS_DIR)
+    os.makedirs(base_dir, exist_ok=True)
+
+    path = os.path.join(base_dir, f"{topup_id}.{ext}")
+    file_storage.save(path)
+    return url_for("static", filename=f"{RECEIPTS_DIR}/{topup_id}.{ext}", _external=True)
+
+
+def _receipt_abs_path(tid: int, ext: str) -> str:
+    safe = f"{tid}{ext.lower()}"
+    return os.path.join(current_app.root_path, "static", RECEIPTS_DIR, safe)
+
+def _receipt_url_if_exists(tid: int) -> str | None:
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        p = _receipt_abs_path(tid, ext)
+        if os.path.exists(p):
+            return url_for("static", filename=f"{RECEIPTS_DIR}/{os.path.basename(p)}", _external=True)
+    return None
+
 def _as_local(dt_obj: dt.datetime) -> dt.datetime:
     """Convert naive (assumed UTC) or aware datetime to LOCAL_TZ."""
     if dt_obj is None:
@@ -82,9 +117,126 @@ def _as_local(dt_obj: dt.datetime) -> dt.datetime:
 def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Wallet schema autodetect (supports *_pesos or legacy *_cents while migrating)
-# ──────────────────────────────────────────────────────────────────────────────
+
+
+@commuter_bp.route("/topup-requests", methods=["GET"])
+@require_role("commuter")
+def list_my_topup_requests():
+    """
+    GET /commuter/topup-requests
+      Optional query:
+        status=pending|approved|rejected|succeeded|cancelled
+        page=<int> default 1
+        page_size=<int> default 20
+    """
+    status = (request.args.get("status") or "").strip().lower()
+    page = max(1, request.args.get("page", type=int, default=1))
+    page_size = max(1, min(100, request.args.get("page_size", type=int, default=20)))
+
+    q = TopUp.query.filter(TopUp.account_id == g.user.id)
+    if status:
+        q = q.filter(TopUp.status == status)
+
+    total = q.count()
+    rows = (
+        q.order_by(desc(getattr(TopUp, "created_at", TopUp.id)))
+         .offset((page - 1) * page_size)
+         .limit(page_size)
+         .all()
+    )
+
+    items = []
+    for t in rows:
+        items.append({
+            "id": int(t.id),
+            "account_id": int(t.account_id),
+            "amount_pesos": int(getattr(t, "amount_pesos", 0) or 0),
+            "method": getattr(t, "method", "cash"),
+            "status": getattr(t, "status", "pending"),
+            "created_at": (
+                t.created_at.isoformat() if getattr(t, "created_at", None) else None
+            ),
+            # Optional fields (add only if your schema has them)
+            "note": getattr(t, "note", None) or getattr(t, "external_ref", None) or getattr(t, "provider_ref", None),
+            "receipt_url": getattr(t, "receipt_url", None),
+        })
+
+    return jsonify(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=(page * page_size) < total,
+    ), 200
+
+@commuter_bp.route("/topup-requests", methods=["POST"])
+@require_role("commuter")
+def create_topup_request():
+    """
+    Create a pending commuter top-up request (GCash with receipt).
+    Accepts multipart/form-data:
+      - amount_pesos (int)
+      - method = 'gcash' (required for commuter)
+      - note (optional) -> used as provider_ref if present
+      - receipt (image file)
+    """
+    form = request.form
+    files = request.files
+
+    # Only GCash is supported for commuter self-requests (cash goes via teller scan)
+    method = (form.get("method") or "gcash").strip().lower()
+    if method != "gcash":
+        return jsonify(error="unsupported method"), 400
+
+    # amount
+    try:
+        amount_pesos = int(form.get("amount_pesos") or form.get("amount_php") or 0)
+    except Exception:
+        amount_pesos = 0
+    if amount_pesos <= 0:
+        return jsonify(error="invalid amount"), 400
+
+    # provider fields (MUST NOT be NULL in your DB)
+    provider = "gcash"
+    # Prefer note/external ref if given; else synthesize a unique one
+    note = (form.get("note") or "").strip()
+    provider_ref = (form.get("external_ref") or "").strip() or note or _unique_ref(provider)
+
+    # Require a receipt image
+    receipt_fs = files.get("receipt")
+    if not receipt_fs or not getattr(receipt_fs, "filename", None):
+        return jsonify(error="receipt image is required"), 400
+
+    # Insert pending top-up
+    tu = TopUp(
+        account_id=int(g.user.id),
+        method=method,
+        amount_pesos=amount_pesos,
+        status="pending",
+        provider=provider,
+        provider_ref=provider_ref,
+    )
+    db.session.add(tu)
+    db.session.flush()  # get tu.id without committing yet
+
+    # Save receipt to static/topup_receipts/<id>.<ext>
+    receipt_url = _save_receipt(receipt_fs, tu.id)
+
+    # Commit
+    db.session.commit()
+
+    return jsonify({
+        "id": tu.id,
+        "account_id": tu.account_id,
+        "amount_pesos": int(tu.amount_pesos or 0),
+        "method": tu.method,
+        "status": tu.status,
+        "provider": tu.provider,
+        "provider_ref": tu.provider_ref,
+        "receipt_url": receipt_url,
+        "created_at": tu.created_at.isoformat() if getattr(tu, "created_at", None) else None,
+    }), 201
+
 def _has_column(table: str, column: str) -> bool:
     try:
         row = db.session.execute(
@@ -208,7 +360,20 @@ def commuter_my_wallet_qr_png():
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
-
+def _day_range_filter(q, date_str: Optional[str], days: Optional[str]):
+    """Apply date/day window filters (created_at) in LOCAL_TZ semantics."""
+    if date_str:
+        try:
+            day = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            raise ValueError("date must be YYYY-MM-DD")
+        start_utc, end_utc = _local_day_bounds_utc(day)
+        q = q.filter(TicketSale.created_at >= start_utc,
+                     TicketSale.created_at <  end_utc)
+    elif days in {"7", "30"}:
+        cutoff = dt.datetime.utcnow() - timedelta(days=int(days))
+        q = q.filter(TicketSale.created_at >= cutoff)
+    return q
 
 @commuter_bp.route("/notify-test", methods=["POST"])
 @require_role("commuter")
@@ -226,12 +391,15 @@ def commuter_notify_test():
 def commuter_ticket_image(ticket_id: int):
     """
     High-contrast, LARGE-TYPE JPG receipt renderer.
-    Optional: ?download=1 to force download.
+
+    Now supports both:
+      • legacy "batch" (multiple TicketSale rows tied by batch_id), and
+      • new single-row "group" tickets with is_group/group_* columns.
     """
     t = (
         TicketSale.query.options(
             joinedload(TicketSale.user),
-            joinedload(TicketSale.bus).joinedload(Bus.pao),
+            joinedload(TicketSale.bus),
             joinedload(TicketSale.origin_stop_time),
             joinedload(TicketSale.destination_stop_time),
         )
@@ -241,29 +409,130 @@ def commuter_ticket_image(ticket_id: int):
     if not t:
         return jsonify(error="ticket not found"), 404
 
-    # Resolve stop names (StopTime or TicketStop fallback)
+    # Resolve stop names + (optional) seq for fare math
+    o_seq = d_seq = None
     if t.origin_stop_time:
         origin_name = t.origin_stop_time.stop_name
+        try:
+            o_seq = int(getattr(t.origin_stop_time, "seq", None) or 0)
+        except Exception:
+            o_seq = None
     else:
         ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
         origin_name = ts.stop_name if ts else ""
+        o_seq = int(getattr(ts, "seq", 0) or 0) if ts else None
 
     if t.destination_stop_time:
         destination_name = t.destination_stop_time.stop_name
+        try:
+            d_seq = int(getattr(t.destination_stop_time, "seq", None) or 0)
+        except Exception:
+            d_seq = None
     else:
         tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
         destination_name = tsd.stop_name if tsd else ""
+        d_seq = int(getattr(tsd, "seq", 0) or 0) if tsd else None
 
+    # Who issued (for right-panel info)
     issuer_via_field = getattr(t, "issued_by", None)
-    issuer_via_bus   = getattr(getattr(getattr(t, "bus", None), "pao", None), "id", None)
-    issuer_id        = issuer_via_field or issuer_via_bus
+    issuer_via_bus = db.session.query(User.id) \
+        .filter(User.assigned_bus_id == t.bus_id, User.role == "pao") \
+        .order_by(User.id.desc()) \
+        .scalar()
+    issuer_id = issuer_via_field or issuer_via_bus
 
+    # ───────────────────────────────────────────────────────────────────
+    # Group-aware details (single-row model)
+    is_group = bool(getattr(t, "is_group", False))
+    g_reg = int(getattr(t, "group_regular", 0) or 0)
+    g_dis = int(getattr(t, "group_discount", 0) or 0)
+    group_qty = g_reg + g_dis if is_group else 1
+    total_pesos = int(round(float(t.price or 0)))
+
+    # Fare math (only if we can infer hops). Same formula used in PAO create flow.
+    def _fare_for_each(pt: str) -> Optional[int]:
+        if o_seq is None or d_seq is None:
+            return None
+        hops = abs(int(o_seq) - int(d_seq))
+        base = 10 + max(hops - 1, 0) * 2
+        return int(round(base * 0.8)) if pt == "discount" else int(base)
+
+    reg_each = _fare_for_each("regular")
+    dis_each = _fare_for_each("discount")
+
+    # Build "batch-like" summary for the renderer
+    if is_group and group_qty > 1:
+        batch_qty = group_qty
+        # Prefer recomputed totals when we know per-type fares; else fall back to ticket total
+        if reg_each is not None and dis_each is not None:
+            total_by_types = (g_reg * reg_each) + (g_dis * dis_each)
+            batch_total = total_by_types if total_by_types > 0 else total_pesos
+        else:
+            batch_total = total_pesos
+
+        breakdown = {}
+        if g_reg > 0:
+            breakdown["regular"] = {
+                "qty": g_reg,
+                "total": (g_reg * reg_each) if reg_each is not None else None,
+                "each": reg_each
+            }
+        if g_dis > 0:
+            breakdown["discount"] = {
+                "qty": g_dis,
+                "total": (g_dis * dis_each) if dis_each is not None else None,
+                "each": dis_each
+            }
+
+        # Line items text (compact)
+        line_items = []
+        if g_reg > 0:
+            if reg_each is not None:
+                line_items.append(f"Regular × {g_reg}  ·  ₱{reg_each} each  ·  ₱{(g_reg*reg_each)}")
+            else:
+                line_items.append(f"Regular × {g_reg}")
+        if g_dis > 0:
+            if dis_each is not None:
+                line_items.append(f"Discount × {g_dis}  ·  ₱{dis_each} each  ·  ₱{(g_dis*dis_each)}")
+            else:
+                line_items.append(f"Discount × {g_dis}")
+    else:
+        # Legacy batch path (multiple rows tied together) — keep working if present
+        bid = getattr(t, "batch_id", None) or t.id
+        rows = (
+            db.session.query(
+                TicketSale.id,
+                TicketSale.reference_no,
+                TicketSale.passenger_type,
+                TicketSale.price
+            )
+            .filter(func.coalesce(TicketSale.batch_id, TicketSale.id) == bid,
+                    TicketSale.paid.is_(True))
+            .order_by(TicketSale.id.asc())
+            .all()
+        )
+        batch_qty = len(rows)
+        batch_total = sum(int(round(float(r.price or 0))) for r in rows)
+        breakdown = {}
+        for r in rows:
+            ptype = (r.passenger_type or "regular").lower()
+            breakdown.setdefault(ptype, {"qty": 0, "total": 0})
+            breakdown[ptype]["qty"] += 1
+            breakdown[ptype]["total"] += int(round(float(r.price or 0)))
+        line_items = [
+            f"{(r.reference_no or str(r.id))}  ·  {(r.passenger_type or 'regular').title()}  ·  ₱{int(round(float(r.price or 0)))}"
+            for r in rows
+        ]
+
+    # Log for debugging
     try:
         current_app.logger.info(
-            "[receipt:image] ticket_id=%s ref=%s price=%.2f paid=%s "
-            "issued_by_field=%s bus.pao.id=%s chosen_issuer=%s",
-            t.id, t.reference_no, float(t.price or 0), bool(t.paid),
-            issuer_via_field, issuer_via_bus, issuer_id
+            "[receipt:image] ticket_id=%s model=%s qty=%s total=%s reg=%s dis=%s",
+            t.id,
+            ("group" if (is_group and group_qty > 1) else "batch/solo"),
+            (batch_qty if (is_group and group_qty > 1) else (batch_qty if 'batch_qty' in locals() else 1)),
+            (batch_total if 'batch_total' in locals() else total_pesos),
+            g_reg, g_dis
         )
     except Exception:
         pass
@@ -275,7 +544,7 @@ def commuter_ticket_image(ticket_id: int):
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-    # Canvas + styles
+    # ─── Drawing (unchanged styling, but tweaks for group display) ────────────
     W, H = 1440, 2200
     M = 80
     DARK_GREEN    = (21, 87, 36)
@@ -289,8 +558,6 @@ def commuter_ticket_image(ticket_id: int):
     BG_PAPER      = (250, 251, 252)
     SUCCESS_BG    = (212, 237, 218)
     SUCCESS_TEXT  = (21, 87, 36)
-    ERROR_BG      = (248, 215, 218)
-    ERROR_TEXT    = (114, 28, 36)
 
     bg = Image.new("RGB", (W, H), BG_PAPER)
     draw = ImageDraw.Draw(bg)
@@ -325,21 +592,26 @@ def commuter_ticket_image(ticket_id: int):
         keep = max(8, max_chars // 2 - 1)
         return s[:keep] + "…" + s[-(max_chars - keep - 1):]
 
-    # Card & header
+    # Card
     shadow_offset = 10
-    draw.rectangle((M + shadow_offset, M + shadow_offset, W - M + shadow_offset, H - M + shadow_offset), fill=(0, 0, 0))
+    draw.rectangle(
+        (M + shadow_offset, M + shadow_offset, W - M + shadow_offset, H - M + shadow_offset),
+        fill=(0, 0, 0),
+    )
     draw.rectangle((M, M, W - M, H - M), fill=WHITE, outline=BORDER_LIGHT, width=2)
 
     y = M + 40
     header_h = 180
     draw.rectangle((M, y, W - M, y + header_h), fill=LIGHT_GREEN, outline=DARK_GREEN, width=3)
     if ft_title:
-        draw.text((M + 48, y + (header_h - 80) // 2), "PGT Onboard — Official Receipt", fill=DARK_GREEN, font=ft_title)
+        title = "PGT Onboard — Official Receipt"
+        if is_group and group_qty > 1:
+            title += " — Group"
+        draw.text((M + 48, y + (header_h - 80) // 2), title, fill=DARK_GREEN, font=ft_title)
     y += header_h + 12
     draw.rectangle((M + 48, y, W - M - 48, y + 5), fill=ACCENT_GREEN)
     y += 40
 
-    # fields
     L = M + 48
     R = W - M - 48
     COL_GAP = 60
@@ -354,21 +626,10 @@ def commuter_ticket_image(ticket_id: int):
             draw.text((x, y2), display_value, fill=color, font=ft_value)
         return y2 + 58 + 28
 
-    if t.origin_stop_time:
-        origin_name = t.origin_stop_time.stop_name
-    else:
-        ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
-        origin_name = ts.stop_name if ts else ""
-
-    if t.destination_stop_time:
-        destination_name = t.destination_stop_time.stop_name
-    else:
-        tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
-        destination_name = tsd.stop_name if tsd else ""
-
     yL = y
     yR = y
     passenger_name = f"{t.user.first_name} {t.user.last_name}" if t.user else "—"
+    # Left/Right columns
     yL = field(L, yL, "Reference No.", t.reference_no or "—")
     yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—")
 
@@ -378,15 +639,15 @@ def commuter_ticket_image(ticket_id: int):
         draw.text((L, yL), "DATE & TIME", fill=TEXT_MUTED, font=ft_label)
     y_value = yL + 54
     if ft_value:
-        d_disp = date_str if tw(date_str, ft_value) <= COL_W else ellipsize(date_str, 36)
-        draw.text((L, y_value), d_disp, fill=TEXT_DARK, font=ft_value)
-        t_disp = time_str if tw(time_str, ft_value) <= COL_W else ellipsize(time_str, 36)
-        draw.text((L, y_value + 52), t_disp, fill=TEXT_DARK, font=ft_value)
+        draw.text((L, y_value), date_str, fill=TEXT_DARK, font=ft_value)
+        draw.text((L, y_value + 52), time_str, fill=TEXT_DARK, font=ft_value)
     yL = y_value + 52 + 60
 
-    yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
+    # Passenger field: show group hint when applicable
+    right_passenger_value = passenger_name if not (is_group and group_qty > 1) else f"{passenger_name}  (Group of {group_qty})"
+    yR = field(L + COL_W + COL_GAP, yR, "Passenger", right_passenger_value)
     yL = field(L, yL, "Origin", origin_name or "—")
-    yR = field(L + COL_W + COL_GAP, yR, "Passenger", passenger_name)
+    yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
 
     y = max(yL, yR) + 20
     draw.rectangle((L, y, R, y + 4), fill=BORDER_LIGHT)
@@ -397,26 +658,24 @@ def commuter_ticket_image(ticket_id: int):
     if ft_label:
         draw.text((L, amount_y), "TOTAL AMOUNT", fill=TEXT_MUTED, font=ft_label)
     if ft_big:
-        fare_pesos = int(round(float(t.price or 0)))
+        fare_pesos = total_pesos
         draw.text((L, amount_y + 44), f"₱{fare_pesos}", fill=ACCENT_GREEN, font=ft_big)
 
-    state_txt = "PAID" if t.paid else "UNPAID"
-    state_bg = SUCCESS_BG if t.paid else ERROR_BG
-    state_text_color = SUCCESS_TEXT if t.paid else ERROR_TEXT
-
+    state_txt = "PAID"
     if ft_header:
         pill_w = int(tw(state_txt, ft_header) + 64)
         pill_h = 76
         pill_x1 = R - pill_w
         pill_y1 = amount_y + 8
-        draw.rectangle((pill_x1 + 14, pill_y1, pill_x1 + pill_w - 14, pill_y1 + pill_h), fill=state_bg)
-        draw.rectangle((pill_x1, pill_y1 + 14, pill_x1 + pill_w, pill_y1 + pill_h - 14), fill=state_bg)
+        draw.rectangle((pill_x1 + 14, pill_y1, pill_x1 + pill_w - 14, pill_y1 + pill_h), fill=SUCCESS_BG)
+        draw.rectangle((pill_x1, pill_y1 + 14, pill_x1 + pill_w, pill_y1 + pill_h - 14), fill=SUCCESS_BG)
         text_x = pill_x1 + (pill_w - tw(state_txt, ft_header)) // 2
         text_y = pill_y1 + (pill_h - 60) // 2
-        draw.text((text_x, text_y), state_txt, fill=state_text_color, font=ft_header)
+        draw.text((text_x, text_y), state_txt, fill=SUCCESS_TEXT, font=ft_header)
 
     y += 170
 
+    # QR panel (left)
     qr_section_bg = (247, 251, 247)
     qr_size = 480
     qr_padding = 36
@@ -428,12 +687,13 @@ def commuter_ticket_image(ticket_id: int):
     if ft_medium:
         draw.text((L + qr_padding, y + qr_padding + qr_size + 24), "Scan to view/download receipt", fill=TEXT_MEDIUM, font=ft_medium)
 
+    # Right panel: Payment + Group/Batch Summary
     right_x = L + panel_w + 56
     right_y = y + 24
     if ft_label:
         draw.text((right_x, right_y), "PAYMENT STATUS", fill=TEXT_MUTED, font=ft_label)
     if ft_header:
-        draw.text((right_x, right_y + 44), state_txt, fill=(ACCENT_GREEN if t.paid else ERROR_TEXT), font=ft_header)
+        draw.text((right_x, right_y + 44), state_txt, fill=ACCENT_GREEN, font=ft_header)
 
     info_y = right_y + 140
     info_items = [
@@ -447,7 +707,63 @@ def commuter_ticket_image(ticket_id: int):
             draw.text((right_x, info_y + 36), value, fill=TEXT_MEDIUM, font=ft_value)
         info_y += 96
 
-    footer_y = H - M - 72
+    # Summary block
+    if (is_group and group_qty > 1) or ("batch_total" in locals() and batch_qty > 1):
+        section_y = info_y + 12
+        if ft_label:
+            draw.text((right_x, section_y), "GROUP SUMMARY" if (is_group and group_qty > 1) else "BATCH SUMMARY", fill=TEXT_MUTED, font=ft_label)
+        section_y += 52
+        if ft_value:
+            draw.text((right_x, section_y), f"Passengers: {batch_qty}", fill=TEXT_DARK, font=ft_value)
+            section_y += 52
+            draw.text((right_x, section_y), f"Total Fare: ₱{batch_total}", fill=ACCENT_GREEN, font=ft_value)
+            section_y += 64
+
+        if ft_label:
+            draw.text((right_x, section_y), "Breakdown", fill=TEXT_MUTED, font=ft_label)
+        section_y += 44
+
+        # group-aware breakdown printing
+        for ptype in ("regular", "discount"):
+            if ptype in breakdown:
+                data = breakdown[ptype]
+                if isinstance(data.get("total"), int) and isinstance(data.get("each"), int):
+                    line = f"{ptype.title()}: {data['qty']}  ·  ₱{data['each']} each  ·  ₱{data['total']}"
+                elif isinstance(data.get("total"), int):
+                    line = f"{ptype.title()}: {data['qty']}  ·  ₱{data['total']}"
+                else:
+                    line = f"{ptype.title()}: {data['qty']}"
+                if ft_medium:
+                    draw.text((right_x, section_y), line, fill=TEXT_MEDIUM, font=ft_medium)
+                section_y += 44
+
+    y = y + panel_h + 48
+
+    # Ticket line items (for legacy multi-row batches) or synthesized lines for group
+    if (is_group and group_qty > 1) or ("line_items" in locals() and len(line_items) > 0):
+        if ft_header:
+            draw.text((L, y), "Tickets in this group" if (is_group and group_qty > 1) else "Tickets in this batch", fill=TEXT_DARK, font=ft_header)
+        y += 64
+        draw.rectangle((L, y, R, y + 4), fill=BORDER_LIGHT)
+        y += 24
+
+        lines = (line_items if (is_group and group_qty > 1) else line_items)
+        top_n = 15
+        for idx, txt in enumerate(lines[:top_n], start=1):
+            if ft_medium:
+                draw.text((L + 12, y), (txt if (is_group and group_qty > 1) else f"{idx:>2}.  {txt}"), fill=TEXT_MEDIUM, font=ft_medium)
+            y += 50
+        if len(lines) > top_n:
+            if ft_medium:
+                draw.text((L + 12, y), f"+{len(lines) - top_n} more…", fill=TEXT_MUTED, font=ft_medium)
+            y += 50
+
+        y += 16
+        draw.rectangle((L, y, R, y + 4), fill=BORDER_LIGHT)
+        y += 24
+
+    # Footer
+    footer_y = max(y + 36, H - M - 72)
     if ft_small:
         from datetime import datetime as _dt
         link_display = (img_link[:80] + "…") if len(img_link) > 80 else img_link
@@ -468,19 +784,15 @@ def commuter_ticket_image(ticket_id: int):
         )
     )
     try:
-        resp.headers["X-Debug-Issued-By"] = str(issuer_id or "")
-        resp.headers["X-Debug-Issued-By-Field"] = str(issuer_via_field or "")
-        resp.headers["X-Debug-Issued-By-BusPao"] = str(issuer_via_bus or "")
+        resp.headers["X-Debug-Model"] = "group" if (is_group and group_qty > 1) else "batch/solo"
+        resp.headers["X-Debug-Group-Regular"] = str(g_reg)
+        resp.headers["X-Debug-Group-Discount"] = str(g_dis)
+        resp.headers["X-Debug-Group-Qty"] = str(group_qty)
     except Exception:
         pass
     resp.headers["Cache-Control"] = "public, max-age=86400"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Wallet helpers that try *_pesos first, then fall back to *_cents on 1054.
-# This avoids relying on INFORMATION_SCHEMA and survives mid-migration states.
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _is_unknown_col(err: Exception) -> bool:
     # MySQL error code for "Unknown column": 1054
@@ -488,6 +800,20 @@ def _is_unknown_col(err: Exception) -> bool:
         return isinstance(err, OperationalError) and getattr(err.orig, "args", [None])[0] == 1054
     except Exception:
         return False
+
+
+@commuter_bp.route("/wallet/qr-token", methods=["GET"])
+@require_role("commuter")
+def wallet_qr_token_alias():
+    # Same payload as /wallet/qrcode
+    return wallet_qrcode()
+
+@commuter_bp.route("/wallet/qr-token/rotate", methods=["POST"])
+@require_role("commuter")
+def wallet_qr_token_rotate_alias():
+    # Same behavior as /wallet/qrcode/rotate
+    return wallet_qrcode_rotate()
+
 
 def _get_or_create_wallet_account(user_id: int):
     # PESOS-ONLY: never reference *cents columns
@@ -746,64 +1072,102 @@ def commuter_get_ticket(ticket_id: int):
     t = (
         TicketSale.query.options(
             joinedload(TicketSale.user),
-            joinedload(TicketSale.bus).joinedload(Bus.pao),
+            joinedload(TicketSale.bus),
             joinedload(TicketSale.origin_stop_time),
             joinedload(TicketSale.destination_stop_time),
         )
-        .filter(TicketSale.id == ticket_id, TicketSale.user_id == g.user.id)
+        .filter(TicketSale.id == ticket_id)
         .first()
     )
     if not t:
         return jsonify(error="ticket not found"), 404
 
+    # Resolve names
     if t.origin_stop_time:
         origin_name = t.origin_stop_time.stop_name
+        o_seq = getattr(t.origin_stop_time, "seq", None)
     else:
         ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
         origin_name = ts.stop_name if ts else ""
+        o_seq = getattr(ts, "seq", None)
 
     if t.destination_stop_time:
         destination_name = t.destination_stop_time.stop_name
+        d_seq = getattr(t.destination_stop_time, "seq", None)
     else:
         tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
         destination_name = tsd.stop_name if tsd else ""
+        d_seq = getattr(tsd, "seq", None)
 
-    # Choose QR asset (amount already integer pesos)
-    if t.passenger_type == "discount":
-        base = int(round(float(t.price or 0) / 0.8))
-        prefix = "discount"
-    else:
-        base = int(round(float(t.price or 0)))
-        prefix = "regular"
-    filename = f"{prefix}_{base}.jpg"
-    qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
+    # Group meta
+    is_group = bool(getattr(t, "is_group", False))
+    g_reg = int(getattr(t, "group_regular", 0) or 0)
+    g_dis = int(getattr(t, "group_discount", 0) or 0)
+    group_qty = g_reg + g_dis if is_group else 1
+    total_pesos = int(round(float(t.price or 0)))
 
-    payload = build_qr_payload(
-        t,
-        origin_name=origin_name,
-        destination_name=destination_name,
-    )
+    # Per-type each (best-effort)
+    def _fare_for_each(pt: str):
+        try:
+            if o_seq is None or d_seq is None:
+                return None
+            hops = abs(int(o_seq) - int(d_seq))
+            base = 10 + max(hops - 1, 0) * 2
+            return int(round(base * 0.8)) if pt == "discount" else int(base)
+        except Exception:
+            return None
+
+    reg_each = _fare_for_each("regular")
+    dis_each = _fare_for_each("discount")
+
+    breakdown = []
+    if is_group and group_qty > 1:
+        if g_reg:
+            subtotal = (g_reg * reg_each) if reg_each is not None else None
+            breakdown.append({"passenger_type": "regular", "quantity": g_reg, "fare_each": reg_each, "subtotal": subtotal})
+        if g_dis:
+            subtotal = (g_dis * dis_each) if dis_each is not None else None
+            breakdown.append({"passenger_type": "discount", "quantity": g_dis, "fare_each": dis_each, "subtotal": subtotal})
+
+    # QR helpers
+    amount = total_pesos
+    prefix = "discount" if (t.passenger_type or "").lower() == "discount" else "regular"
+    filename = f"{prefix}_{amount}.jpg"
+    qr_url  = url_for("static", filename=f"qr/{filename}", _external=True)
     qr_link = url_for("commuter.commuter_ticket_receipt_qr", ticket_id=t.id, _external=True)
+    payload = build_qr_payload(t, origin_name=origin_name, destination_name=destination_name)
 
-    issuer_id = getattr(t, "issued_by", None) or (t.bus.pao.id if (t.bus and t.bus.pao) else None)
+    issuer_id = getattr(t, "issued_by", None) or getattr(g, "user", None).id
 
-    return jsonify({
+    out = {
         "id": t.id,
         "referenceNo": t.reference_no,
         "date": t.created_at.strftime("%B %d, %Y"),
         "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
         "origin": origin_name,
         "destination": destination_name,
-        "passengerType": t.passenger_type.title(),
-        "commuter": f"{t.user.first_name} {t.user.last_name}",
-        "fare": int(round(float(t.price or 0))),  # NO CENTS
+        "passengerType": (t.passenger_type or "").title(),
+        "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "Guest",
+        "fare": total_pesos,
         "paid": bool(t.paid),
         "qr": payload,
         "qr_link": qr_link,
         "qr_url": qr_url,
         "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
         "paoId": issuer_id,
-    }), 200
+        # Group-aware extras:
+        "is_group": is_group,
+        "group": {
+            "regular": g_reg,
+            "discount": g_dis,
+            "total": group_qty,
+            "breakdown": breakdown,
+            "total_fare": total_pesos,
+        } if is_group else None,
+    }
+    return jsonify(out), 200
+
+
 
 @commuter_bp.route("/dashboard", methods=["GET"])
 @require_role("commuter")
@@ -1170,76 +1534,182 @@ def my_receipts():
     days      = request.args.get("days")
     bus_id    = request.args.get("bus_id", type=int)
     light     = (request.args.get("light") or "").lower() in {"1", "true", "yes"}
+    group     = (request.args.get("group") or "").lower() in {"1", "true", "yes"}
 
-    qs = (
-        db.session.query(TicketSale)
-        .options(
-            joinedload(TicketSale.user),
-            joinedload(TicketSale.origin_stop_time),
-            joinedload(TicketSale.destination_stop_time),
+    # ---------- UNGROUPED (one row per ticket, PAID-ONLY) ----------
+    if not group:
+        q = (
+            TicketSale.query.options(
+                joinedload(TicketSale.user),
+                joinedload(TicketSale.origin_stop_time),
+                joinedload(TicketSale.destination_stop_time),
+            )
+            .filter(TicketSale.user_id == g.user.id, TicketSale.paid.is_(True))
         )
-        .filter(TicketSale.user_id == g.user.id)
-    )
+        # time window
+        try:
+            q = _day_range_filter(q, date_str, days)
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+
+        if bus_id:
+            q = q.filter(TicketSale.bus_id == bus_id)
+
+        total = q.count()
+        rows = (
+            q.order_by(TicketSale.id.desc())
+             .offset((page - 1) * page_size)
+             .limit(page_size)
+             .all()
+        )
+
+        items = []
+        for t in rows:
+            # names via StopTime or TicketStop fallback
+            if t.origin_stop_time:
+                origin_name = t.origin_stop_time.stop_name
+            else:
+                ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+                origin_name = ts.stop_name if ts else ""
+
+            if t.destination_stop_time:
+                destination_name = t.destination_stop_time.stop_name
+            else:
+                tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+                destination_name = tsd.stop_name if tsd else ""
+
+            fare = int(round(float(t.price or 0)))
+            base = {
+                "id": t.id,
+                "referenceNo": t.reference_no,
+                "date": t.created_at.strftime("%B %d, %Y"),
+                "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+                "origin": origin_name,
+                "destination": destination_name,
+                "fare": fare,
+                "paid": True,  # PAO-only receipts
+                "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
+                "view_url": url_for("commuter.commuter_ticket_view", ticket_id=t.id, _external=True),
+            }
+            if not light:
+                base.update({
+                    "passengerType": (t.passenger_type or "").title(),
+                    "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "Guest",
+                    "bus_id": t.bus_id,
+                    "batch_id": int(getattr(t, "batch_id", None) or t.id),
+                })
+            items.append(base)
+
+        return jsonify(
+            items=items,
+            page=page,
+            page_size=page_size,
+            total=total,
+            has_more=(page * page_size) < total,
+        ), 200
+
+    # ---------- GROUPED (one row per batch, PAID-ONLY) ----------
+    where_dates = []
+    params = {}
 
     if date_str:
         try:
             day = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
             return jsonify(error="date must be YYYY-MM-DD"), 400
-        qs = qs.filter(func.date(TicketSale.created_at) == day)
+        where_dates.append("DATE(created_at) = :oneday")
+        params["oneday"] = day
     elif days in {"7", "30"}:
         cutoff = dt.datetime.utcnow() - timedelta(days=int(days))
-        qs = qs.filter(TicketSale.created_at >= cutoff)
+        where_dates.append("created_at >= :cutoff")
+        params["cutoff"] = cutoff
 
     if bus_id:
-        if hasattr(TicketSale, "bus_id"):
-            qs = qs.filter(TicketSale.bus_id == bus_id)
-        else:
-            qs = qs.join(Trip, TicketSale.trip_id == Trip.id).filter(Trip.bus_id == bus_id)
+        where_dates.append("bus_id = :bus_id")
+        params["bus_id"] = bus_id
 
-    total = qs.count()
-    rows = qs.order_by(TicketSale.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    # Only this user's PAID tickets
+    base_where = "user_id = :uid AND paid = 1"
+    params["uid"] = g.user.id
+    if where_dates:
+        base_where += " AND " + " AND ".join(where_dates)
+
+    total = int(db.session.execute(
+        text(f"""
+            SELECT COUNT(*) FROM (
+              SELECT COALESCE(batch_id, id) AS batch_key
+              FROM ticket_sales
+              WHERE {base_where}
+              GROUP BY COALESCE(batch_id, id)
+            ) AS g
+        """),
+        params,
+    ).scalar() or 0)
+
+    groups = db.session.execute(
+        text(f"""
+            SELECT
+              COALESCE(batch_id, id) AS batch_id,
+              MIN(id)  AS head_id,
+              COUNT(*) AS qty,
+              SUM(CAST(price AS SIGNED)) AS total_pesos,
+              MAX(created_at) AS latest_created_at
+            FROM ticket_sales
+            WHERE {base_where}
+            GROUP BY COALESCE(batch_id, id)
+            ORDER BY head_id DESC
+            LIMIT :lim OFFSET :off
+        """),
+        {**params, "lim": page_size, "off": (page - 1) * page_size},
+    ).mappings().all()
+
+    if not groups:
+        return jsonify(items=[], page=page, page_size=page_size, total=0, has_more=False), 200
+
+    head_ids = [int(r["head_id"]) for r in groups]
+    heads = (
+        TicketSale.query.options(
+            joinedload(TicketSale.user),
+            joinedload(TicketSale.origin_stop_time),
+            joinedload(TicketSale.destination_stop_time),
+        )
+        .filter(TicketSale.id.in_(head_ids))
+        .all()
+    )
+    head_map = {t.id: t for t in heads}
 
     items = []
-    for t in rows:
-        amount = int(round(float(t.price or 0)))
-        prefix = "discount" if t.passenger_type == "discount" else "regular"
-        filename = f"{prefix}_{amount}.jpg"
-        qr_url = url_for("static", filename=f"qr/{filename}", _external=True)
+    for grow in groups:
+        head = head_map.get(int(grow["head_id"]))
+        if not head:
+            continue
 
-        if t.origin_stop_time:
-            origin_name = t.origin_stop_time.stop_name
+        if head.origin_stop_time:
+            origin_name = head.origin_stop_time.stop_name
         else:
-            ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+            ts = TicketStop.query.get(getattr(head, "origin_stop_time_id", None))
             origin_name = ts.stop_name if ts else ""
 
-        if t.destination_stop_time:
-            destination_name = t.destination_stop_time.stop_name
+        if head.destination_stop_time:
+            destination_name = head.destination_stop_time.stop_name
         else:
-            tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+            tsd = TicketStop.query.get(getattr(head, "destination_stop_time_id", None))
             destination_name = tsd.stop_name if tsd else ""
 
-        payload = build_qr_payload(
-            t,
-            origin_name=origin_name,
-            destination_name=destination_name,
-        )
-        qr_link = url_for("commuter.qr_image_for_ticket", ticket_id=t.id, _external=True)
-
         items.append({
-            "id": t.id,
-            "referenceNo": t.reference_no,
-            "date": t.created_at.strftime("%B %d, %Y"),
-            "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+            "id": head.id,
+            "batch_id": int(grow["batch_id"]),
+            "referenceNo": head.reference_no,
+            "date": head.created_at.strftime("%B %d, %Y"),
+            "time": head.created_at.strftime("%I:%M %p").lstrip("0").lower(),
             "origin": origin_name,
             "destination": destination_name,
-            "passengerType": t.passenger_type.title(),
-            "commuter": f"{t.user.first_name} {t.user.last_name}",
-            "fare": amount,  # NO CENTS
-            "paid": bool(t.paid),
-            "qr_url": qr_url,
-            "qr": payload if not light else payload,
-            "qr_link": qr_link,
+            "commuter": f"{head.user.first_name} {head.user.last_name}" if head.user else "Guest",
+            "fare": int(grow["total_pesos"] or 0),
+            "paid": True,
+            "passengers": int(grow["qty"] or 0),
+            "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=head.id, _external=True),
+            "view_url": url_for("commuter.commuter_ticket_view", ticket_id=head.id, _external=True),
         })
 
     return jsonify(
@@ -1249,6 +1719,101 @@ def my_receipts():
         total=total,
         has_more=(page * page_size) < total,
     ), 200
+
+# Alias: /commuter/my/receipts  → same payload as /commuter/tickets/mine
+@commuter_bp.route("/my/receipts", methods=["GET"])
+@require_role("commuter")
+def my_receipts_alias():
+    return my_receipts()
+
+# Alias: /commuter/tickets?mine=1  → same payload as /commuter/tickets/mine
+@commuter_bp.route("/tickets", methods=["GET"])
+@require_role("commuter")
+def tickets_index():
+    mine = (request.args.get("mine") or "").lower() in {"1", "true", "yes"}
+    # If client asks for mine=1, return the same as /tickets/mine (supports all same query params)
+    if mine or True:
+        return my_receipts()
+    # (If you really want a 404 when mine is missing, replace the line above with:)
+    # return jsonify(error="not found"), 404
+
+
+@commuter_bp.route("/tickets/<int:ticket_id>/batch", methods=["GET"])
+@require_role("commuter")
+def commuter_get_ticket_batch(ticket_id: int):
+    t = TicketSale.query.filter_by(id=ticket_id).first()
+    if not t or (t.user_id != g.user.id):
+        return jsonify(error="not found"), 404
+
+    # names
+    if t.origin_stop_time:
+        origin = t.origin_stop_time.stop_name
+    else:
+        ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+        origin = ts.stop_name if ts else ""
+
+    if t.destination_stop_time:
+        destination = t.destination_stop_time.stop_name
+    else:
+        tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+        destination = tsd.stop_name if tsd else ""
+
+    # Group-first; fall back to legacy batch
+    is_group = bool(getattr(t, "is_group", False))
+    if is_group and (int(getattr(t, "group_regular", 0) or 0) + int(getattr(t, "group_discount", 0) or 0) > 1):
+        g_reg = int(getattr(t, "group_regular", 0) or 0)
+        g_dis = int(getattr(t, "group_discount", 0) or 0)
+        passengers = g_reg + g_dis
+        total = int(round(float(t.price or 0)))
+        breakdown = []
+        if g_reg: breakdown.append({"passenger_type": "regular", "quantity": g_reg})
+        if g_dis: breakdown.append({"passenger_type": "discount", "quantity": g_dis})
+
+        return jsonify({
+            "batch_id": int(getattr(t, "batch_id", None) or t.id),
+            "head_ticket_id": int(t.id),
+            "referenceNo": t.reference_no,
+            "date": t.created_at.strftime("%B %d, %Y"),
+            "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+            "origin": origin,
+            "destination": destination,
+            "passengers": passengers,
+            "fare_total": total,
+            "breakdown": breakdown,
+            "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
+        }), 200
+
+    # legacy multi-row batch
+    bid = getattr(t, "batch_id", None) or t.id
+    rows = (
+        TicketSale.query
+        .filter(func.coalesce(TicketSale.batch_id, TicketSale.id) == bid, TicketSale.paid.is_(True))
+        .order_by(TicketSale.id.asc())
+        .all()
+    )
+    if not rows:
+        return jsonify(error="not found"), 404
+
+    total = sum(int(round(float(r.price or 0))) for r in rows)
+    types = {}
+    for r in rows:
+        types[r.passenger_type or "regular"] = types.get(r.passenger_type or "regular", 0) + 1
+
+    head = rows[0]
+    return jsonify({
+        "batch_id": int(bid),
+        "head_ticket_id": int(head.id),
+        "referenceNo": head.reference_no,
+        "date": head.created_at.strftime("%B %d, %Y"),
+        "time": head.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+        "origin": origin,
+        "destination": destination,
+        "passengers": len(rows),
+        "fare_total": total,
+        "breakdown": [{"passenger_type": k, "quantity": v} for k, v in types.items()],
+        "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=head.id, _external=True),
+    }), 200
+
 
 @commuter_bp.route("/trips/<int:trip_id>", methods=["GET"])
 @require_role("commuter")

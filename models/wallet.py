@@ -1,9 +1,9 @@
 # backend/models/wallet.py
+from __future__ import annotations
 from db import db
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship, synonym
 
-# ──────────────────────────────────────────────────────────────────────────────
 class WalletAccount(db.Model):
     __tablename__ = "wallet_accounts"
 
@@ -46,7 +46,6 @@ class WalletAccount(db.Model):
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 class WalletLedger(db.Model):
     __tablename__ = "wallet_ledger"
 
@@ -63,7 +62,6 @@ class WalletLedger(db.Model):
 
     created_at            = db.Column(db.DateTime, server_default=func.now(), nullable=False)
 
-    # Back-compat helpers in CENTS (different names)
     @property
     def amount_cents(self) -> int:
         return int(self.amount_pesos) * 100
@@ -87,19 +85,24 @@ class WalletLedger(db.Model):
             self.running_balance_pesos = 0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 class TopUp(db.Model):
     __tablename__ = "wallet_topups"
 
     id           = db.Column(db.Integer, primary_key=True, autoincrement=True)
     account_id   = db.Column(db.Integer, db.ForeignKey("wallet_accounts.user_id"), nullable=False, index=True)
-    pao_id       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True, index=True)
+
+    # Operator-less: no pao_id / teller_id
     method       = db.Column(db.Enum("cash", "gcash", name="topup_method"), nullable=False, default="cash")
     amount_pesos = db.Column(db.Integer, nullable=False)                 # whole pesos
-    status       = db.Column(db.String(16), nullable=False, server_default="succeeded", index=True)
-    created_at   = db.Column(db.DateTime, server_default=func.now(), nullable=False)
 
-    pao          = relationship("User", foreign_keys=[pao_id])
+    # We allow pending/succeeded/rejected/cancelled
+    status       = db.Column(db.String(16), nullable=False, server_default="pending", index=True)
+
+    # Optional provider metadata (if your schema has them; safe to keep nullable)
+    provider     = db.Column(db.String(32), nullable=True)
+    provider_ref = db.Column(db.String(128), nullable=True, unique=False)
+
+    created_at   = db.Column(db.DateTime, server_default=func.now(), nullable=False)
 
     # Back-compat helper in CENTS (different name)
     @property

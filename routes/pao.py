@@ -65,24 +65,31 @@ def _iso_utc(x):
 from threading import Thread
 
 
-
 def _post_commit_notify(
-    bus_id:int,
-    user_id:int|None,
-    items_ids:list[int],
-    o_name:str,
-    d_name:str,
+    app,
+    bus_id: int,
+    user_id: int | None,
+    items_ids: list[int],
+    o_name: str,
+    d_name: str,
     *,
-    new_balance_pesos:int|None=None,
-    wallet_owner_id:int|None=None,
-    total_pesos:int|None=None,
+    new_balance_pesos: int | None = None,
+    wallet_owner_id: int | None = None,
+    total_pesos: int | None = None,
 ):
+    """
+    Background notifier to run *after* a successful DB commit.
+    IMPORTANT: Pass the real Flask app object (current_app._get_current_object()).
+    """
+    import logging
+
     try:
-        with current_app.app_context():
-            # MQTT: recompute paid count
+        with app.app_context():
+            # MQTT: recompute today's paid count (UTC day window)
             from datetime import datetime as _dt
             start = _dt.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             end   = _dt.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)
+
             cnt = (
                 db.session.query(func.count(TicketSale.id))
                 .filter(TicketSale.bus_id == bus_id, TicketSale.paid.is_(True))
@@ -90,11 +97,15 @@ def _post_commit_notify(
                 .scalar()
             ) or 0
 
+            # Publish live paid count to the device, if it has an identifier
             bus_row = Bus.query.get(bus_id)
             if bus_row and bus_row.identifier:
-                publish(f"device/{bus_row.identifier}/fare", {"paid": cnt})
+                try:
+                    publish(f"device/{bus_row.identifier}/fare", {"paid": cnt})
+                except Exception:
+                    app.logger.exception("[mqtt] publish failed")
 
-            # Push (best-effort)
+            # Notify paying user (best-effort)
             if user_id:
                 try:
                     head_id = items_ids[0] if items_ids else None
@@ -106,17 +117,18 @@ def _post_commit_notify(
                     }
                     if new_balance_pesos is not None:
                         payload["new_balance_php"] = float(new_balance_pesos)
+
                     push_to_user(
-                        db, DeviceToken, user_id,
+                        db, DeviceToken, int(user_id),
                         "✅ Payment confirmed",
                         f"Ref #{head_id} • {o_name} → {d_name}",
                         payload,
                         channelId="payments", priority="high", ttl=600,
                     )
                 except Exception:
-                    current_app.logger.exception("[push] notify failed")
+                    app.logger.exception("[push] notify failed")
 
-            # If a different wallet owner funded this, also tell *them* (wallet_debit)
+            # If a different wallet owner funded this, also notify them (wallet_debit)
             if wallet_owner_id and wallet_owner_id != user_id:
                 try:
                     payload2 = {
@@ -126,16 +138,23 @@ def _post_commit_notify(
                         "deeplink": "/commuter/wallet",
                     }
                     push_to_user(
-                        db, DeviceToken, wallet_owner_id,
+                        db, DeviceToken, int(wallet_owner_id),
                         "💳 Wallet charged",
                         f"–₱{float(total_pesos or 0):.2f} • New ₱{float(new_balance_pesos or 0):.2f}",
                         payload2,
                         channelId="payments", priority="high", ttl=600,
                     )
                 except Exception:
-                    current_app.logger.exception("[push] wallet-owner debit notify failed")
+                    app.logger.exception("[push] wallet-owner debit notify failed")
+
     except Exception:
-        current_app.logger.exception("[post-commit] worker crashed")
+        # Avoid using current_app here; the worker may have no active context if setup failed
+        try:
+            app.logger.exception("[post-commit] worker crashed")
+        except Exception:
+            logging.exception("[post-commit] worker crashed (no app logger)")
+
+
 # ---- Time helpers (UTC canonical; Manila convenience) ----
 from datetime import timezone as _tz, timedelta as _td
 _MNL = _tz(_td(hours=8))
@@ -1132,19 +1151,17 @@ def _fare_for(o, d, passenger_type: str) -> int:
     base = 10 + max(hops - 1, 0) * 2
     return round(base * 0.8) if passenger_type == "discount" else base
 
-
 @pao_bp.route("/tickets", methods=["POST"])
 @require_role("pao")
 def create_ticket():
- 
+
     data = request.get_json(silent=True) or {}
-    current_app.logger.debug(f"[PAO:/tickets wallet-only] raw payload: {data}")
+    current_app.logger.debug(f"[PAO:/tickets wallet-only SINGLE] raw payload: {data}")
 
     try:
         # ---- Resolve O/D stops ------------------------------------------------
         o_id = data.get("origin_stop_id") or data.get("origin_stop_time_id")
         d_id = data.get("destination_stop_id") or data.get("destination_stop_time_id")
-
         o = TicketStop.query.get(o_id)
         d = TicketStop.query.get(d_id)
         if not o or not d:
@@ -1152,26 +1169,32 @@ def create_ticket():
 
         # ---- Parse passenger blocks (supports list or legacy single) ----------
         items_spec = data.get("items")
-        blocks: list[tuple[str, int]] = []
+        n_regular = 0
+        n_discount = 0
         if isinstance(items_spec, list):
             for b in items_spec:
                 pt = (b or {}).get("passenger_type")
                 qty = int((b or {}).get("quantity") or 0)
                 if pt not in ("regular", "discount") or qty < 0:
                     return jsonify(error="invalid passenger_type/quantity"), 400
-                if qty > 0:
-                    blocks.append((pt, min(qty, 20)))
+                if pt == "regular":
+                    n_regular += qty
+                else:
+                    n_discount += qty
         else:
+            # legacy solo
             pt = data.get("passenger_type")
             if pt not in ("regular", "discount"):
                 return jsonify(error="invalid passenger_type"), 400
             qty = max(1, min(int(data.get("quantity") or 1), 20))
-            blocks = [(pt, qty)]
+            if pt == "regular":
+                n_regular = qty
+            else:
+                n_discount = qty
 
-        if not blocks:
+        total_qty = n_regular + n_discount
+        if total_qty <= 0:
             return jsonify(error="no passengers"), 400
-
-        total_qty = sum(q for _, q in blocks)
         if total_qty > 20:
             return jsonify(error="quantity exceeds limit (20)"), 400
 
@@ -1182,23 +1205,15 @@ def create_ticket():
         except Exception:
             ticket_dt = datetime.now()
 
-        # ---- Assignment targets -----------------------------------------------
-        primary_type = data.get("primary_type")
-        if primary_type in ("regular", "discount"):
-            # Ensure "primary_type" becomes the first issued block
-            blocks.sort(key=lambda x: 0 if x[0] == primary_type else 1)
-
-        assign_all = bool(data.get("assign_all_to_commuter") or False)
-
-        # The "owner" for the tickets:
-        # prefer explicit commuter_id; fall back to the wallet account user (below)
-        requested_commuter_id = data.get("commuter_id")
+        # ---- Decide stored passenger_type (for compatibility) -----------------
+        primary_type = (data.get("primary_type") or ("regular" if n_regular >= n_discount else "discount")).lower()
+        if primary_type not in ("regular", "discount"):
+            primary_type = "regular"
 
         # ---- Wallet credential (REQUIRED) -------------------------------------
         wallet_token = (data.get("wallet_token") or "").strip()
         wallet_user_id = data.get("user_id")
-
-        account_user_id = None
+        account_user_id: int | None = None
         if wallet_token:
             if verify_wallet_token is None:
                 return jsonify(error="wallet token not supported"), 400
@@ -1208,11 +1223,11 @@ def create_ticket():
                 return jsonify(error="invalid wallet token"), 400
         elif wallet_user_id not in (None, "", 0):
             account_user_id = int(wallet_user_id)
-
         if not account_user_id:
             return jsonify(error="missing wallet_token or user_id"), 400
 
         # Ticket "commuter" to assign to (use commuter_id if provided, else the wallet owner)
+        requested_commuter_id = data.get("commuter_id")
         linked_user_id = int(requested_commuter_id or account_user_id)
         user = User.query.get(linked_user_id)
         if not user:
@@ -1229,9 +1244,12 @@ def create_ticket():
             base = 10 + max(hops - 1, 0) * 2
             return round(base * 0.8) if pt == "discount" else base
 
-        total_pesos = int(round(sum(_fare_for_local(pt) * qty for pt, qty in blocks)))
+        total_pesos = int(round(
+            _fare_for_local("regular") * n_regular +
+            _fare_for_local("discount") * n_discount
+        ))
 
-        # ---- Atomic pre-debit (fails → 402; no tickets created) ---------------
+        # ---- Atomic pre-debit (fails → 402; nothing created) ------------------
         upd = db.session.execute(
             text("""
                 UPDATE wallet_accounts
@@ -1241,56 +1259,39 @@ def create_ticket():
             {"uid": account_user_id, "amt": total_pesos},
         )
         if upd.rowcount != 1:
-            resp = jsonify({
-                "error": "insufficient balance",
-                "account_user_id": int(account_user_id),
-                "required_php": float(total_pesos),
-            })
-            return resp, 402
+            return jsonify(
+                error="insufficient balance",
+                account_user_id=int(account_user_id),
+                required_php=float(total_pesos),
+            ), 402
 
-        # ---- Create paid tickets ----------------------------------------------
-        items: list[TicketSale] = []
-        head_assigned = False  # for legacy single-assignment when assign_all=False
+        # ---- Create a *single* paid ticket carrying group meta ----------------
+        t = TicketSale(
+            bus_id=bus_id,
+            user_id=user.id,                 # single owner (no guests in single-row model)
+            guest=False,
+            price=total_pesos,               # whole pesos (group total)
+            passenger_type=primary_type,     # keep legacy compatibility
+            reference_no="TEMP",
+            paid=True,
+            created_at=ticket_dt,
+            origin_stop_time_id=o.id,
+            destination_stop_time_id=d.id,
+            issued_by=g.user.id,
+            # group meta:
+            is_group=bool(total_qty > 1),
+            group_regular=int(n_regular),
+            group_discount=int(n_discount),
+        )
+        db.session.add(t)
+        db.session.flush()                   # get t.id
+        t.reference_no = _gen_reference(bus_id, t.id)
 
-        for pt, qty in blocks:
-            fare = _fare_for_local(pt)
-            for _ in range(qty):
-                # Decide ticket owner
-                if assign_all:
-                    this_user_id = user.id
-                else:
-                    # Only the first ticket gets assigned to the commuter by default
-                    if not head_assigned:
-                        this_user_id = user.id
-                        head_assigned = True
-                    else:
-                        this_user_id = None  # subsequent tickets as guest
-
-                t = TicketSale(
-                    bus_id=bus_id,
-                    user_id=this_user_id,
-                    guest=bool(not this_user_id),
-                    price=fare,                         # whole pesos
-                    passenger_type=pt,
-                    reference_no="TEMP",
-                    paid=True,                          # 🔑 always paid
-                    created_at=ticket_dt,
-                    origin_stop_time_id=o.id,
-                    destination_stop_time_id=d.id,
-                    issued_by=g.user.id,
-                )
-                db.session.add(t)
-                db.session.flush()   # to get t.id
-                t.reference_no = _gen_reference(bus_id, t.id)
-                items.append(t)
-
-        # ---- Ledger entry (single row, references head ticket) ----------------
+        # ---- Ledger entry (single row, references this ticket) ----------------
         new_balance = db.session.execute(
             text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
             {"uid": account_user_id}
         ).scalar() or 0
-
-        head_id = items[0].id if items else None
         db.session.execute(
             text("""
                 INSERT INTO wallet_ledger
@@ -1299,44 +1300,40 @@ def create_ticket():
                 VALUES
                     (:aid, 'debit', 'ride', :amt, :run, 'ticket_sale', :rid, NOW())
             """),
-            {"aid": account_user_id, "amt": total_pesos, "run": int(new_balance), "rid": head_id},
+            {"aid": account_user_id, "amt": total_pesos, "run": int(new_balance), "rid": int(t.id)},
         )
 
         db.session.commit()
 
         # ---- Async notifications (MQTT + push best-effort) --------------------
+        app_obj = current_app._get_current_object()
         Thread(
             target=_post_commit_notify,
-            args=(bus_id, int(user.id) if user else None, [t.id for t in items], o.stop_name, d.stop_name),
+            args=(app_obj, bus_id, int(user.id), [int(t.id)], o.stop_name, d.stop_name),
             kwargs=dict(
-                new_balance_pesos=int(new_balance),       # ✅ include new balance
-                wallet_owner_id=int(account_user_id),     # ✅ notify wallet owner
-                total_pesos=int(total_pesos),             # ✅ amount charged
+                new_balance_pesos=int(new_balance),
+                wallet_owner_id=int(account_user_id),
+                total_pesos=int(total_pesos),
             ),
-            daemon=True
+            daemon=True,
         ).start()
 
-        # ---- Response: batch when >1, else single -----------------------------
+        # ---- Response: single ticket ------------------------------------------
         origin_name = o.stop_name
         destination_name = d.stop_name
-
-        def _ser(t: TicketSale) -> dict:
-            return _serialize_ticket_json(t, origin_name, destination_name)
-
-        if len(items) > 1:
-            total_fare = sum(int(round(float(it.price or 0))) for it in items)
-            return jsonify({
-                "count": len(items),
-                "total_fare": f"{float(total_fare):.2f}",
-                "items": [_ser(it) for it in items],
-            }), 201
-
-        head = items[0]
-        return jsonify(_ser(head)), 201
+        payload = _serialize_ticket_json(t, origin_name, destination_name)
+        # extra hints (clients may ignore safely)
+        payload["count"] = int(total_qty)
+        payload["group"] = {
+            "regular": int(n_regular),
+            "discount": int(n_discount),
+            "total": int(total_qty),
+        }
+        return jsonify(payload), 201
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.exception("!! create_ticket (wallet-only) unexpected error")
+        current_app.logger.exception("!! create_ticket (wallet-only SINGLE) unexpected error")
         return jsonify(error=str(e)), 500
 
 
@@ -1402,50 +1399,90 @@ def list_tickets():
         return jsonify(error="invalid date"), 400
 
     start_dt = datetime.combine(day, datetime.min.time())
-    end_dt = datetime.combine(day, datetime.max.time())
+    end_dt   = datetime.combine(day, datetime.max.time())
 
     bus_id = _current_bus_id()
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
 
-    qs = (
-        TicketSale.query.options(joinedload(TicketSale.user))
-        .filter(
-            TicketSale.bus_id == bus_id,
-            TicketSale.created_at.between(start_dt, end_dt),
-            TicketSale.paid.is_(True),
+    # 1) Find batches for the day
+    groups = db.session.execute(
+        text("""
+            SELECT
+            MIN(id)  AS head_id,
+            COUNT(*) AS qty,
+            SUM(CAST(price AS SIGNED)) AS total_pesos
+            FROM ticket_sales
+            WHERE bus_id = :bus
+            AND created_at BETWEEN :s AND :e
+            AND paid = 1
+            GROUP BY
+            COALESCE(
+                CAST(batch_id AS CHAR),
+                CONCAT(
+                issued_by,'|',
+                IFNULL(origin_stop_time_id,0),'|',
+                IFNULL(destination_stop_time_id,0),'|',
+                DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')
+                )
+            )
+            ORDER BY head_id ASC
+        """),
+        {"bus": bus_id, "s": start_dt, "e": end_dt},
+    ).mappings().all()
+
+
+    if not groups:
+        return jsonify([]), 200
+
+    head_ids = [int(r["head_id"]) for r in groups]
+
+    # 2) Load head tickets in one go for details (commuter, O/D, timestamps, ref)
+    heads = (
+        TicketSale.query.options(
+            joinedload(TicketSale.user),
+            joinedload(TicketSale.origin_stop_time),
+            joinedload(TicketSale.destination_stop_time),
         )
-        .order_by(TicketSale.id.asc())
+        .filter(TicketSale.id.in_(head_ids))
+        .all()
     )
+    head_map = {t.id: t for t in heads}
 
     out = []
-    for t in qs:
-        if t.origin_stop_time:
-            origin_name = t.origin_stop_time.stop_name
+    for r in groups:
+        head = head_map.get(int(r["head_id"]))
+        if not head:
+            continue
+
+        # Origin/Destination names (use head ticket)
+        if head.origin_stop_time:
+            origin_name = head.origin_stop_time.stop_name
         else:
-            ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+            ts = TicketStop.query.get(getattr(head, "origin_stop_time_id", None))
             origin_name = ts.stop_name if ts else ""
 
-        if t.destination_stop_time:
-            destination_name = t.destination_stop_time.stop_name
+        if head.destination_stop_time:
+            destination_name = head.destination_stop_time.stop_name
         else:
-            tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+            tsd = TicketStop.query.get(getattr(head, "destination_stop_time_id", None))
             destination_name = tsd.stop_name if tsd else ""
 
-        out.append(
-            {
-                "id": t.id,
-                "referenceNo": t.reference_no,
-                "commuter": _commuter_label(t),
-                "date": t.created_at.strftime("%B %d, %Y"),
-                "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-                "origin": origin_name,
-                "destination": destination_name,
-                "fare": f"{float(t.price):.2f}",
-                "paid": bool(t.paid),
-        
-            }
-        )
+        out.append({
+            "id": head.id,                                 # use head-id as the row id
+            "referenceNo": head.reference_no,
+            "commuter": _commuter_label(head),
+            "date": head.created_at.strftime("%B %d, %Y"),
+            "time": head.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+            "origin": origin_name,
+            "destination": destination_name,
+            "fare": f"{float(r['total_pesos'] or 0):.2f}", # TOTAL for the batch
+            "paid": True,
+            # Optional extras (UI can ignore safely):
+            "passengers": int(r["qty"] or 0),
+            "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=head.id, _external=True),
+        })
+
     return jsonify(out), 200
 
 
@@ -1493,7 +1530,12 @@ def get_ticket(ticket_id):
         getattr(t, "issued_by", None),
         getattr(getattr(g, "user", None), "id", None),
     )
-    return jsonify({
+    gr = int(getattr(t, "group_regular", 0) or 0)
+    gd = int(getattr(t, "group_discount", 0) or 0)
+    total = gr + gd
+    is_group = bool(getattr(t, "is_group", False) or total > 1)
+    group_block = ({"regular": gr, "discount": gd, "total": total} if is_group else None)
+    resp = {
         "id": t.id,
         "referenceNo": t.reference_no,
         "date": t.created_at.strftime("%B %d, %Y"),
@@ -1511,7 +1553,15 @@ def get_ticket(ticket_id):
         "qr_bg_url": qr_bg_url,
         "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
         "paoId": getattr(t, "issued_by", None) or getattr(g, "user", None).id,
-    }), 200
+    }
+
+    if is_group:
+        resp["isGroup"] = True
+        resp["group"] = group_block
+        resp["count"] = total
+
+    return jsonify(resp), 200
+
 
 @pao_bp.route("/tickets/<int:ticket_id>", methods=["PATCH"])
 @require_role("pao")

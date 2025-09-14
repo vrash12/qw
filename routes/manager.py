@@ -43,7 +43,23 @@ def _active_trip_for(bus_id: int, ts: datetime):
             return t
     return None
 
-# ⬇️ /manager/commuters
+# --- add near your imports ---
+from sqlalchemy import text
+
+# --- helper: does a column exist? ---
+def table_has_column(table: str, column: str) -> bool:
+    row = db.session.execute(
+        text("""
+            SELECT COUNT(*) AS c
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name   = :t
+              AND column_name  = :c
+        """),
+        {"t": table, "c": column},
+    ).mappings().first()
+    return bool(row and int(row["c"]) > 0)
+
 @manager_bp.route("/commuters", methods=["GET"])
 @require_role("manager")
 def list_commuters():
@@ -244,7 +260,6 @@ def commuter_tickets(user_id: int):
         return jsonify(error="Failed to load tickets"), 500
 
 
-# ⬇️ commuter top-ups with date range + paging (whole pesos) — TELLER-first, PAO fallback
 @manager_bp.route("/commuters/<int:user_id>/topups", methods=["GET"])
 @require_role("manager")
 def commuter_topups(user_id: int):
@@ -256,10 +271,8 @@ def commuter_topups(user_id: int):
 
         to_dt = datetime.strptime(to_str, "%Y-%m-%d") if to_str else datetime.utcnow()
         fr_dt = datetime.strptime(from_str, "%Y-%m-%d") if from_str else (to_dt - timedelta(days=30))
-
         offset = (page - 1) * size
 
-        # total count
         total_row = db.session.execute(
             text("""
                 SELECT COUNT(*) AS c
@@ -273,9 +286,10 @@ def commuter_topups(user_id: int):
         ).mappings().first() or {}
         total = int(total_row.get("c", 0))
 
-        # Prefer teller_id; fall back to pao_id if your schema hasn't been migrated yet
-        rows = db.session.execute(
-            text("""
+        has_teller = table_has_column("wallet_topups", "teller_id")
+
+        if has_teller:
+            sql = """
                 SELECT 
                     t.id,
                     t.created_at,
@@ -293,17 +307,36 @@ def commuter_topups(user_id: int):
                   AND t.created_at <  :to_plus
                 ORDER BY t.created_at DESC
                 LIMIT :lim OFFSET :off
-            """),
-            {
-                "uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1),
-                "lim": size, "off": offset
-            }
+            """
+        else:
+            sql = """
+                SELECT 
+                    t.id,
+                    t.created_at,
+                    t.amount_pesos,
+                    COALESCE(t.method, 'cash') AS method,
+                    t.pao_id AS teller_id,
+                    pu.first_name AS teller_first,
+                    pu.last_name  AS teller_last
+                FROM wallet_topups t
+                LEFT JOIN users pu ON pu.id = t.pao_id
+                WHERE t.account_id = :uid
+                  AND t.status = 'succeeded'
+                  AND t.created_at >= :fr
+                  AND t.created_at <  :to_plus
+                ORDER BY t.created_at DESC
+                LIMIT :lim OFFSET :off
+            """
+
+        rows = db.session.execute(
+            text(sql),
+            {"uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1), "lim": size, "off": offset}
         ).mappings().all()
 
         items = [{
             "id": r["id"],
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            "amount_php": float(r["amount_pesos"] or 0.0),  # whole pesos
+            "amount_php": float(r["amount_pesos"] or 0.0),
             "method": r["method"],
             "teller_id": r["teller_id"],
             "teller_name": ("{} {}".format(r.get("teller_first") or "", r.get("teller_last") or "").strip() or None),
@@ -320,71 +353,87 @@ def commuter_topups(user_id: int):
         return jsonify(error="Failed to load top-ups"), 500
 
 
-
 @manager_bp.route("/topups", methods=["GET"])
 @require_role("manager")
 def manager_topups():
-    """
-    Supports:
-      - ?date=YYYY-MM-DD                    (single day)
-      - ?start=YYYY-MM-DD&end=YYYY-MM-DD    (inclusive range)
-      - ?method=cash|gcash                  (optional)
-      - ?teller_id=123                      (optional; legacy ?pao_id still accepted)
-    Returns: list of topups with status='succeeded'
-    """
-    # --- choose window ---
+    from datetime import datetime as _dt
+
+    # window
     date_str  = (request.args.get("date") or "").strip()
     start_str = (request.args.get("start") or "").strip()
     end_str   = (request.args.get("end") or "").strip()
-
     try:
         if date_str:
-            day = datetime.strptime(date_str, "%Y-%m-%d").date()
-            start_dt = datetime.combine(day, datetime.min.time())
-            end_dt   = datetime.combine(day, datetime.max.time())
+            day = _dt.strptime(date_str, "%Y-%m-%d").date()
+            start_dt = _dt.combine(day, _dt.min.time())
+            end_dt   = _dt.combine(day, _dt.max.time())
         elif start_str and end_str:
-            start_day = datetime.strptime(start_str, "%Y-%m-%d").date()
-            end_day   = datetime.strptime(end_str,   "%Y-%m-%d").date()
-            if end_day < start_day:
+            sd = _dt.strptime(start_str, "%Y-%m-%d").date()
+            ed = _dt.strptime(end_str,   "%Y-%m-%d").date()
+            if ed < sd:
                 return jsonify(error="end must be >= start"), 400
-            start_dt = datetime.combine(start_day, datetime.min.time())
-            end_dt   = datetime.combine(end_day,   datetime.max.time())
+            start_dt = _dt.combine(sd, _dt.min.time())
+            end_dt   = _dt.combine(ed, _dt.max.time())
         else:
-            # default: today (UTC)
-            day = datetime.utcnow().date()
-            start_dt = datetime.combine(day, datetime.min.time())
-            end_dt   = datetime.combine(day, datetime.max.time())
+            day = _dt.utcnow().date()
+            start_dt = _dt.combine(day, _dt.min.time())
+            end_dt   = _dt.combine(day, _dt.max.time())
     except ValueError:
         return jsonify(error="invalid date format (use YYYY-MM-DD)"), 400
 
     method = (request.args.get("method") or "").strip().lower() or None
-    teller_id = request.args.get("teller_id", type=int)
+    teller_id = request.args.get("teller_id", type=int) or request.args.get("pao_id", type=int)  # legacy
 
-    # Legacy support: allow ?pao_id until DB is fully migrated
-    legacy_pao_id = request.args.get("pao_id", type=int)
-    if legacy_pao_id and not teller_id:
-        teller_id = legacy_pao_id
-
-    # --- build SQL ---
-    # Use COALESCE(t.teller_id, t.pao_id) to support both schemas during migration.
-    sql = """
-        SELECT t.id, t.account_id, COALESCE(t.teller_id, t.pao_id) AS teller_id,
-               t.method, t.amount_pesos, t.status, t.created_at,
-               cu.first_name  AS commuter_first,  cu.last_name  AS commuter_last,
-               au.first_name  AS teller_first,    au.last_name  AS teller_last
-        FROM wallet_topups t
-        LEFT JOIN users cu ON cu.id = t.account_id
-        LEFT JOIN users au ON au.id = COALESCE(t.teller_id, t.pao_id)
-        WHERE t.status = 'succeeded'
-          AND t.created_at BETWEEN :s AND :e
-    """
+    has_teller = table_has_column("wallet_topups", "teller_id")
     params = {"s": start_dt, "e": end_dt}
+
+    # two safe variants
+    if has_teller:
+        sql = """
+            SELECT
+                t.id,
+                t.account_id,
+                COALESCE(t.teller_id, t.pao_id) AS teller_id,
+                COALESCE(t.method, 'cash')      AS method,
+                t.amount_pesos,
+                t.status,
+                t.created_at,
+                cu.first_name  AS commuter_first,
+                cu.last_name   AS commuter_last,
+                au.first_name  AS teller_first,
+                au.last_name   AS teller_last
+            FROM wallet_topups t
+            LEFT JOIN users cu ON cu.id = t.account_id
+            LEFT JOIN users au ON au.id = COALESCE(t.teller_id, t.pao_id)
+            WHERE t.status = 'succeeded'
+              AND t.created_at BETWEEN :s AND :e
+        """
+    else:
+        sql = """
+            SELECT
+                t.id,
+                t.account_id,
+                t.pao_id                         AS teller_id,
+                COALESCE(t.method, 'cash')       AS method,
+                t.amount_pesos,
+                t.status,
+                t.created_at,
+                cu.first_name  AS commuter_first,
+                cu.last_name   AS commuter_last,
+                au.first_name  AS teller_first,
+                au.last_name   AS teller_last
+            FROM wallet_topups t
+            LEFT JOIN users cu ON cu.id = t.account_id
+            LEFT JOIN users au ON au.id = t.pao_id
+            WHERE t.status = 'succeeded'
+              AND t.created_at BETWEEN :s AND :e
+        """
 
     if method in ("cash", "gcash"):
         sql += " AND t.method = :m"
         params["m"] = method
     if teller_id:
-        sql += " AND COALESCE(t.teller_id, t.pao_id) = :tid"
+        sql += " AND " + ("COALESCE(t.teller_id, t.pao_id)" if has_teller else "t.pao_id") + " = :tid"
         params["tid"] = teller_id
 
     sql += " ORDER BY t.id DESC"
@@ -392,20 +441,24 @@ def manager_topups():
     rows = db.session.execute(text(sql), params).mappings().all()
 
     items = []
+    total_php = 0.0
     for r in rows:
+        commuter_name = f"{(r['commuter_first'] or '').strip()} {(r['commuter_last'] or '').strip()}".strip() or None
+        teller_name   = f"{(r['teller_first']   or '').strip()} {(r['teller_last']   or '').strip()}".strip() or None
+        amt = float(r["amount_pesos"] or 0.0)
+        total_php += amt
         items.append({
-            "id": r["id"],
-            "method": r["method"],
-            "amount_php": float(r["amount_pesos"]),  # stored as whole pesos
+            "id": int(r["id"]),
+            "created_at": r["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ") if r["created_at"] else None,
+            "amount_php": amt,
+            "method": r["method"] or "cash",
             "status": r["status"],
-            "created_at": r["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "commuter": f"{(r['commuter_first'] or '').strip()} {(r['commuter_last'] or '').strip()}".strip(),
-            "teller":   f"{(r['teller_first']   or '').strip()} {(r['teller_last']   or '').strip()}".strip(),
-            "account_id": int(r["account_id"]) if r["account_id"] is not None else None,
-            "teller_id":  int(r["teller_id"])  if r["teller_id"]  is not None else None,
+            "commuter_id": int(r["account_id"]) if r["account_id"] is not None else None,
+            "commuter_name": commuter_name,
+            "teller_id": int(r["teller_id"]) if r["teller_id"] is not None else None,
+            "teller_name": teller_name,
         })
 
-    total_php = sum(i["amount_php"] for i in items)
     return jsonify(items=items, count=len(items), total_php=float(total_php)), 200
 
 

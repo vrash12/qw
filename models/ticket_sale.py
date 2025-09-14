@@ -27,6 +27,9 @@ class TicketSale(db.Model):
     paid           = db.Column(db.Boolean, nullable=False, server_default=db.text('0'))
     voided         = db.Column(db.Boolean, nullable=False, server_default=db.text('0'))
     void_reason    = db.Column(db.String(120))
+    is_group       = db.Column(db.Boolean, nullable=False, server_default=db.text('0'))
+    group_regular  = db.Column(db.Integer, nullable=False, server_default=db.text('0'))
+    group_discount = db.Column(db.Integer, nullable=False, server_default=db.text('0'))
 
     bus_id    = db.Column(db.Integer, db.ForeignKey("buses.id"), nullable=False)
 
@@ -45,3 +48,4 @@ class TicketSale(db.Model):
 
     origin_stop_time      = db.relationship('TicketStop', foreign_keys=[origin_stop_time_id])
     destination_stop_time = db.relationship('TicketStop', foreign_keys=[destination_stop_time_id])
+    batch_id = db.Column(db.Integer, index=True, nullable=True)
