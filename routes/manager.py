@@ -1,16 +1,16 @@
 # backend/routes/manager.py
-from flask import Blueprint, request, jsonify, send_from_directory, current_app
+from flask import Blueprint, request, jsonify, send_from_directory, current_app, g
 import os
 import uuid
 from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
-from sqlalchemy import func, text  # ⬅️ import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import aliased
 
 from db import db
 from routes.auth import require_role
 from models.bus import Bus
-from models.schedule import Trip  # ⬅️ StopTime removed
+from models.schedule import Trip
 from models.qr_template import QRTemplate
 from models.fare_segment import FareSegment
 from models.sensor_reading import SensorReading
@@ -36,29 +36,286 @@ def _active_trip_for(bus_id: int, ts: datetime):
     )
     for t in candidates:
         start = datetime.combine(t.service_date, t.start_time)
-        end   = datetime.combine(t.service_date, t.end_time)
+        end = datetime.combine(t.service_date, t.end_time)
         if t.end_time <= t.start_time:  # past midnight
             end = end + timedelta(days=1)
         if start <= ts < end:
             return t
     return None
 
-# --- add near your imports ---
-from sqlalchemy import text
 
 # --- helper: does a column exist? ---
 def table_has_column(table: str, column: str) -> bool:
     row = db.session.execute(
-        text("""
+        text(
+            """
             SELECT COUNT(*) AS c
             FROM information_schema.columns
             WHERE table_schema = DATABASE()
               AND table_name   = :t
               AND column_name  = :c
-        """),
+        """
+        ),
         {"t": table, "c": column},
     ).mappings().first()
     return bool(row and int(row["c"]) > 0)
+
+
+def _is_ticket_void_row(row) -> bool:
+    """Determine if a ticket row is voided, supporting both schemas."""
+    try:
+        if bool(getattr(row, "voided")):
+            return True
+    except Exception:
+        pass
+    try:
+        st = (getattr(row, "status", None) or "").strip().lower()
+        if st in {"void", "voided", "refunded", "cancelled", "canceled"}:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _amount_pesos_from_price(price) -> int:
+    try:
+        return int(round(float(price or 0)))
+    except Exception:
+        return 0
+
+
+def _ensure_wallet_account(user_id: int):
+    """Create wallet_accounts row if missing (pesos schema)."""
+    db.session.execute(
+        text(
+            """
+            INSERT INTO wallet_accounts (user_id, balance_pesos)
+            VALUES (:uid, 0)
+            ON DUPLICATE KEY UPDATE user_id = user_id
+        """
+        ),
+        {"uid": user_id},
+    )
+
+
+def _wallet_tables_exist() -> bool:
+    return table_has_column("wallet_accounts", "balance_pesos") and table_has_column(
+        "wallet_ledger", "amount_pesos"
+    )
+
+
+def _write_void_reason(ticket_table: str, ticket_id: int, reason: str):
+    """
+    Persist void reason if a suitable column exists. Priority:
+    - void_reason
+    - reason
+    - note / remarks
+    No-op if none exist.
+    """
+    candidates = []
+    for col in ("void_reason", "reason", "note", "remarks"):
+        if table_has_column(ticket_table, col):
+            candidates.append(col)
+            break
+    if not candidates:
+        return
+    col = candidates[0]
+    db.session.execute(
+        text(
+            f"UPDATE {ticket_table} SET {col} = :r WHERE id = :tid"
+        ),
+        {"r": reason, "tid": ticket_id},
+    )
+
+
+def _mark_ticket_void(ticket: TicketSale, reason: str | None):
+    """
+    Mark a TicketSale row voided across schemas:
+      - if column 'voided' exists: set voided=1
+      - else if 'status' exists: set status='voided'
+      - always set paid=0 (if exists) for clarity on state
+      - optionally persist reason into void_reason/reason/note/remarks when present
+    """
+    # set paid -> false if column exists
+    if table_has_column("ticket_sales", "paid"):
+        ticket.paid = False  # type: ignore[attr-defined]
+
+    # set void marker
+    if table_has_column("ticket_sales", "voided"):
+        ticket.voided = True  # type: ignore[attr-defined]
+    elif table_has_column("ticket_sales", "status"):
+        setattr(ticket, "status", "voided")
+
+    # persist reason via SQL (handles flexible column name)
+    if reason:
+        _write_void_reason("ticket_sales", ticket.id, reason)
+
+
+def _refund_paid_ticket(ticket: TicketSale, actor_id: int | None) -> dict:
+    """
+    Refund a paid ticket into the user's wallet if wallet tables exist.
+    Returns a dict summary {refunded: bool, balance: int|None}.
+    """
+    if not _wallet_tables_exist():
+        return {"refunded": False, "balance": None, "note": "wallet tables missing"}
+
+    if not ticket.user_id:
+        return {"refunded": False, "balance": None, "note": "no user to refund"}
+
+    amount_pesos = _amount_pesos_from_price(ticket.price)
+    if amount_pesos <= 0:
+        return {"refunded": False, "balance": None, "note": "zero-amount ticket"}
+
+    # ensure account
+    _ensure_wallet_account(int(ticket.user_id))
+
+    # fetch current balance
+    bal_row = db.session.execute(
+        text(
+            """
+            SELECT balance_pesos AS bal
+            FROM wallet_accounts
+            WHERE user_id = :uid
+        """
+        ),
+        {"uid": ticket.user_id},
+    ).mappings().first()
+    cur_bal = int(bal_row["bal"] or 0) if bal_row else 0
+    new_bal = cur_bal + amount_pesos
+
+    # update balance
+    db.session.execute(
+        text(
+            """
+            UPDATE wallet_accounts
+            SET balance_pesos = :b
+            WHERE user_id = :uid
+        """
+        ),
+        {"b": new_bal, "uid": ticket.user_id},
+    )
+
+    # write ledger
+    db.session.execute(
+        text(
+            """
+            INSERT INTO wallet_ledger
+            (account_id, direction, event, amount_pesos, running_balance_pesos, ref_table, ref_id, created_at)
+            VALUES (:uid, 'in', 'refund_ticket', :amt, :run, 'ticket_sales', :tid, :ts)
+        """
+        ),
+        {
+            "uid": ticket.user_id,
+            "amt": amount_pesos,
+            "run": new_bal,
+            "tid": ticket.id,
+            "ts": datetime.utcnow(),
+        },
+    )
+
+    return {"refunded": True, "balance": new_bal, "note": None}
+
+
+@manager_bp.route("/tickets/<int:ticket_id>/void", methods=["PATCH"])
+@require_role("manager")
+def manager_void_ticket(ticket_id: int):
+    """
+    Void a ticket (manager action) with a reason and refund wallet if needed.
+
+    Body:
+      { "voided": true|false, "reason": "<required when voided=true>" }
+
+    Notes:
+      - Idempotent for void=true: if already voided, no duplicate refund occurs.
+      - If ticket was paid and becomes voided now, wallet is credited with the full fare.
+      - Works on schemas with either `voided` (bool) or `status` (str).
+      - Persists reason to `void_reason`/`reason`/`note`/`remarks` if available.
+    """
+    data = request.get_json(silent=True) or {}
+    want_void = bool(data.get("voided", True))
+    reason = (data.get("reason") or "").strip()
+
+    if want_void and not reason:
+        return jsonify(error="reason is required when voiding a ticket"), 400
+
+    ticket = TicketSale.query.filter(TicketSale.id == ticket_id).first()
+    if not ticket:
+        return jsonify(error="ticket not found"), 404
+
+    already_void = _is_ticket_void_row(ticket)
+    was_paid = bool(getattr(ticket, "paid", False))
+
+    if want_void:
+        if already_void:
+            # idempotent: do NOT refund again
+            return jsonify(
+                ok=True,
+                ticket_id=ticket.id,
+                state="voided",
+                paid=False,
+                voided=True,
+                status=getattr(ticket, "status", "voided"),
+                reason=reason or None,
+                refund={"refunded": False, "balance": None, "note": "already voided"},
+            ), 200
+
+        try:
+            # perform state change + optional refund in one transaction
+            with db.session.begin():
+                _mark_ticket_void(ticket, reason)
+                # do refund if it had been paid
+                refund_summary = {"refunded": False, "balance": None, "note": None}
+                if was_paid:
+                    refund_summary = _refund_paid_ticket(ticket, actor_id=getattr(g, "user", None) and g.user.id)
+                db.session.flush()
+            return jsonify(
+                ok=True,
+                ticket_id=ticket.id,
+                state="voided",
+                paid=False,
+                voided=True,
+                status=getattr(ticket, "status", "voided"),
+                reason=reason or None,
+                refund=refund_summary,
+            ), 200
+        except Exception as e:
+            current_app.logger.exception("[manager:void] failed")
+            db.session.rollback()
+            return jsonify(error=str(e)), 500
+
+    # Un-void (rare): support only when schema has boolean 'voided'; otherwise set status='paid' if it existed
+    try:
+        with db.session.begin():
+            if table_has_column("ticket_sales", "voided"):
+                setattr(ticket, "voided", False)
+            if table_has_column("ticket_sales", "status"):
+                # best-effort: restore to 'paid' if it had been paid; else 'unpaid'
+                setattr(ticket, "status", "paid" if was_paid else "unpaid")
+            if table_has_column("ticket_sales", "paid"):
+                setattr(ticket, "paid", was_paid)
+            # clear reason if a reason column exists
+            for col in ("void_reason", "reason", "note", "remarks"):
+                if table_has_column("ticket_sales", col):
+                    db.session.execute(
+                        text(f"UPDATE ticket_sales SET {col} = NULL WHERE id = :tid"),
+                        {"tid": ticket.id},
+                    )
+                    break
+            db.session.flush()
+        return jsonify(
+            ok=True,
+            ticket_id=ticket.id,
+            state=("paid" if was_paid else "unpaid"),
+            paid=was_paid,
+            voided=False,
+            status=getattr(ticket, "status", None),
+            reason=None,
+        ), 200
+    except Exception as e:
+        current_app.logger.exception("[manager:unvoid] failed")
+        db.session.rollback()
+        return jsonify(error=str(e)), 500
+
 
 @manager_bp.route("/commuters", methods=["GET"])
 @require_role("manager")
@@ -111,36 +368,39 @@ def list_commuters():
             .group_by("uid")
             .all()
         )
-        stats = {r.uid: {"tickets": int(r.tickets or 0),
-                         "last_ticket_at": (r.last_ticket_at.isoformat() if r.last_ticket_at else None)}
-                 for r in stats_rows}
+        stats = {
+            r.uid: {
+                "tickets": int(r.tickets or 0),
+                "last_ticket_at": (r.last_ticket_at.isoformat() if r.last_ticket_at else None),
+            }
+            for r in stats_rows
+        }
     else:
         stats = {}
 
     items = []
     for u in users:
         s = stats.get(u.id, {"tickets": 0, "last_ticket_at": None})
-        items.append({
-            "id": u.id,
-            "first_name": u.first_name,
-            "last_name": u.last_name,
-            "name": f"{u.first_name} {u.last_name}".strip(),
-            "username": u.username,
-            "phone_number": u.phone_number,
-            "tickets": s["tickets"],
-            "last_ticket_at": s["last_ticket_at"],
-        })
+        items.append(
+            {
+                "id": u.id,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "name": f"{u.first_name} {u.last_name}".strip(),
+                "username": u.username,
+                "phone_number": u.phone_number,
+                "tickets": s["tickets"],
+                "last_ticket_at": s["last_ticket_at"],
+            }
+        )
 
     pages = (total + page_size - 1) // page_size
-    return jsonify({
-        "items": items,
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "pages": pages
-    }), 200
+    return (
+        jsonify({"items": items, "page": page, "page_size": page_size, "total": total, "pages": pages}),
+        200,
+    )
 
-# ⬇️ commuter detail (profile + quick stats)
+
 @manager_bp.route("/commuters/<int:user_id>", methods=["GET"])
 @require_role("manager")
 def commuter_detail(user_id: int):
@@ -150,7 +410,7 @@ def commuter_detail(user_id: int):
     if not u:
         return jsonify(error="commuter not found"), 404
 
-    # Tickets stats
+    # Tickets stats (exclude voided from revenue)
     t_stats = (
         db.session.query(
             F.count(TicketSale.id),
@@ -164,56 +424,63 @@ def commuter_detail(user_id: int):
     last_ticket_at = t_stats[1].isoformat() if t_stats[1] else None
     tickets_revenue = float(t_stats[2] or 0.0)
 
-    # Top-ups stats — use account_id + amount_pesos (whole pesos)
+    # Top-ups stats — pesos only
     topup_stats = db.session.execute(
-        text("""
+        text(
+            """
             SELECT 
                 COALESCE(SUM(t.amount_pesos), 0) AS sum_pesos,
                 MAX(t.created_at)               AS last_at
             FROM wallet_topups t
             WHERE t.account_id = :uid
               AND t.status = 'succeeded'
-        """),
-        {"uid": user_id}
+        """
+        ),
+        {"uid": user_id},
     ).mappings().first() or {}
     topups_total_pesos = int(topup_stats.get("sum_pesos", 0))
     last_topup_dt = topup_stats.get("last_at")
     last_topup_at = last_topup_dt.isoformat() if last_topup_dt else None
 
-    return jsonify({
-        "id": u.id,
-        "first_name": u.first_name,
-        "last_name": u.last_name,
-        "name": f"{u.first_name} {u.last_name}".strip(),
-        "username": u.username,
-        "phone_number": u.phone_number,
-        "tickets": {
-            "count": tickets_total,
-            "revenue_php": round(tickets_revenue, 2),
-            "last_at": last_ticket_at,
-        },
-        "topups": {
-            "count": None,
-            "total_php": float(topups_total_pesos),
-            "last_at": last_topup_at,
-        }
-    }), 200
+    return (
+        jsonify(
+            {
+                "id": u.id,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "name": f"{u.first_name} {u.last_name}".strip(),
+                "username": u.username,
+                "phone_number": u.phone_number,
+                "tickets": {
+                    "count": tickets_total,
+                    "revenue_php": round(tickets_revenue, 2),
+                    "last_at": last_ticket_at,
+                },
+                "topups": {
+                    "count": None,
+                    "total_php": float(topups_total_pesos),
+                    "last_at": last_topup_at,
+                },
+            }
+        ),
+        200,
+    )
 
 
-# ⬇️ commuter tickets with date range + paging
 @manager_bp.route("/commuters/<int:user_id>/tickets", methods=["GET"])
 @require_role("manager")
 def commuter_tickets(user_id: int):
     try:
-        to_str   = request.args.get("to")
+        to_str = request.args.get("to")
         from_str = request.args.get("from")
-        page     = request.args.get("page", type=int, default=1)
-        size     = min(max(request.args.get("page_size", type=int, default=25), 1), 100)
+        page = request.args.get("page", type=int, default=1)
+        size = min(max(request.args.get("page_size", type=int, default=25), 1), 100)
 
         to_dt = datetime.strptime(to_str, "%Y-%m-%d") if to_str else datetime.utcnow()
         fr_dt = datetime.strptime(from_str, "%Y-%m-%d") if from_str else (to_dt - timedelta(days=30))
 
-        O = aliased(TicketStop); D = aliased(TicketStop)
+        O = aliased(TicketStop)
+        D = aliased(TicketStop)
 
         base = (
             db.session.query(
@@ -222,6 +489,8 @@ def commuter_tickets(user_id: int):
                 TicketSale.price,
                 TicketSale.paid,
                 TicketSale.passenger_type,
+                TicketSale.status,
+                TicketSale.voided,
                 Bus.identifier.label("bus"),
                 O.stop_name.label("origin"),
                 D.stop_name.label("destination"),
@@ -230,7 +499,6 @@ def commuter_tickets(user_id: int):
             .outerjoin(O, TicketSale.origin_stop_time_id == O.id)
             .outerjoin(D, TicketSale.destination_stop_time_id == D.id)
             .filter(TicketSale.user_id == user_id)
-            .filter(TicketSale.voided.is_(False))
             .filter(TicketSale.created_at.between(fr_dt, to_dt + timedelta(days=1)))
             .order_by(TicketSale.created_at.desc())
         )
@@ -238,24 +506,38 @@ def commuter_tickets(user_id: int):
         total = base.count()
         rows = base.offset((page - 1) * size).limit(size).all()
 
-        items = [{
-            "id": r.id,
-            "created_at": r.created_at.isoformat(),
-            "time": r.created_at.strftime("%Y-%m-%d %H:%M"),
-            "fare": f"{float(r.price or 0):.2f}",
-            "paid": bool(r.paid),
-            "passenger_type": (r.passenger_type or "regular"),
-            "bus": r.bus,
-            "origin": r.origin or "",
-            "destination": r.destination or "",
-        } for r in rows]
+        items = []
+        for r in rows:
+            is_void = bool(r.voided) or (str(r.status or "").lower() in {"void", "voided", "refunded", "cancelled"})
+            items.append(
+                {
+                    "id": r.id,
+                    "created_at": r.created_at.isoformat(),
+                    "time": r.created_at.strftime("%Y-%m-%d %H:%M"),
+                    "fare": f"{float(r.price or 0):.2f}",
+                    "paid": bool(r.paid) and not is_void,
+                    "status": (r.status or ("voided" if is_void else ("paid" if r.paid else "unpaid"))),
+                    "voided": is_void,
+                    "passenger_type": (r.passenger_type or "regular"),
+                    "bus": r.bus,
+                    "origin": r.origin or "",
+                    "destination": r.destination or "",
+                }
+            )
 
-        return jsonify({
-            "items": items,
-            "page": page, "page_size": size,
-            "total": total, "pages": (total + size - 1)//size
-        }), 200
-    except Exception as e:
+        return (
+            jsonify(
+                {
+                    "items": items,
+                    "page": page,
+                    "page_size": size,
+                    "total": total,
+                    "pages": (total + size - 1) // size,
+                }
+            ),
+            200,
+        )
+    except Exception:
         current_app.logger.exception("ERROR in commuter_tickets")
         return jsonify(error="Failed to load tickets"), 500
 
@@ -264,25 +546,27 @@ def commuter_tickets(user_id: int):
 @require_role("manager")
 def commuter_topups(user_id: int):
     try:
-        to_str   = request.args.get("to")
+        to_str = request.args.get("to")
         from_str = request.args.get("from")
-        page     = request.args.get("page", type=int, default=1)
-        size     = min(max(request.args.get("page_size", type=int, default=25), 1), 100)
+        page = request.args.get("page", type=int, default=1)
+        size = min(max(request.args.get("page_size", type=int, default=25), 1), 100)
 
         to_dt = datetime.strptime(to_str, "%Y-%m-%d") if to_str else datetime.utcnow()
         fr_dt = datetime.strptime(from_str, "%Y-%m-%d") if from_str else (to_dt - timedelta(days=30))
         offset = (page - 1) * size
 
         total_row = db.session.execute(
-            text("""
+            text(
+                """
                 SELECT COUNT(*) AS c
                 FROM wallet_topups t
                 WHERE t.account_id = :uid
                   AND t.status = 'succeeded'
                   AND t.created_at >= :fr
                   AND t.created_at <  :to_plus
-            """),
-            {"uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1)}
+            """
+            ),
+            {"uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1)},
         ).mappings().first() or {}
         total = int(total_row.get("c", 0))
 
@@ -330,23 +614,27 @@ def commuter_topups(user_id: int):
 
         rows = db.session.execute(
             text(sql),
-            {"uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1), "lim": size, "off": offset}
+            {"uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1), "lim": size, "off": offset},
         ).mappings().all()
 
-        items = [{
-            "id": r["id"],
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            "amount_php": float(r["amount_pesos"] or 0.0),
-            "method": r["method"],
-            "teller_id": r["teller_id"],
-            "teller_name": ("{} {}".format(r.get("teller_first") or "", r.get("teller_last") or "").strip() or None),
-        } for r in rows]
+        items = [
+            {
+                "id": r["id"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "amount_php": float(r["amount_pesos"] or 0.0),
+                "method": r["method"],
+                "teller_id": r["teller_id"],
+                "teller_name": ("{} {}".format(r.get("teller_first") or "", r.get("teller_last") or "").strip() or None),
+            }
+            for r in rows
+        ]
 
-        return jsonify({
-            "items": items,
-            "page": page, "page_size": size,
-            "total": total, "pages": (total + size - 1)//size
-        }), 200
+        return (
+            jsonify(
+                {"items": items, "page": page, "page_size": size, "total": total, "pages": (total + size - 1) // size}
+            ),
+            200,
+        )
 
     except Exception:
         current_app.logger.exception("ERROR in commuter_topups")
@@ -359,25 +647,25 @@ def manager_topups():
     from datetime import datetime as _dt
 
     # window
-    date_str  = (request.args.get("date") or "").strip()
+    date_str = (request.args.get("date") or "").strip()
     start_str = (request.args.get("start") or "").strip()
-    end_str   = (request.args.get("end") or "").strip()
+    end_str = (request.args.get("end") or "").strip()
     try:
         if date_str:
             day = _dt.strptime(date_str, "%Y-%m-%d").date()
             start_dt = _dt.combine(day, _dt.min.time())
-            end_dt   = _dt.combine(day, _dt.max.time())
+            end_dt = _dt.combine(day, _dt.max.time())
         elif start_str and end_str:
             sd = _dt.strptime(start_str, "%Y-%m-%d").date()
-            ed = _dt.strptime(end_str,   "%Y-%m-%d").date()
+            ed = _dt.strptime(end_str, "%Y-%m-%d").date()
             if ed < sd:
                 return jsonify(error="end must be >= start"), 400
             start_dt = _dt.combine(sd, _dt.min.time())
-            end_dt   = _dt.combine(ed, _dt.max.time())
+            end_dt = _dt.combine(ed, _dt.max.time())
         else:
             day = _dt.utcnow().date()
             start_dt = _dt.combine(day, _dt.min.time())
-            end_dt   = _dt.combine(day, _dt.max.time())
+            end_dt = _dt.combine(day, _dt.max.time())
     except ValueError:
         return jsonify(error="invalid date format (use YYYY-MM-DD)"), 400
 
@@ -444,23 +732,24 @@ def manager_topups():
     total_php = 0.0
     for r in rows:
         commuter_name = f"{(r['commuter_first'] or '').strip()} {(r['commuter_last'] or '').strip()}".strip() or None
-        teller_name   = f"{(r['teller_first']   or '').strip()} {(r['teller_last']   or '').strip()}".strip() or None
+        teller_name = f"{(r['teller_first'] or '').strip()} {(r['teller_last'] or '').strip()}".strip() or None
         amt = float(r["amount_pesos"] or 0.0)
         total_php += amt
-        items.append({
-            "id": int(r["id"]),
-            "created_at": r["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ") if r["created_at"] else None,
-            "amount_php": amt,
-            "method": r["method"] or "cash",
-            "status": r["status"],
-            "commuter_id": int(r["account_id"]) if r["account_id"] is not None else None,
-            "commuter_name": commuter_name,
-            "teller_id": int(r["teller_id"]) if r["teller_id"] is not None else None,
-            "teller_name": teller_name,
-        })
+        items.append(
+            {
+                "id": int(r["id"]),
+                "created_at": r["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ") if r["created_at"] else None,
+                "amount_php": amt,
+                "method": r["method"] or "cash",
+                "status": r["status"],
+                "commuter_id": int(r["account_id"]) if r["account_id"] is not None else None,
+                "commuter_name": commuter_name,
+                "teller_id": int(r["teller_id"]) if r["teller_id"] is not None else None,
+                "teller_name": teller_name,
+            }
+        )
 
     return jsonify(items=items, count=len(items), total_php=float(total_php)), 200
-
 
 
 @manager_bp.route("/revenue-breakdown", methods=["GET"])
@@ -468,7 +757,7 @@ def manager_topups():
 def revenue_breakdown():
     from datetime import datetime as _dt, timedelta as _td
 
-    paid_only = (request.args.get("paid_only", "true").lower() != "false")
+    paid_only = request.args.get("paid_only", "true").lower() != "false"
 
     trip_id = request.args.get("trip_id", type=int)
     if trip_id:
@@ -478,12 +767,12 @@ def revenue_breakdown():
         bus_id = trip.bus_id
         day = trip.service_date
         window_from = _dt.combine(day, trip.start_time)
-        window_to   = _dt.combine(day, trip.end_time)
+        window_to = _dt.combine(day, trip.end_time)
         if trip.end_time <= trip.start_time:
             window_to = window_to + _td(days=1)
     else:
         date_str = request.args.get("date")
-        bus_id   = request.args.get("bus_id", type=int)
+        bus_id = request.args.get("bus_id", type=int)
         if not (date_str and bus_id):
             return jsonify(error="trip_id OR (date, bus_id, from, to) required"), 400
         try:
@@ -492,11 +781,11 @@ def revenue_breakdown():
             return jsonify(error="invalid date format"), 400
         try:
             hhmm_from = request.args["from"]
-            hhmm_to   = request.args["to"]
+            hhmm_to = request.args["to"]
         except KeyError:
             return jsonify(error="from and to are required"), 400
         window_from = _dt.combine(day, _dt.strptime(hhmm_from, "%H:%M").time())
-        window_to   = _dt.combine(day, _dt.strptime(hhmm_to, "%H:%M").time())
+        window_to = _dt.combine(day, _dt.strptime(hhmm_to, "%H:%M").time())
         if window_to <= window_from:
             window_to = window_to + _td(days=1)
 
@@ -534,21 +823,28 @@ def revenue_breakdown():
     for g in by_type:
         pct_t = (g["tickets"] / totals_tickets * 100.0) if totals_tickets else 0.0
         pct_r = (g["revenue"] / totals_revenue * 100.0) if totals_revenue else 0.0
-        out.append({
-            "type": g["type"],
-            "tickets": g["tickets"],
-            "revenue": round(g["revenue"], 2),
-            "pct_tickets": round(pct_t, 1),
-            "pct_revenue": round(pct_r, 1),
-        })
+        out.append(
+            {
+                "type": g["type"],
+                "tickets": g["tickets"],
+                "revenue": round(g["revenue"], 2),
+                "pct_tickets": round(pct_t, 1),
+                "pct_revenue": round(pct_r, 1),
+            }
+        )
 
-    return jsonify({
-        "from": window_from.date().isoformat(),
-        "to": window_to.date().isoformat(),
-        "paid_only": bool(paid_only),
-        "totals": {"tickets": int(totals_tickets), "revenue": round(totals_revenue, 2)},
-        "by_type": sorted(out, key=lambda x: 0 if x["type"] == "regular" else 1),
-    }), 200
+    return (
+        jsonify(
+            {
+                "from": window_from.date().isoformat(),
+                "to": window_to.date().isoformat(),
+                "paid_only": bool(paid_only),
+                "totals": {"tickets": int(totals_tickets), "revenue": round(totals_revenue, 2)},
+                "by_type": sorted(out, key=lambda x: 0 if x["type"] == "regular" else 1),
+            }
+        ),
+        200,
+    )
 
 
 @manager_bp.route("/trips/<int:trip_id>", methods=["PATCH"])
@@ -567,14 +863,10 @@ def update_trip(trip_id: int):
 
         db.session.commit()
 
-        return jsonify(
-            id=trip.id,
-            number=trip.number,
-            start_time=trip.start_time.strftime("%H:%M"),
-            end_time=trip.end_time.strftime("%H:%M"),
-        ), 200
+        return jsonify(id=trip.id, number=trip.number, start_time=trip.start_time.strftime("%H:%M"), end_time=trip.end_time.strftime("%H:%M")), 200
     except (KeyError, ValueError):
         return jsonify(error="Invalid payload or missing required fields"), 400
+
 
 @manager_bp.route("/trips/<int:trip_id>", methods=["DELETE"])
 @require_role("manager")
@@ -592,7 +884,6 @@ def delete_trip(trip_id: int):
         return jsonify(error="Error deleting trip: " + str(e)), 500
 
 
-
 @manager_bp.route("/tickets/composition", methods=["GET"])
 @require_role("manager")
 def tickets_composition():
@@ -604,7 +895,7 @@ def tickets_composition():
     except ValueError:
         return jsonify(error="invalid date"), 400
 
-    ptype = func.coalesce(TicketSale.passenger_type, 'regular')
+    ptype = func.coalesce(TicketSale.passenger_type, "regular")
 
     rows = (
         db.session.query(ptype.label("ptype"), func.count(TicketSale.id))
@@ -649,6 +940,8 @@ def tickets_for_day():
             TicketSale.price,
             TicketSale.passenger_type,
             TicketSale.paid,
+            TicketSale.voided,
+            TicketSale.status,
             User.first_name,
             User.last_name,
             Bus.id.label("bus_id"),
@@ -657,11 +950,10 @@ def tickets_for_day():
             D.stop_name.label("destination"),
         )
         .outerjoin(User, TicketSale.user_id == User.id)
-        .join(Bus,  TicketSale.bus_id  == Bus.id)
-        .outerjoin(O, TicketSale.origin_stop_time_id      == O.id)
+        .join(Bus, TicketSale.bus_id == Bus.id)
+        .outerjoin(O, TicketSale.origin_stop_time_id == O.id)
         .outerjoin(D, TicketSale.destination_stop_time_id == D.id)
         .filter(func.date(TicketSale.created_at) == day)
-        .filter(TicketSale.voided.is_(False))
     )
     if bus_id_filter:
         qs = qs.filter(TicketSale.bus_id == bus_id_filter)
@@ -674,15 +966,14 @@ def tickets_for_day():
     def windows_for(bus_id: int):
         if bus_id not in trips_by_bus:
             trips_by_bus[bus_id] = (
-                Trip.query
-                .filter(Trip.bus_id == bus_id, Trip.service_date.in_([day, prev]))
+                Trip.query.filter(Trip.bus_id == bus_id, Trip.service_date.in_([day, prev]))
                 .order_by(Trip.start_time.asc())
                 .all()
             )
         wins = []
         for t in trips_by_bus[bus_id]:
             start = datetime.combine(t.service_date, t.start_time)
-            end   = datetime.combine(t.service_date, t.end_time)
+            end = datetime.combine(t.service_date, t.end_time)
             if t.end_time <= t.start_time:
                 end = end + timedelta(days=1)
             wins.append((t, start, end))
@@ -698,23 +989,28 @@ def tickets_for_day():
                 trip_window = f"{t.start_time.strftime('%H:%M')}–{t.end_time.strftime('%H:%M')}"
                 break
 
-        tickets.append({
-            "id": r.id,
-            "bus": r.bus,
-            "commuter": f"{(r.first_name or '')} {(r.last_name or '')}".strip() or "Guest",
-            "origin": r.origin or "",
-            "destination": r.destination or "",
-            "fare": f"{float(r.price):.2f}",
-            "paid": bool(r.paid),
-            "passenger_type": (r.passenger_type or "regular"),
-            "passengerType":  (r.passenger_type or "regular"),
-            "created_at": r.created_at.isoformat(),
-            "time": r.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-            "trip": trip_num,
-            "trip_window": trip_window,
-        })
+        is_void = bool(r.voided) or (str(r.status or "").lower() in {"void", "voided", "refunded", "cancelled"})
+        tickets.append(
+            {
+                "id": r.id,
+                "bus": r.bus,
+                "commuter": f"{(r.first_name or '')} {(r.last_name or '')}".strip() or "Guest",
+                "origin": r.origin or "",
+                "destination": r.destination or "",
+                "fare": f"{float(r.price):.2f}",
+                "paid": bool(r.paid) and not is_void,
+                "status": (r.status or ("voided" if is_void else ("paid" if r.paid else "unpaid"))),
+                "passenger_type": (r.passenger_type or "regular"),
+                "passengerType": (r.passenger_type or "regular"),
+                "voided": is_void,
+                "created_at": r.created_at.isoformat(),
+                "time": r.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+                "trip": trip_num,
+                "trip_window": trip_window,
+            }
+        )
 
-    total = sum(float(r.price or 0) for r in rows)
+    total = sum(float(r.price or 0) for r in rows if not (bool(r.voided) or (str(r.status or "").lower() in {"void", "voided", "refunded", "cancelled"})))
     return jsonify(tickets=tickets, total=f"{total:.2f}"), 200
 
 
@@ -741,7 +1037,7 @@ def list_buses():
                 }
             )
         return jsonify(out), 200
-    except Exception as e:
+    except Exception:
         current_app.logger.exception("ERROR in /manager/buses")
         return jsonify(error="Could not process the request to list buses."), 500
 
@@ -756,7 +1052,7 @@ def route_data_insights():
 
     def _trip_window(day_, start_t, end_t):
         start_dt = _dt.combine(day_, start_t)
-        end_dt   = _dt.combine(day_, end_t)
+        end_dt = _dt.combine(day_, end_t)
         if end_t <= start_t:
             end_dt = end_dt + _td(days=1)
         return start_dt, end_dt
@@ -776,9 +1072,12 @@ def route_data_insights():
             if snap:
                 use_snapshot = True
                 metrics = dict(
-                    avg_pax=snap.avg_pax, peak_pax=snap.peak_pax,
-                    boarded=snap.boarded, alighted=snap.alighted,
-                    start_pax=snap.start_pax, end_pax=snap.end_pax,
+                    avg_pax=snap.avg_pax,
+                    peak_pax=snap.peak_pax,
+                    boarded=snap.boarded,
+                    alighted=snap.alighted,
+                    start_pax=snap.start_pax,
+                    end_pax=snap.end_pax,
                     net_change=snap.end_pax - snap.start_pax,
                 )
             else:
@@ -805,18 +1104,20 @@ def route_data_insights():
             return jsonify(error="invalid date format"), 400
 
         try:
-            start = request.args["from"]; end = request.args["to"]
+            start = request.args["from"]
+            end = request.args["to"]
         except KeyError:
             return jsonify(error="from and to are required when trip_id is omitted"), 400
 
         window_from = _dt.combine(day, _dt.strptime(start, "%H:%M").time())
-        window_to   = _dt.combine(day, _dt.strptime(end, "%H:%M").time())
+        window_to = _dt.combine(day, _dt.strptime(end, "%H:%M").time())
         if window_to <= window_from:
             window_to = window_to + _td(days=1)
         window_end_excl = window_to + _td(minutes=1)
 
         meta = {
-            "trip_id": None, "trip_number": None,
+            "trip_id": None,
+            "trip_number": None,
             "window_from": window_from.isoformat(),
             "window_to": window_to.isoformat(),
         }
@@ -839,37 +1140,27 @@ def route_data_insights():
         .all()
     )
 
-    series = [{
-        "time": r.hhmm,
-        "passengers": int(r.pax or 0),
-        "in": int(r.ins or 0),
-        "out": int(r.outs or 0),
-    } for r in occ_rows]
+    series = [{"time": r.hhmm, "passengers": int(r.pax or 0), "in": int(r.ins or 0), "out": int(r.outs or 0)} for r in occ_rows]
 
     if not metrics:
         pax_values = [p["passengers"] for p in series]
-        avg_pax  = round(sum(pax_values) / len(pax_values)) if pax_values else 0
+        avg_pax = round(sum(pax_values) / len(pax_values)) if pax_values else 0
         peak_pax = max(pax_values) if pax_values else 0
-        boarded  = sum(p["in"] for p in series)
+        boarded = sum(p["in"] for p in series)
         alighted = sum(p["out"] for p in series)
         start_pax = pax_values[0] if pax_values else 0
-        end_pax   = pax_values[-1] if pax_values else 0
+        end_pax = pax_values[-1] if pax_values else 0
         metrics = {
-            "avg_pax":   avg_pax,
-            "peak_pax":  peak_pax,
-            "boarded":   boarded,
-            "alighted":  alighted,
+            "avg_pax": avg_pax,
+            "peak_pax": peak_pax,
+            "boarded": boarded,
+            "alighted": alighted,
             "start_pax": start_pax,
-            "end_pax":   end_pax,
+            "end_pax": end_pax,
             "net_change": end_pax - start_pax,
         }
 
-    return jsonify(
-        occupancy=series,
-        meta=meta,
-        metrics=metrics,
-        snapshot=use_snapshot
-    ), 200
+    return jsonify(occupancy=series, meta=meta, metrics=metrics, snapshot=use_snapshot), 200
 
 
 @manager_bp.route("/metrics/tickets", methods=["GET"])
@@ -901,9 +1192,7 @@ def ticket_metrics():
     total_tickets = 0
     total_revenue = 0.0
     for r in rows:
-        daily.append(
-            {"date": r.d, "tickets": int(r.tickets), "revenue": float(r.revenue or 0)}
-        )
+        daily.append({"date": r.d, "tickets": int(r.tickets), "revenue": float(r.revenue or 0)})
         total_tickets += int(r.tickets)
         total_revenue += float(r.revenue or 0)
 
@@ -951,14 +1240,10 @@ def upload_qr():
 @manager_bp.route("/qr-templates", methods=["GET"])
 @require_role("manager")
 def list_qr():
-    return jsonify([
-        {
-            "id": t.id,
-            "url": f"/manager/qr-templates/{t.id}/file",
-            "price": f"{t.price:.2f}",
-        }
-        for t in QRTemplate.query.order_by(QRTemplate.created_at.desc())
-    ]), 200
+    return (
+        jsonify([{"id": t.id, "url": f"/manager/qr-templates/{t.id}/file", "price": f"{t.price:.2f}"} for t in QRTemplate.query.order_by(QRTemplate.created_at.desc())]),
+        200,
+    )
 
 
 @manager_bp.route("/qr-templates/<int:tpl_id>/file", methods=["GET"])
@@ -971,14 +1256,12 @@ def serve_qr_file(tpl_id):
 @require_role("manager")
 def list_fare_segments():
     rows = FareSegment.query.order_by(FareSegment.id).all()
-    return jsonify([
-        {
-            "id": s.id,
-            "label": f"{s.origin.stop_name} → {s.destination.stop_name}",
-            "price": f"{s.price:.2f}",
-        }
-        for s in rows
-    ]), 200
+    return (
+        jsonify(
+            [{"id": s.id, "label": f"{s.origin.stop_name} → {s.destination.stop_name}", "price": f"{s.price:.2f}"} for s in rows]
+        ),
+        200,
+    )
 
 
 @manager_bp.route("/sensor-readings", methods=["POST"])
@@ -1034,19 +1317,23 @@ def list_bus_readings(device_id: str):
         .all()
     )
 
-    return jsonify([
-        {
-            "id": r.id,
-            "timestamp": r.timestamp.isoformat(),
-            "in_count": r.in_count,
-            "out_count": r.out_count,
-            "total_count": r.total_count,
-        }
-        for r in readings
-    ]), 200
+    return (
+        jsonify(
+            [
+                {
+                    "id": r.id,
+                    "timestamp": r.timestamp.isoformat(),
+                    "in_count": r.in_count,
+                    "out_count": r.out_count,
+                    "total_count": r.total_count,
+                }
+                for r in readings
+            ]
+        ),
+        200,
+    )
 
 
-# ⬇️ list trips for a bus on a given service_date
 @manager_bp.route("/bus-trips", methods=["GET"])
 @require_role("manager")
 def list_bus_trips():
@@ -1062,23 +1349,19 @@ def list_bus_trips():
         return jsonify(error="invalid date format"), 400
 
     trips = (
-        Trip.query
-        .filter(Trip.bus_id == bus_id, Trip.service_date == day)
+        Trip.query.filter(Trip.bus_id == bus_id, Trip.service_date == day)
         .order_by(Trip.start_time.asc())
         .all()
     )
 
-    return jsonify([
-        {
-            "id": t.id,
-            "number": t.number,
-            "start_time": t.start_time.strftime("%H:%M"),
-            "end_time": t.end_time.strftime("%H:%M"),
-        }
-        for t in trips
-    ]), 200
+    return (
+        jsonify(
+            [{"id": t.id, "number": t.number, "start_time": t.start_time.strftime("%H:%M"), "end_time": t.end_time.strftime("%H:%M")} for t in trips]
+        ),
+        200,
+    )
 
-# ⬇️ create a new trip
+
 @manager_bp.route("/trips", methods=["POST"])
 @require_role("manager")
 def create_trip():
@@ -1089,8 +1372,8 @@ def create_trip():
 
     try:
         service_date = datetime.strptime(str(data["service_date"]), "%Y-%m-%d").date()
-        start_time   = datetime.strptime(str(data["start_time"]),   "%H:%M").time()
-        end_time     = datetime.strptime(str(data["end_time"]),     "%H:%M").time()
+        start_time = datetime.strptime(str(data["start_time"]), "%H:%M").time()
+        end_time = datetime.strptime(str(data["end_time"]), "%H:%M").time()
     except ValueError:
         return jsonify(error="Invalid date/time format"), 400
 
@@ -1104,10 +1387,7 @@ def create_trip():
     if end_time <= start_time:
         return jsonify(error="end_time must be after start_time"), 400
 
-    existing = Trip.query.filter(
-        Trip.bus_id == bus_id,
-        Trip.service_date == service_date
-    ).all()
+    existing = Trip.query.filter(Trip.bus_id == bus_id, Trip.service_date == service_date).all()
 
     ns = datetime.combine(service_date, start_time)
     ne = datetime.combine(service_date, end_time)
@@ -1116,29 +1396,22 @@ def create_trip():
         s = datetime.combine(service_date, t.start_time)
         e = datetime.combine(service_date, t.end_time)
         if max(s, ns) < min(e, ne):  # overlap
-            return jsonify(
-                error=f"Overlaps with {t.number} ({t.start_time.strftime('%H:%M')}–{t.end_time.strftime('%H:%M')})"
-            ), 409
+            return (
+                jsonify(error=f"Overlaps with {t.number} ({t.start_time.strftime('%H:%M')}–{t.end_time.strftime('%H:%M')})"),
+                409,
+            )
 
-    trip = Trip(
-        bus_id=bus_id,
-        service_date=service_date,
-        number=number,
-        start_time=start_time,
-        end_time=end_time,
-    )
+    trip = Trip(bus_id=bus_id, service_date=service_date, number=number, start_time=start_time, end_time=end_time)
 
     try:
         db.session.add(trip)
         db.session.commit()
-    except Exception as e:
+    except Exception:
         db.session.rollback()
         current_app.logger.exception("ERROR creating trip")
         return jsonify(error="Failed to create trip"), 500
 
-    return jsonify(
-        id=trip.id,
-        number=trip.number,
-        start_time=trip.start_time.strftime("%H:%M"),
-        end_time=trip.end_time.strftime("%H:%M"),
-    ), 201
+    return (
+        jsonify(id=trip.id, number=trip.number, start_time=trip.start_time.strftime("%H:%M"), end_time=trip.end_time.strftime("%H:%M")),
+        201,
+    )

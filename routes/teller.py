@@ -2,19 +2,19 @@
 from __future__ import annotations
 
 import os
+import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
-from flask import Blueprint, request, jsonify, g, current_app, url_for
-from sqlalchemy import func
-from sqlalchemy.orm import joinedload, aliased
-from models.device_token import DeviceToken
-from utils.push import push_to_user
+from flask import Blueprint, request, jsonify, current_app, url_for
+from sqlalchemy.orm import aliased
+
 from db import db
 from models.user import User
 from models.wallet import WalletAccount, WalletLedger, TopUp
-
-# Auth decorator (support both import paths)
+from models.device_token import DeviceToken
+from utils.push import push_to_user
+from sqlalchemy import func
 try:
     from routes.auth import require_role
 except Exception:
@@ -22,6 +22,15 @@ except Exception:
 
 # Wallet services (operator-less)
 from services.wallet import topup_cash, topup_gcash, approve_topup_existing
+
+# Optional realtime publish (best-effort / no-op if module missing)
+try:
+    from mqtt_ingest import publish as mqtt_publish  # def publish(topic: str, payload: dict) -> None
+except Exception:
+    mqtt_publish = None
+
+# For verifying commuter QR tokens (must match routes/commuter.py)
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 teller_bp = Blueprint("teller", __name__, url_prefix="/teller")
 
@@ -37,6 +46,10 @@ MAX_TOPUP = 1000
 
 # Where commuter receipts are stored by /commuter/topup-requests
 RECEIPTS_DIR = "topup_receipts"
+
+# Must match SALT_USER_QR in routes/commuter.py
+SALT_USER_QR = "user-qr-v1"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Small helpers
@@ -78,6 +91,96 @@ def _receipt_url_if_exists(tid: int) -> Optional[str]:
     return None
 
 
+def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extra) -> bool:
+    """
+    Best-effort realtime wallet update for the commuter's device(s).
+    Mirrors the PAO/commuter payload shape so clients can reuse handlers.
+    """
+    if not mqtt_publish:
+        return False
+    try:
+        payload = {
+            "type": "wallet_update",
+            "event": event,  # "wallet_topup" | "wallet_debit" | ...
+            "new_balance_php": int(new_balance_pesos),
+            "sentAt": int(_time.time() * 1000),
+            **extra,
+        }
+        mqtt_publish(f"user/{uid}/wallet", payload)
+        return True
+    except Exception:
+        current_app.logger.exception("[mqtt] teller wallet publish failed")
+        return False
+
+
+def _unsign_user_qr(token: str, *, max_age: Optional[int] = None) -> int:
+    """
+    Returns the user id encoded in commuter QR token from /commuter/users/me/qr.png.
+    """
+    s = URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt=SALT_USER_QR)
+    data = s.loads(token, max_age=max_age) if max_age else s.loads(token)
+    uid = int(data.get("uid"))
+    if uid <= 0:
+        raise ValueError("bad uid")
+    return uid
+
+
+def _ensure_wallet_row(user_id: int) -> int:
+    """
+    Ensure wallet_accounts row exists; return current balance (pesos).
+    """
+    acct = WalletAccount.query.get(user_id)
+    if not acct:
+        acct = WalletAccount(user_id=user_id, balance_pesos=0)
+        db.session.add(acct)
+        db.session.commit()
+        return 0
+    return _as_php(getattr(acct, "balance_pesos", 0))
+
+
+def _debug_log_push(uid: int, payload: dict):
+    try:
+        toks = (
+            db.session.query(DeviceToken.platform, DeviceToken.token)
+            .filter(DeviceToken.user_id == uid)
+            .all()
+        )
+        sample = [(p or "?", (t or "")[:16] + "…") for (p, t) in toks]
+        current_app.logger.info(
+            "[push][debug] target uid=%s tokens=%s sample=%s payload_keys=%s",
+            uid, len(toks), sample, sorted(list(payload.keys())),
+        )
+    except Exception:
+        current_app.logger.exception("[push][debug] failed to list tokens")
+
+@teller_bp.route("/users/scan", methods=["GET"])
+@require_role("teller")  # adjust if your PAO role is used to scan
+def user_qr_scan():
+    """
+    GET /teller/users/scan?token=...
+    Verifies commuter QR token and returns minimal identity for display before charging.
+    """
+    tok = (request.args.get("token") or "").strip()
+    if not tok:
+        return jsonify(error="token required"), 400
+    try:
+        uid = _unsign_user_qr(tok)  # token minted by commuter qr endpoint
+    except (BadSignature, SignatureExpired, ValueError):
+        return jsonify(error="invalid token"), 400
+
+    user = User.query.get(uid)
+    if not user:
+        return jsonify(error="not found"), 404
+
+    bal = _ensure_wallet_row(uid)
+    return jsonify(
+        id=user.id,
+        name=_user_name(user),
+        balance_pesos=int(bal),
+        balance_php=int(bal),
+    ), 200
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Requests list/detail + approve/reject
 
@@ -89,7 +192,7 @@ def list_topup_requests():
     Returns: { items: [...] } matching the shape used by the Teller lists.
     """
     status = (request.args.get("status") or "pending").strip().lower()
-    limit  = max(1, min(200, request.args.get("limit", type=int, default=50)))
+    limit = max(1, min(200, request.args.get("limit", type=int, default=50)))
 
     U = aliased(User)
     rows = (
@@ -152,7 +255,8 @@ def approve_topup(tid: int):
       - credits the wallet,
       - writes a ledger row (ref_table='wallet_topups', ref_id=tid),
       - marks topup.status='succeeded',
-      - sends a push notification to the commuter.
+      - sends a push notification to the commuter,
+      - best-effort realtime publish for instant UI.
 
     Returns 200 with { ok, topup_id, ledger_id, new_balance_php, status }.
     """
@@ -177,8 +281,20 @@ def approve_topup(tid: int):
             "status": "succeeded",
         }
 
-        # 🔔 Notify commuter immediately (best-effort)
+        # 🔔 Notify commuter immediately (push + realtime publish; best-effort)
         try:
+            sent_at = int(_time.time() * 1000)
+
+            _debug_log_push(int(t.account_id), {
+                "type": "wallet_topup",
+                "method": t.method,
+                "amount_php": int(t.amount_pesos or 0),
+                "topup_id": int(t.id),
+                "ledger_id": int(ledger_id),
+                "new_balance_php": int(new_balance),
+                "deeplink": "/(tabs)/commuter/wallet",
+            })
+            # push (consumed by appEvents 'push' listener for instantaneous UI)
             push_to_user(
                 db, DeviceToken, int(t.account_id),
                 "🪙 Wallet top-up approved",
@@ -189,8 +305,19 @@ def approve_topup(tid: int):
                     "method": t.method,
                     "amount_php": int(t.amount_pesos or 0),
                     "topup_id": int(t.id),
+                    "ledger_id": int(ledger_id),
                     "new_balance_php": int(new_balance),
-                    "deeplink": "/commuter/wallet",
+                    "deeplink": "/(tabs)/commuter/wallet",
+                    "sentAt": sent_at,
+                    # Let client show an optimistic row in "Recent Activity"
+                    "ledger_hint": {
+                        "direction": "credit",
+                        "event": f"topup:{t.method or 'cash'}",
+                        "amount_php": int(t.amount_pesos or 0),
+                        "running_balance_php": int(new_balance),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "ref": {"table": "wallet_topups", "id": int(t.id)},
+                    },
                     # Optionally include a receipt preview URL if you store it:
                     # "receipt_url": _receipt_url_if_exists(t.id),
                 },
@@ -198,8 +325,18 @@ def approve_topup(tid: int):
                 priority="high",
                 ttl=600,
             )
+
+            # MQTT realtime (for any connected clients/widgets)
+            _publish_user_wallet(
+                int(t.account_id),
+                new_balance_pesos=int(new_balance),
+                event="wallet_topup",
+                amount_php=int(t.amount_pesos or 0),
+                topup_id=int(t.id),
+                ledger_id=int(ledger_id),
+            )
         except Exception:
-            current_app.logger.exception("[push] approve_topup push failed")
+            current_app.logger.exception("[push] approve_topup push/mqtt failed")
 
         return jsonify(payload), 200
 
@@ -358,6 +495,8 @@ def wallet_overview(user_id: int):
         "recent_topups": recent_topups,
         "recent_ledger": recent_ledger,
     }), 200
+
+
 @teller_bp.route("/wallet/topups", methods=["POST"])
 @require_role("teller")
 def create_topup():
@@ -365,21 +504,30 @@ def create_topup():
     Create an immediate wallet top-up for a commuter (bypasses 'pending').
 
     Body (JSON):
-      - user_id (int)
+      - user_id (int) OR token (signed commuter QR token from /commuter/users/me/qr.png)
       - method: 'cash' | 'gcash'
       - amount_pesos (int)  OR amount_php (alias)
       - external_ref (optional, for gcash receipts / reference nos.)
 
     Returns 201 with { ok, topup_id, ledger_id, new_balance_php }.
-    Also sends a push notification to the commuter on success.
+    Also sends a push notification to the commuter on success and a realtime publish.
     """
     data = request.get_json(silent=True) or {}
 
-    # Validate target wallet
-    try:
-        account_user_id = int(data.get("user_id"))
-    except Exception:
-        return jsonify(error="invalid user_id"), 400
+    # Resolve target wallet from user_id or signed QR token
+    account_user_id: Optional[int] = None
+    if data.get("user_id") is not None:
+        try:
+            account_user_id = int(data.get("user_id"))
+        except Exception:
+            return jsonify(error="invalid user_id"), 400
+    elif (data.get("token") or "").strip():
+        try:
+            account_user_id = _unsign_user_qr((data.get("token") or "").strip())
+        except (BadSignature, SignatureExpired, ValueError):
+            return jsonify(error="invalid token"), 400
+    else:
+        return jsonify(error="user_id or token is required"), 400
 
     # Validate method + amount
     method = str(data.get("method") or "cash").strip().lower()
@@ -390,6 +538,9 @@ def create_topup():
 
     if amount_pesos < MIN_TOPUP or amount_pesos > MAX_TOPUP:
         return jsonify(error=f"amount must be between {MIN_TOPUP} and {MAX_TOPUP}"), 400
+
+    # Ensure wallet row exists (creates if missing)
+    _ensure_wallet_row(account_user_id)
 
     # Execute the credit
     try:
@@ -415,8 +566,19 @@ def create_topup():
             "new_balance_php": int(round(float(new_bal))),
         }
 
-        # 🔔 Fire a push to the commuter (best-effort; don't fail the request if this errors)
+        # 🔔 Push + realtime publish (best-effort; don't fail the request if this errors)
         try:
+            sent_at = int(_time.time() * 1000)
+
+            _debug_log_push(account_user_id, {
+                "type": "wallet_topup",
+                "method": method,
+                "amount_php": int(amount_pesos),
+                "topup_id": int(topup_id),
+                "ledger_id": int(ledger_id),
+                "new_balance_php": int(round(float(new_bal))),
+                "deeplink": "/(tabs)/commuter/wallet",
+            })
             push_to_user(
                 db, DeviceToken, account_user_id,
                 "🪙 Wallet top-up received",
@@ -427,15 +589,35 @@ def create_topup():
                     "method": method,
                     "amount_php": int(amount_pesos),
                     "topup_id": int(topup_id),
+                    "ledger_id": int(ledger_id),
                     "new_balance_php": int(round(float(new_bal))),
-                    "deeplink": "/commuter/wallet",
+                    "deeplink": "/(tabs)/commuter/wallet",
+                    "sentAt": sent_at,
+                    # Optimistic "Recent Activity" hint for the client:
+                    "ledger_hint": {
+                        "direction": "credit",
+                        "event": f"topup:{method}",
+                        "amount_php": int(amount_pesos),
+                        "running_balance_php": int(round(float(new_bal))),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "ref": {"table": "wallet_topups", "id": int(topup_id)},
+                    },
                 },
                 channelId="payments",
                 priority="high",
                 ttl=600,
             )
+
+            _publish_user_wallet(
+                account_user_id,
+                new_balance_pesos=int(round(float(new_bal))),
+                event="wallet_topup",
+                amount_php=int(amount_pesos),
+                topup_id=int(topup_id),
+                ledger_id=int(ledger_id),
+            )
         except Exception:
-            current_app.logger.exception("[push] wallet_topup push failed")
+            current_app.logger.exception("[push] wallet_topup push/mqtt failed")
 
         return jsonify(payload), 201
 

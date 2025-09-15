@@ -7,7 +7,8 @@ from flask import (
     Blueprint, request, jsonify, g, current_app, url_for,
     redirect, send_file, make_response
 )
-from sqlalchemy import func, text
+from sqlalchemy import func, text, or_
+
 from sqlalchemy.orm import joinedload
 from models.wallet import WalletAccount, WalletLedger, TopUp
 from utils.wallet_qr import build_wallet_token
@@ -98,6 +99,25 @@ def _save_receipt(file_storage, topup_id: int) -> Optional[str]:
 def _receipt_abs_path(tid: int, ext: str) -> str:
     safe = f"{tid}{ext.lower()}"
     return os.path.join(current_app.root_path, "static", RECEIPTS_DIR, safe)
+def _is_ticket_void(t) -> bool:
+    """
+    Robustly determine if a ticket is voided, regardless of schema.
+    True if:
+      - a boolean/integer column 'voided' exists and is truthy, OR
+      - a 'status' column exists and is one of: void, voided, refunded, cancelled.
+    """
+    try:
+        if bool(getattr(t, "voided", False)):
+            return True
+    except Exception:
+        pass
+    try:
+        st = (getattr(t, "status", None) or "").strip().lower()
+        if st in {"void", "voided", "refunded", "cancelled"}:
+            return True
+    except Exception:
+        pass
+    return False
 
 def _receipt_url_if_exists(tid: int) -> str | None:
     for ext in (".jpg", ".jpeg", ".png", ".webp"):
@@ -392,9 +412,11 @@ def commuter_ticket_image(ticket_id: int):
     """
     High-contrast, LARGE-TYPE JPG receipt renderer.
 
-    Now supports both:
+    Supports both:
       • legacy "batch" (multiple TicketSale rows tied by batch_id), and
-      • new single-row "group" tickets with is_group/group_* columns.
+      • single-row "group" tickets with is_group/group_* columns.
+
+    Also renders VOIDED tickets (refunded to wallet).
     """
     t = (
         TicketSale.query.options(
@@ -441,7 +463,6 @@ def commuter_ticket_image(ticket_id: int):
         .scalar()
     issuer_id = issuer_via_field or issuer_via_bus
 
-    # ───────────────────────────────────────────────────────────────────
     # Group-aware details (single-row model)
     is_group = bool(getattr(t, "is_group", False))
     g_reg = int(getattr(t, "group_regular", 0) or 0)
@@ -463,7 +484,6 @@ def commuter_ticket_image(ticket_id: int):
     # Build "batch-like" summary for the renderer
     if is_group and group_qty > 1:
         batch_qty = group_qty
-        # Prefer recomputed totals when we know per-type fares; else fall back to ticket total
         if reg_each is not None and dis_each is not None:
             total_by_types = (g_reg * reg_each) + (g_dis * dis_each)
             batch_total = total_by_types if total_by_types > 0 else total_pesos
@@ -544,7 +564,7 @@ def commuter_ticket_image(ticket_id: int):
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-    # ─── Drawing (unchanged styling, but tweaks for group display) ────────────
+    # ─── Drawing ────────────────────────────────────────────────────────────
     W, H = 1440, 2200
     M = 80
     DARK_GREEN    = (21, 87, 36)
@@ -558,6 +578,10 @@ def commuter_ticket_image(ticket_id: int):
     BG_PAPER      = (250, 251, 252)
     SUCCESS_BG    = (212, 237, 218)
     SUCCESS_TEXT  = (21, 87, 36)
+    WARN_BG       = (255, 243, 205)
+    WARN_TEXT     = (133, 100, 4)
+    DANGER_BG     = (248, 215, 218)
+    DANGER_TEXT   = (114, 28, 36)
 
     bg = Image.new("RGB", (W, H), BG_PAPER)
     draw = ImageDraw.Draw(bg)
@@ -653,6 +677,13 @@ def commuter_ticket_image(ticket_id: int):
     draw.rectangle((L, y, R, y + 4), fill=BORDER_LIGHT)
     y += 48
 
+    # Robust "voided" check (use module helper if present)
+    try:
+        is_void = _is_ticket_void(t)  # type: ignore[name-defined]
+    except NameError:
+        st = (getattr(t, "status", None) or "").strip().lower()
+        is_void = bool(getattr(t, "voided", False)) or st in {"void", "voided", "refunded", "cancelled"}
+
     # amount + pill (NO CENTS)
     amount_y = y
     if ft_label:
@@ -661,17 +692,33 @@ def commuter_ticket_image(ticket_id: int):
         fare_pesos = total_pesos
         draw.text((L, amount_y + 44), f"₱{fare_pesos}", fill=ACCENT_GREEN, font=ft_big)
 
+    # State pill (PAID / UNPAID / VOIDED)
     state_txt = "PAID"
+    pill_bg = SUCCESS_BG
+    pill_fg = SUCCESS_TEXT
+    if not bool(t.paid):
+        state_txt = "UNPAID"
+        pill_bg = WARN_BG
+        pill_fg = WARN_TEXT
+    if is_void:
+        state_txt = "VOIDED"
+        pill_bg = DANGER_BG
+        pill_fg = DANGER_TEXT
+
     if ft_header:
         pill_w = int(tw(state_txt, ft_header) + 64)
         pill_h = 76
         pill_x1 = R - pill_w
         pill_y1 = amount_y + 8
-        draw.rectangle((pill_x1 + 14, pill_y1, pill_x1 + pill_w - 14, pill_y1 + pill_h), fill=SUCCESS_BG)
-        draw.rectangle((pill_x1, pill_y1 + 14, pill_x1 + pill_w, pill_y1 + pill_h - 14), fill=SUCCESS_BG)
+        draw.rectangle((pill_x1 + 14, pill_y1, pill_x1 + pill_w - 14, pill_y1 + pill_h), fill=pill_bg)
+        draw.rectangle((pill_x1, pill_y1 + 14, pill_x1 + pill_w, pill_y1 + pill_h - 14), fill=pill_bg)
         text_x = pill_x1 + (pill_w - tw(state_txt, ft_header)) // 2
         text_y = pill_y1 + (pill_h - 60) // 2
-        draw.text((text_x, text_y), state_txt, fill=SUCCESS_TEXT, font=ft_header)
+        draw.text((text_x, text_y), state_txt, fill=pill_fg, font=ft_header)
+
+    # Add a small hint below amount when voided
+    if is_void and ft_medium:
+        draw.text((L, amount_y + 44 + 96), "Refunded to wallet", fill=TEXT_MEDIUM, font=ft_medium)
 
     y += 170
 
@@ -692,8 +739,10 @@ def commuter_ticket_image(ticket_id: int):
     right_y = y + 24
     if ft_label:
         draw.text((right_x, right_y), "PAYMENT STATUS", fill=TEXT_MUTED, font=ft_label)
+
+    right_status_color = pill_fg  # mirror pill color
     if ft_header:
-        draw.text((right_x, right_y + 44), state_txt, fill=ACCENT_GREEN, font=ft_header)
+        draw.text((right_x, right_y + 44), state_txt, fill=right_status_color, font=ft_header)
 
     info_y = right_y + 140
     info_items = [
@@ -788,11 +837,14 @@ def commuter_ticket_image(ticket_id: int):
         resp.headers["X-Debug-Group-Regular"] = str(g_reg)
         resp.headers["X-Debug-Group-Discount"] = str(g_dis)
         resp.headers["X-Debug-Group-Qty"] = str(group_qty)
+        # surface state in headers too
+        resp.headers["X-Debug-State"] = ("voided" if is_void else ("paid" if bool(t.paid) else "unpaid"))
     except Exception:
         pass
     resp.headers["Cache-Control"] = "public, max-age=86400"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
+
 
 def _is_unknown_col(err: Exception) -> bool:
     # MySQL error code for "Unknown column": 1054
@@ -1010,17 +1062,17 @@ def save_device_token():
     if not token:
         return jsonify(error="token required"), 400
 
-    created = False
     row = DeviceToken.query.filter_by(user_id=g.user.id, token=token).first()
     if not row:
-        row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
+        row = DeviceToken(user_id=g.user.id, token=token, platform=platform, provider="expo")
         db.session.add(row)
     else:
         row.platform = platform or row.platform
     db.session.commit()
-    current_app.logger.info(f"[push] saved token token={token[:12]}… uid={g.user.id} created={created} platform={row.platform}")
-    return jsonify(ok=True, created=created), (201 if created else 200)
 
+    current_app.logger.info("[push] saved token uid=%s platform=%s token=%s…",
+                            g.user.id, platform, token[:16])
+    return jsonify(ok=True), 200
 @commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
 def qr_image_for_ticket(ticket_id: int):
     t = TicketSale.query.get_or_404(ticket_id)
@@ -1082,7 +1134,7 @@ def commuter_get_ticket(ticket_id: int):
     if not t:
         return jsonify(error="ticket not found"), 404
 
-    # Resolve names
+    # Resolve stop names + (optional) seq (for per-type fare estimates)
     if t.origin_stop_time:
         origin_name = t.origin_stop_time.stop_name
         o_seq = getattr(t.origin_stop_time, "seq", None)
@@ -1139,6 +1191,13 @@ def commuter_get_ticket(ticket_id: int):
 
     issuer_id = getattr(t, "issued_by", None) or getattr(g, "user", None).id
 
+    # Robust "voided" check (use module helper if present)
+    try:
+        is_void = _is_ticket_void(t)  # type: ignore[name-defined]
+    except NameError:
+        st = (getattr(t, "status", None) or "").strip().lower()
+        is_void = bool(getattr(t, "voided", False)) or st in {"void", "voided", "refunded", "cancelled"}
+
     out = {
         "id": t.id,
         "referenceNo": t.reference_no,
@@ -1149,7 +1208,9 @@ def commuter_get_ticket(ticket_id: int):
         "passengerType": (t.passenger_type or "").title(),
         "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "Guest",
         "fare": total_pesos,
-        "paid": bool(t.paid),
+        "paid": bool(t.paid) and not is_void,           # never show paid=true when voided
+        "voided": bool(is_void),
+        "state": ("voided" if is_void else ("paid" if bool(t.paid) else "unpaid")),
         "qr": payload,
         "qr_link": qr_link,
         "qr_url": qr_url,
@@ -1166,7 +1227,6 @@ def commuter_get_ticket(ticket_id: int):
         } if is_group else None,
     }
     return jsonify(out), 200
-
 
 
 @commuter_bp.route("/dashboard", methods=["GET"])
