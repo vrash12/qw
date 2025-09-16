@@ -116,30 +116,40 @@ def login():
 
     return jsonify(error='Invalid username or password'), 401
 
+def require_role(*roles):
+    """
+    Usage:
+      @require_role("teller")                 -> only teller
+      @require_role("teller", "pao")          -> either teller or pao
+      @require_role()                         -> any authenticated user
+    An 'admin' user is always allowed.
+    """
+    # Support a single iterable too: @require_role(["teller","pao"])
+    if len(roles) == 1 and isinstance(roles[0], (list, tuple, set)):
+        roles = tuple(roles[0])
 
-def require_role(role):
+    allowed = {str(r).lower() for r in roles if r}
+
     def decorator(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            token = None
-            if 'Authorization' in request.headers:
-                try:
-                    token = request.headers['Authorization'].split(" ")[1]
-                except IndexError:
-                    return jsonify(error="Malformed Authorization header"), 401
-
-            if not token:
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
                 return jsonify(error="Missing token"), 401
 
+            token = auth.split(" ", 1)[1]
             try:
                 payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-                user_id = payload['user_id']
+                user_id = payload.get("user_id")
                 current_user = User.query.get(user_id)
                 if not current_user:
                     return jsonify(error="User not found"), 401
 
                 g.user = current_user
-                if current_user.role != role:
+
+                user_role = (current_user.role or "").lower()
+                # If roles were provided, enforce them; if none were provided, just require auth.
+                if allowed and user_role not in allowed and user_role != "admin":
                     return jsonify(error="Insufficient permissions"), 403
 
             except jwt.ExpiredSignatureError:
