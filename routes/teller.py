@@ -6,7 +6,7 @@ import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
-from flask import Blueprint, request, jsonify, current_app, url_for
+from flask import Blueprint, request, jsonify, current_app, url_for, g
 from sqlalchemy.orm import aliased
 
 from db import db
@@ -124,6 +124,29 @@ def _unsign_user_qr(token: str, *, max_age: Optional[int] = None) -> int:
         raise ValueError("bad uid")
     return uid
 
+@teller_bp.route("/device-token", methods=["POST"])
+@require_role("teller","pao")  # ← allow both
+def register_teller_device_token():
+    """Save/refresh this teller's device push token."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "unknown").strip()
+    if not token:
+        return jsonify(error="token required"), 400
+
+    try:
+        # upsert by (user_id, token)
+        row = DeviceToken.query.filter_by(user_id=g.user.id, token=token).first()
+        if not row:
+            row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
+            db.session.add(row)
+        else:
+            row.platform = platform
+        db.session.commit()
+        return jsonify(ok=True), 200
+    except Exception as e:
+        current_app.logger.exception("[teller] device-token upsert failed")
+        return jsonify(error=str(e)), 400
 
 def _ensure_wallet_row(user_id: int) -> int:
     """

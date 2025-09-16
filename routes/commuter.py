@@ -25,17 +25,20 @@ from models.device_token import DeviceToken
 from utils.qr import build_qr_payload
 from utils.push import push_to_user
 from io import BytesIO
+from itsdangerous import URLSafeSerializer
 from PIL import Image, ImageDraw, ImageFont
 import qrcode
+import time as _time
 import traceback
 from werkzeug.exceptions import HTTPException
 from datetime import timedelta
 from sqlalchemy.exc import OperationalError
-
+from services.notify import notify_tellers_new_topup
 from sqlalchemy import desc
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 import os, uuid, time
 from werkzeug.utils import secure_filename
+from models.wallet import TopUp
 try:
     from zoneinfo import ZoneInfo
     try:
@@ -137,7 +140,17 @@ def _as_local(dt_obj: dt.datetime) -> dt.datetime:
 def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
+SALT_WALLET_QR = "wallet-qr-rot-v1"
 
+def _wallet_qr_token(uid: int, bucket: Optional[int] = None) -> str:
+    """
+    Issue a stateless, *minute-bucketed* signed token.
+    The token changes every minute: bucket = floor(now/60).
+    """
+    if bucket is None:
+        bucket = int(_time.time() // 60)
+    s = URLSafeSerializer(current_app.config["SECRET_KEY"], salt=SALT_WALLET_QR)
+    return s.dumps({"uid": int(uid), "mb": int(bucket)})
 
 @commuter_bp.route("/topup-requests", methods=["GET"])
 @require_role("commuter")
@@ -244,6 +257,10 @@ def create_topup_request():
 
     # Commit
     db.session.commit()
+    try:
+        notify_tellers_new_topup(db, User, DeviceToken, push_to_user, topup=tu, commuter=g.user)
+    except Exception:
+        current_app.logger.exception("[push] notify tellers of new topup failed")
 
     return jsonify({
         "id": tu.id,
@@ -845,6 +862,37 @@ def commuter_ticket_image(ticket_id: int):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
+def _notify_tellers_new_topup(t, commuter: User):
+    """Fire-and-forget push to every teller that a new GCash request is waiting."""
+    try:
+        # list all tellers
+        teller_ids = [uid for (uid,) in db.session.query(User.id).filter(User.role == "teller").all()]
+        if not teller_ids:
+            return
+
+        # compose message
+        amount = int(getattr(t, "amount_pesos", 0) or 0)
+        name = f"{(commuter.first_name or '').strip()} {(commuter.last_name or '').strip()}".strip() or (commuter.username or f"User #{commuter.id}")
+        title = "🧾 New top-up request"
+        body  = f"₱{amount:,} via GCash from {name}"
+
+        payload = {
+            "type": "topup_request",
+            "topup_id": int(t.id),
+            "amount_php": amount,
+            "method": "gcash",
+            # let the app deep-link if you add it later; TellerConsole already opens Pending on receipt
+            "deeplink": "/teller/pending",
+            "sentAt": int(_time.time() * 1000),
+        }
+
+        for uid in teller_ids:
+            # Android channel must match TellerConsole ("topups")
+            push_to_user(db, DeviceToken, uid, title, body, payload,
+                         channelId="topups", priority="high", ttl=600)
+    except Exception:
+        current_app.logger.exception("[push] notify tellers of new topup failed")
+
 
 def _is_unknown_col(err: Exception) -> bool:
     # MySQL error code for "Unknown column": 1054
@@ -975,13 +1023,25 @@ def wallet_ledger():
         has_more=(page * page_size) < total,
     ), 200
 
-
 @commuter_bp.route("/wallet/qrcode", methods=["GET"])
 @require_role("commuter")
 def wallet_qrcode():
-    token = build_wallet_token(g.user.id)  # now stable per commuter
+    now = int(_time.time())
+    bucket = now // 60
+    token = _wallet_qr_token(g.user.id, bucket=bucket)
+    # expires at next minute boundary
+    expires_at_ts = (bucket + 1) * 60
     deep_link = f"https://pay.example/charge?wallet_token={token}&autopay=1"
-    return jsonify(wallet_token=token, deep_link=deep_link), 200
+    resp = jsonify(
+        wallet_token=token,
+        deep_link=deep_link,
+        expires_at=dt.datetime.fromtimestamp(expires_at_ts, tz=dt.timezone.utc).isoformat(),
+        valid_for_sec=max(1, expires_at_ts - now),
+    )
+    # don't cache: keeps clients honest about expiry/rotation
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp, 200
+
 
 @commuter_bp.route("/wallet/qrcode/rotate", methods=["POST"])
 @require_role("commuter")
@@ -1053,26 +1113,24 @@ def _as_time(v: Any) -> Optional[dt.time]:
                 pass
     return None
 
+# routes/commuter.py (or similar)
 @commuter_bp.route("/device-token", methods=["POST"])
 @require_role("commuter")
-def save_device_token():
+def register_commuter_device_token():
     data = request.get_json(silent=True) or {}
     token = (data.get("token") or "").strip()
-    platform = (data.get("platform") or "").strip() or None
+    platform = (data.get("platform") or "unknown").strip()
     if not token:
         return jsonify(error="token required"), 400
-
     row = DeviceToken.query.filter_by(user_id=g.user.id, token=token).first()
     if not row:
-        row = DeviceToken(user_id=g.user.id, token=token, platform=platform, provider="expo")
+        row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
         db.session.add(row)
     else:
-        row.platform = platform or row.platform
+        row.platform = platform
     db.session.commit()
-
-    current_app.logger.info("[push] saved token uid=%s platform=%s token=%s…",
-                            g.user.id, platform, token[:16])
     return jsonify(ok=True), 200
+
 @commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
 def qr_image_for_ticket(ticket_id: int):
     t = TicketSale.query.get_or_404(ticket_id)
@@ -1598,13 +1656,23 @@ def my_receipts():
 
     # ---------- UNGROUPED (one row per ticket, PAID-ONLY) ----------
     if not group:
+        void_statuses = {"void", "voided", "refunded", "cancelled"}
+        conds = [TicketSale.user_id == g.user.id]
+
+        if _has_column("ticket_sales", "voided"):
+            conds.append(or_(TicketSale.paid.is_(True), TicketSale.voided.is_(True)))
+        elif _has_column("ticket_sales", "status"):
+            conds.append(or_(TicketSale.paid.is_(True), TicketSale.status.in_(list(void_statuses))))
+        else:
+            conds.append(TicketSale.paid.is_(True))  # fallback
+
         q = (
             TicketSale.query.options(
                 joinedload(TicketSale.user),
                 joinedload(TicketSale.origin_stop_time),
                 joinedload(TicketSale.destination_stop_time),
             )
-            .filter(TicketSale.user_id == g.user.id, TicketSale.paid.is_(True))
+            .filter(*conds)
         )
         # time window
         try:
@@ -1638,27 +1706,33 @@ def my_receipts():
                 tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
                 destination_name = tsd.stop_name if tsd else ""
 
-            fare = int(round(float(t.price or 0)))
-            base = {
-                "id": t.id,
-                "referenceNo": t.reference_no,
-                "date": t.created_at.strftime("%B %d, %Y"),
-                "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-                "origin": origin_name,
-                "destination": destination_name,
-                "fare": fare,
-                "paid": True,  # PAO-only receipts
-                "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
-                "view_url": url_for("commuter.commuter_ticket_view", ticket_id=t.id, _external=True),
-            }
-            if not light:
-                base.update({
-                    "passengerType": (t.passenger_type or "").title(),
-                    "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "Guest",
-                    "bus_id": t.bus_id,
-                    "batch_id": int(getattr(t, "batch_id", None) or t.id),
-                })
-            items.append(base)
+        is_void = _is_ticket_void(t)
+
+        fare = int(round(float(t.price or 0)))
+        base = {
+            "id": t.id,
+            "referenceNo": t.reference_no,
+            "date": t.created_at.strftime("%B %d, %Y"),
+            "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+            "origin": origin_name,
+            "destination": destination_name,
+            "fare": fare,
+            "paid": bool(t.paid) and not is_void,        # never mark paid when voided
+            "voided": bool(is_void),
+            "state": "voided" if is_void else ("paid" if bool(t.paid) else "unpaid"),
+            "created_at": t.created_at.isoformat(),       # helps your app group by day
+            "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
+            "view_url": url_for("commuter.commuter_ticket_view", ticket_id=t.id, _external=True),
+        }
+        if not light:
+            base.update({
+                "passengerType": (t.passenger_type or "").title(),
+                "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "Guest",
+                "bus_id": t.bus_id,
+                "batch_id": int(getattr(t, "batch_id", None) or t.id),
+                "status": getattr(t, "status", None),
+            })
+        items.append(base)
 
         return jsonify(
             items=items,
@@ -1689,7 +1763,13 @@ def my_receipts():
         params["bus_id"] = bus_id
 
     # Only this user's PAID tickets
-    base_where = "user_id = :uid AND paid = 1"
+    if _has_column("ticket_sales", "voided"):
+        base_where = "user_id = :uid AND (paid = 1 OR voided = 1)"
+    elif _has_column("ticket_sales", "status"):
+        base_where = ("user_id = :uid AND (paid = 1 OR status IN "
+                    "('void','voided','refunded','cancelled'))")
+    else:
+        base_where = "user_id = :uid AND paid = 1"
     params["uid"] = g.user.id
     if where_dates:
         base_where += " AND " + " AND ".join(where_dates)
@@ -1756,6 +1836,8 @@ def my_receipts():
             tsd = TicketStop.query.get(getattr(head, "destination_stop_time_id", None))
             destination_name = tsd.stop_name if tsd else ""
 
+        is_void = _is_ticket_void(head)
+
         items.append({
             "id": head.id,
             "batch_id": int(grow["batch_id"]),
@@ -1766,12 +1848,13 @@ def my_receipts():
             "destination": destination_name,
             "commuter": f"{head.user.first_name} {head.user.last_name}" if head.user else "Guest",
             "fare": int(grow["total_pesos"] or 0),
-            "paid": True,
-            "passengers": int(grow["qty"] or 0),
+            "paid": (not is_void) and True,         # keep “paid” true only if not voided
+            "voided": bool(is_void),
+            "state": "voided" if is_void else "paid",
+            "created_at": head.created_at.isoformat(),
             "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=head.id, _external=True),
             "view_url": url_for("commuter.commuter_ticket_view", ticket_id=head.id, _external=True),
         })
-
     return jsonify(
         items=items,
         page=page,
