@@ -4,7 +4,7 @@ import os
 import uuid
 from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
-from sqlalchemy import func, text
+from sqlalchemy import func, text, literal
 from sqlalchemy.orm import aliased
 
 from db import db
@@ -466,7 +466,6 @@ def commuter_detail(user_id: int):
         200,
     )
 
-
 @manager_bp.route("/commuters/<int:user_id>/tickets", methods=["GET"])
 @require_role("manager")
 def commuter_tickets(user_id: int):
@@ -482,19 +481,25 @@ def commuter_tickets(user_id: int):
         O = aliased(TicketStop)
         D = aliased(TicketStop)
 
+        has_status = table_has_column("ticket_sales", "status")
+        has_voided = table_has_column("ticket_sales", "voided")
+        has_paid   = table_has_column("ticket_sales", "paid")
+
+        fields = [
+            TicketSale.id,
+            TicketSale.created_at,
+            TicketSale.price,
+            TicketSale.passenger_type,
+            (TicketSale.paid if has_paid else literal(False).label("paid")),
+            (TicketSale.status if has_status else literal(None).label("status")),
+            (TicketSale.voided if has_voided else literal(False).label("voided")),
+            Bus.identifier.label("bus"),
+            O.stop_name.label("origin"),
+            D.stop_name.label("destination"),
+        ]
+
         base = (
-            db.session.query(
-                TicketSale.id,
-                TicketSale.created_at,
-                TicketSale.price,
-                TicketSale.paid,
-                TicketSale.passenger_type,
-                TicketSale.status,
-                TicketSale.voided,
-                Bus.identifier.label("bus"),
-                O.stop_name.label("origin"),
-                D.stop_name.label("destination"),
-            )
+            db.session.query(*fields)
             .join(Bus, TicketSale.bus_id == Bus.id)
             .outerjoin(O, TicketSale.origin_stop_time_id == O.id)
             .outerjoin(D, TicketSale.destination_stop_time_id == D.id)
@@ -508,15 +513,16 @@ def commuter_tickets(user_id: int):
 
         items = []
         for r in rows:
-            is_void = bool(r.voided) or (str(r.status or "").lower() in {"void", "voided", "refunded", "cancelled"})
+            st = (str(getattr(r, "status", "") or "")).lower()
+            is_void = bool(getattr(r, "voided", False)) or st in {"void", "voided", "refunded", "cancelled", "canceled"}
             items.append(
                 {
                     "id": r.id,
                     "created_at": r.created_at.isoformat(),
                     "time": r.created_at.strftime("%Y-%m-%d %H:%M"),
                     "fare": f"{float(r.price or 0):.2f}",
-                    "paid": bool(r.paid) and not is_void,
-                    "status": (r.status or ("voided" if is_void else ("paid" if r.paid else "unpaid"))),
+                    "paid": bool(getattr(r, "paid", False)) and not is_void,
+                    "status": (getattr(r, "status", None) or ("voided" if is_void else ("paid" if getattr(r, "paid", False) else "unpaid"))),
                     "voided": is_void,
                     "passenger_type": (r.passenger_type or "regular"),
                     "bus": r.bus,
@@ -525,18 +531,15 @@ def commuter_tickets(user_id: int):
                 }
             )
 
-        return (
-            jsonify(
-                {
-                    "items": items,
-                    "page": page,
-                    "page_size": size,
-                    "total": total,
-                    "pages": (total + size - 1) // size,
-                }
-            ),
-            200,
-        )
+        return jsonify(
+            {
+                "items": items,
+                "page": page,
+                "page_size": size,
+                "total": total,
+                "pages": (total + size - 1) // size,
+            }
+        ), 200
     except Exception:
         current_app.logger.exception("ERROR in commuter_tickets")
         return jsonify(error="Failed to load tickets"), 500
@@ -896,14 +899,16 @@ def tickets_composition():
         return jsonify(error="invalid date"), 400
 
     ptype = func.coalesce(TicketSale.passenger_type, "regular")
+    has_voided = table_has_column("ticket_sales", "voided")
+    has_status = table_has_column("ticket_sales", "status")
 
-    rows = (
-        db.session.query(ptype.label("ptype"), func.count(TicketSale.id))
-        .filter(func.date(TicketSale.created_at) == day)
-        .filter(TicketSale.voided.is_(False))
-        .group_by("ptype")
-        .all()
-    )
+    qs = db.session.query(ptype.label("ptype"), func.count(TicketSale.id)).filter(func.date(TicketSale.created_at) == day)
+    if has_voided:
+        qs = qs.filter(TicketSale.voided.is_(False))
+    elif has_status:
+        qs = qs.filter(func.lower(func.coalesce(TicketSale.status, "")) != "voided")
+
+    rows = qs.group_by("ptype").all()
 
     regular = 0
     discount = 0
@@ -933,22 +938,41 @@ def tickets_for_day():
     O = aliased(TicketStop)
     D = aliased(TicketStop)
 
+    # Column existence checks
+    has_status = table_has_column("ticket_sales", "status")
+    has_voided = table_has_column("ticket_sales", "voided")
+    has_paid   = table_has_column("ticket_sales", "paid")
+
+    # Optional "reason" column detection (first match wins)
+    reason_label = None
+    for col in ("void_reason", "reason", "note", "remarks"):
+        if table_has_column("ticket_sales", col):
+            reason_label = getattr(TicketSale, col).label("void_reason")
+            break
+
+    # Base fields (always present)
+    fields = [
+        TicketSale.id,
+        TicketSale.created_at,
+        TicketSale.price,
+        TicketSale.passenger_type,
+        User.first_name,
+        User.last_name,
+        Bus.id.label("bus_id"),
+        Bus.identifier.label("bus"),
+        O.stop_name.label("origin"),
+        D.stop_name.label("destination"),
+    ]
+
+    # Schema-aware columns with fallbacks
+    fields.append(TicketSale.paid if has_paid else literal(False).label("paid"))
+    fields.append(TicketSale.voided if has_voided else literal(False).label("voided"))
+    fields.append(TicketSale.status if has_status else literal(None).label("status"))
+    if reason_label is not None:
+        fields.append(reason_label)
+
     qs = (
-        db.session.query(
-            TicketSale.id,
-            TicketSale.created_at,
-            TicketSale.price,
-            TicketSale.passenger_type,
-            TicketSale.paid,
-            TicketSale.voided,
-            TicketSale.status,
-            User.first_name,
-            User.last_name,
-            Bus.id.label("bus_id"),
-            Bus.identifier.label("bus"),
-            O.stop_name.label("origin"),
-            D.stop_name.label("destination"),
-        )
+        db.session.query(*fields)
         .outerjoin(User, TicketSale.user_id == User.id)
         .join(Bus, TicketSale.bus_id == Bus.id)
         .outerjoin(O, TicketSale.origin_stop_time_id == O.id)
@@ -960,6 +984,7 @@ def tickets_for_day():
 
     rows = qs.order_by(TicketSale.id.asc()).all()
 
+    # Cache trips per bus for trip mapping
     trips_by_bus: dict[int, list[Trip]] = {}
     prev = day - timedelta(days=1)
 
@@ -981,6 +1006,7 @@ def tickets_for_day():
 
     tickets = []
     for r in rows:
+        # Map to trip window
         trip_num = None
         trip_window = None
         for t, start, end in windows_for(r.bus_id):
@@ -989,7 +1015,10 @@ def tickets_for_day():
                 trip_window = f"{t.start_time.strftime('%H:%M')}–{t.end_time.strftime('%H:%M')}"
                 break
 
-        is_void = bool(r.voided) or (str(r.status or "").lower() in {"void", "voided", "refunded", "cancelled"})
+        st = (str(getattr(r, "status", "") or "")).lower()
+        is_void = bool(getattr(r, "voided", False)) or st in {"void", "voided", "refunded", "cancelled", "canceled"}
+        void_reason = getattr(r, "void_reason", None)
+
         tickets.append(
             {
                 "id": r.id,
@@ -998,11 +1027,12 @@ def tickets_for_day():
                 "origin": r.origin or "",
                 "destination": r.destination or "",
                 "fare": f"{float(r.price):.2f}",
-                "paid": bool(r.paid) and not is_void,
-                "status": (r.status or ("voided" if is_void else ("paid" if r.paid else "unpaid"))),
+                "paid": bool(getattr(r, "paid", False)) and not is_void,
+                "status": (getattr(r, "status", None) or ("voided" if is_void else ("paid" if getattr(r, "paid", False) else "unpaid"))),
                 "passenger_type": (r.passenger_type or "regular"),
                 "passengerType": (r.passenger_type or "regular"),
                 "voided": is_void,
+                "void_reason": void_reason,
                 "created_at": r.created_at.isoformat(),
                 "time": r.created_at.strftime("%I:%M %p").lstrip("0").lower(),
                 "trip": trip_num,
@@ -1010,8 +1040,13 @@ def tickets_for_day():
             }
         )
 
-    total = sum(float(r.price or 0) for r in rows if not (bool(r.voided) or (str(r.status or "").lower() in {"void", "voided", "refunded", "cancelled"})))
+    total = sum(
+        float(r.price or 0)
+        for r in rows
+        if not (bool(getattr(r, "voided", False)) or (str(getattr(r, "status", "") or "").lower() in {"void", "voided", "refunded", "cancelled", "canceled"}))
+    )
     return jsonify(tickets=tickets, total=f"{total:.2f}"), 200
+
 
 
 @manager_bp.route("/buses", methods=["GET"])

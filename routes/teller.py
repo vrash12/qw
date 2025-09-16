@@ -91,6 +91,23 @@ def _receipt_url_if_exists(tid: int) -> Optional[str]:
     return None
 
 
+def _reject_reason_path(tid: int) -> str:
+    """Local file path for a saved reject reason (no DB migration needed)."""
+    return os.path.join(current_app.root_path, "static", RECEIPTS_DIR, f"{tid}.reject.txt")
+
+
+def _reject_reason_if_exists(tid: int) -> Optional[str]:
+    """Return the saved reject reason text, if present."""
+    try:
+        p = _reject_reason_path(tid)
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return (f.read() or "").strip() or None
+    except Exception:
+        current_app.logger.exception("[teller] read reject reason failed tid=%s", tid)
+    return None
+
+
 def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extra) -> bool:
     """
     Best-effort realtime wallet update for the commuter's device(s).
@@ -124,18 +141,25 @@ def _unsign_user_qr(token: str, *, max_age: Optional[int] = None) -> int:
         raise ValueError("bad uid")
     return uid
 
+
 @teller_bp.route("/device-token", methods=["POST"])
-@require_role("teller","pao")  # ← allow both
+@require_role("teller","pao")
 def register_teller_device_token():
-    """Save/refresh this teller's device push token."""
     data = request.get_json(silent=True) or {}
     token = (data.get("token") or "").strip()
     platform = (data.get("platform") or "unknown").strip()
+
+    current_app.logger.info(
+        "[device-token] HIT uid=%s role=%s platform=%s tok=%s",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        platform,
+        (token[:16] + "…") if token else "(none)",
+    )
     if not token:
         return jsonify(error="token required"), 400
 
     try:
-        # upsert by (user_id, token)
         row = DeviceToken.query.filter_by(user_id=g.user.id, token=token).first()
         if not row:
             row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
@@ -143,10 +167,12 @@ def register_teller_device_token():
         else:
             row.platform = platform
         db.session.commit()
+        current_app.logger.info("[device-token] SAVED uid=%s platform=%s", g.user.id, platform)
         return jsonify(ok=True), 200
     except Exception as e:
         current_app.logger.exception("[teller] device-token upsert failed")
         return jsonify(error=str(e)), 400
+
 
 def _ensure_wallet_row(user_id: int) -> int:
     """
@@ -175,6 +201,7 @@ def _debug_log_push(uid: int, payload: dict):
         )
     except Exception:
         current_app.logger.exception("[push][debug] failed to list tokens")
+
 
 @teller_bp.route("/users/scan", methods=["GET"])
 @require_role("teller")  # adjust if your PAO role is used to scan
@@ -240,6 +267,7 @@ def list_topup_requests():
             "note": None,
             "receipt_url": _receipt_url_if_exists(t.id),
             "receipt_thumb_url": _receipt_url_if_exists(t.id),
+            "reject_reason": _reject_reason_if_exists(t.id),
             "commuter": {
                 "id": u.id,
                 "first_name": u.first_name,
@@ -267,6 +295,7 @@ def get_topup_request(tid: int):
         "status": t.status,
         "receipt_url": _receipt_url_if_exists(t.id),
         "created_at": t.created_at.isoformat() if getattr(t, "created_at", None) else None,
+        "reject_reason": _reject_reason_if_exists(t.id),
     }), 200
 
 
@@ -275,19 +304,47 @@ def get_topup_request(tid: int):
 def approve_topup(tid: int):
     """
     Approve a commuter-submitted top-up request:
+      - optionally accepts an override 'amount_pesos' (validated and persisted),
       - credits the wallet,
       - writes a ledger row (ref_table='wallet_topups', ref_id=tid),
       - marks topup.status='succeeded',
       - sends a push notification to the commuter,
       - best-effort realtime publish for instant UI.
 
+    Accepts JSON body: { amount_pesos?: int, amount_php?: int }
     Returns 200 with { ok, topup_id, ledger_id, new_balance_php, status }.
     """
     t = TopUp.query.get_or_404(tid)
     if t.status not in {"pending", "approved"}:
         return jsonify(error=f"invalid state {t.status}"), 400
 
+    # Optional amount override
+    data = request.get_json(silent=True) or {}
+    override_amount = data.get("amount_pesos") if data else None
+    if override_amount is None:
+        override_amount = data.get("amount_php") if data else None
+    if override_amount not in (None, ""):
+        try:
+            amt = int(override_amount)
+        except Exception:
+            return jsonify(error="amount_pesos must be an integer"), 400
+        if amt < MIN_TOPUP or amt > MAX_TOPUP:
+            return jsonify(error=f"amount must be between {MIN_TOPUP} and {MAX_TOPUP}"), 400
+        # Persist to the TopUp row so history matches what was approved
+        try:
+            db.session.execute(
+                db.text("UPDATE wallet_topups SET amount_pesos=:amt WHERE id=:id"),
+                {"amt": int(amt), "id": tid},
+            )
+            db.session.commit()
+            # Refresh model's value
+            t = TopUp.query.get(tid)
+        except Exception:
+            current_app.logger.exception("[teller] failed to persist override amount tid=%s", tid)
+            return jsonify(error="failed to save override amount"), 400
+
     try:
+        # Execute approval using the (possibly updated) amount
         ledger_id, new_balance = approve_topup_existing(
             account_id=t.account_id,
             topup_id=t.id,
@@ -341,8 +398,6 @@ def approve_topup(tid: int):
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "ref": {"table": "wallet_topups", "id": int(t.id)},
                     },
-                    # Optionally include a receipt preview URL if you store it:
-                    # "receipt_url": _receipt_url_if_exists(t.id),
                 },
                 channelId="payments",
                 priority="high",
@@ -373,16 +428,65 @@ def approve_topup(tid: int):
 def reject_topup(tid: int):
     """
     Mark a commuter-submitted request as rejected (no wallet change).
+    Accepts JSON body: { reason?: str }
+    - Persists status='rejected'
+    - Saves the reason to static/topup_receipts/{tid}.reject.txt (no DB migration)
+    - Best-effort push to commuter including the reason
     """
     t = TopUp.query.get_or_404(tid)
     if t.status not in {"pending", "approved"}:
         return jsonify(error=f"invalid state {t.status}"), 400
-    db.session.execute(
-        db.text("UPDATE wallet_topups SET status='rejected' WHERE id=:id"),
-        {"id": tid},
-    )
-    db.session.commit()
-    return jsonify({"ok": True, "status": "rejected", "topup_id": tid}), 200
+
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+
+    try:
+        db.session.execute(
+            db.text("UPDATE wallet_topups SET status='rejected' WHERE id=:id"),
+            {"id": tid},
+        )
+        db.session.commit()
+    except Exception:
+        current_app.logger.exception("[teller] reject update failed tid=%s", tid)
+        return jsonify(error="failed to reject"), 400
+
+    # Save reason to a sidecar text file (optional but helpful)
+    try:
+        if reason:
+            outdir = os.path.join(current_app.root_path, "static", RECEIPTS_DIR)
+            os.makedirs(outdir, exist_ok=True)
+            with open(_reject_reason_path(tid), "w", encoding="utf-8") as f:
+                ts = datetime.now(timezone.utc).isoformat()
+                actor = getattr(g, "user", None) and getattr(g.user, "id", None)
+                f.write(f"{reason}\n— by {actor or 'teller'} @ {ts}\n")
+    except Exception:
+        current_app.logger.exception("[teller] failed to write reject reason tid=%s", tid)
+
+    # Try to notify commuter (best-effort)
+    try:
+        preview = reason if len(reason) <= 140 else (reason[:137] + "…")
+        push_to_user(
+            db, DeviceToken, int(t.account_id),
+            "⚠️ Wallet top-up rejected",
+            f"₱{int(t.amount_pesos or 0):,} via {str(t.method or 'cash').title()} was rejected."
+            + (f" Reason: {preview}" if preview else ""),
+            {
+                "type": "wallet_topup_rejected",
+                "topup_id": int(tid),
+                "amount_php": int(t.amount_pesos or 0),
+                "method": t.method,
+                "reason": preview,
+                "deeplink": "/(tabs)/commuter/wallet",
+                "sentAt": int(_time.time() * 1000),
+            },
+            channelId="payments",
+            priority="high",
+            ttl=600,
+        )
+    except Exception:
+        current_app.logger.exception("[push] reject_topup push failed tid=%s", tid)
+
+    return jsonify({"ok": True, "status": "rejected", "topup_id": tid, "reason": reason or None}), 200
 
 
 # ──────────────────────────────────────────────────────────────────────────────

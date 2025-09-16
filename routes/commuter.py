@@ -189,10 +189,12 @@ def list_my_topup_requests():
             "created_at": (
                 t.created_at.isoformat() if getattr(t, "created_at", None) else None
             ),
-            # Optional fields (add only if your schema has them)
+            # Optional fields
             "note": getattr(t, "note", None) or getattr(t, "external_ref", None) or getattr(t, "provider_ref", None),
             "receipt_url": getattr(t, "receipt_url", None),
+            "reject_reason": getattr(t, "reject_reason", None),  # 👈 NEW
         })
+
 
     return jsonify(
         items=items,
@@ -201,6 +203,27 @@ def list_my_topup_requests():
         total=total,
         has_more=(page * page_size) < total,
     ), 200
+
+def _load_font(size: int, *candidates: str) -> ImageFont.FreeTypeFont:
+    """
+    Try to load a TTF from app's static/fonts first, then common system dirs.
+    Falls back to load_default() only if everything fails.
+    """
+    bases = [
+        os.path.join(current_app.root_path, "static", "fonts"),
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/truetype/liberation",
+    ]
+    for name in candidates:
+        for base in bases:
+            path = name if os.path.isabs(name) else os.path.join(base, name)
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
 
 @commuter_bp.route("/topup-requests", methods=["POST"])
 @require_role("commuter")
@@ -226,8 +249,8 @@ def create_topup_request():
         amount_pesos = int(form.get("amount_pesos") or form.get("amount_php") or 0)
     except Exception:
         amount_pesos = 0
-    if amount_pesos <= 0:
-        return jsonify(error="invalid amount"), 400
+    if amount_pesos < 0:
+        return jsonify(error="invalid amount"), 400  # only block negatives
 
     # provider fields (MUST NOT be NULL in your DB)
     provider = "gcash"
@@ -611,13 +634,14 @@ def commuter_ticket_image(ticket_id: int):
                 continue
         return ImageFont.load_default()
 
-    ft_title   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 80)
-    ft_header  = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 60)
-    ft_label   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 40)
-    ft_value   = _safe_font(["Arial Bold", "DejaVuSans-Bold.ttf", "arial.ttf"], 52)
-    ft_big     = _safe_font(["Arial Black", "DejaVuSans-Bold.ttf", "arialbd.ttf"], 96)
-    ft_medium  = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 44)
-    ft_small   = _safe_font(["Arial", "DejaVuSans.ttf", "arial.ttf"], 34)
+    ft_title   = _load_font(80,  "Inter-ExtraBold.ttf", "NotoSans-Bold.ttf")
+    ft_header  = _load_font(60,  "Inter-Bold.ttf",      "NotoSans-Bold.ttf")
+    ft_label   = _load_font(40,  "Inter-Regular.ttf",   "NotoSans.ttf")
+    ft_value   = _load_font(52,  "Inter-SemiBold.ttf",  "NotoSans-Bold.ttf")
+    ft_big     = _load_font(96,  "Inter-Black.ttf",     "NotoSans-Bold.ttf")
+    ft_medium  = _load_font(44,  "Inter-Regular.ttf",   "NotoSans.ttf")
+    ft_small   = _load_font(34,  "Inter-Regular.ttf",   "NotoSans.ttf")
+
 
     def tw(text, font):
         if not font or not text:
@@ -736,6 +760,32 @@ def commuter_ticket_image(ticket_id: int):
     # Add a small hint below amount when voided
     if is_void and ft_medium:
         draw.text((L, amount_y + 44 + 96), "Refunded to wallet", fill=TEXT_MEDIUM, font=ft_medium)
+
+        # Add a small hint below amount when voided
+    if is_void and ft_medium:
+        draw.text((L, amount_y + 44 + 96), "Refunded to wallet", fill=TEXT_MEDIUM, font=ft_medium)
+
+    # ✅ NEW: print the void reason (multi-line) under the amount/pill
+    void_reason_text = (getattr(t, "void_reason", None) or "").strip()
+    if is_void and void_reason_text:
+        # Title
+        if ft_label:
+            draw.text((L, amount_y + 44 + 96 + 44), "VOID REASON", fill=DANGER_TEXT, font=ft_label)
+
+        # Wrapped lines
+        if ft_medium:
+            from textwrap import wrap
+            max_px = R - L
+            # rough chars-per-line estimate for current font size
+            chars = max(24, min(80, max_px // 12))
+            y_line = amount_y + 44 + 96 + 44 + 44
+            for line in wrap(void_reason_text, width=chars):
+                draw.text((L, y_line), line, fill=DANGER_TEXT, font=ft_medium)
+                y_line += 46
+
+            # Make sure following sections don’t overlap the reason block
+            y = max(y, y_line + 12)
+
 
     y += 170
 
@@ -1269,6 +1319,7 @@ def commuter_get_ticket(ticket_id: int):
         "paid": bool(t.paid) and not is_void,           # never show paid=true when voided
         "voided": bool(is_void),
         "state": ("voided" if is_void else ("paid" if bool(t.paid) else "unpaid")),
+        "void_reason": getattr(t, "void_reason", None),  # 👈 add this line
         "qr": payload,
         "qr_link": qr_link,
         "qr_url": qr_url,

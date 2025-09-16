@@ -67,6 +67,83 @@ from threading import Thread
 # backend/routes/pao.py
 from time import time as _epoch_ms
 
+def _try_user_qr_soft(token: str):
+    """
+    Try to decode a signed commuter-QR with a small post-expiry grace.
+    Returns: (user_id | None, grace_used | None, error_kind | None)
+      - user_id: int if OK (grace_used may be True/False)
+      - error_kind: "expired" or "invalid" when not OK
+    """
+    s = _user_qr_serializer()  # already defined in your file
+    max_age = int(current_app.config.get("WALLET_QR_MAX_AGE_S", 60))
+    grace   = int(current_app.config.get("WALLET_QR_GRACE_S", 8))
+
+    try:
+        payload = s.loads(token, max_age=max_age)
+        uid = int(payload.get("uid") or 0)
+        return (uid if uid > 0 else None, False, None)
+    except SignatureExpired as e:
+        # Signature is valid but too old; allow tiny grace if within max_age+grace
+        try:
+            valid, payload = s.loads_unsafe(token)  # (bool, payload or None)
+        except Exception:
+            valid, payload = False, None
+
+        if valid and payload and getattr(e, "date_signed", None):
+            # How old is the token?
+            signed_at = e.date_signed
+            if signed_at.tzinfo is None:
+                signed_at = signed_at.replace(tzinfo=timezone.utc)
+            age_sec = (datetime.now(timezone.utc) - signed_at).total_seconds()
+            if age_sec <= (max_age + grace):
+                uid = int(payload.get("uid") or 0)
+                return (uid if uid > 0 else None, True, None)
+
+        return (None, None, "expired")
+    except BadSignature:
+        return (None, None, "invalid")
+
+
+def _try_wallet_rot_soft(tok: str):
+    """
+    Accept rotating wallet tokens: URLSafeSerializer payload {"uid": <int>, "mb": <minuteBucket>}
+    Valid for the current minute; allow small post-rollover grace.
+    Returns: (user_id|None, grace_used|None, "expired"/"invalid"|None)
+    """
+    from itsdangerous import BadSignature
+    import time as _t
+
+    try:
+        payload = _wallet_rot_serializer().loads(tok)
+        uid = int(payload.get("uid") or 0)
+        mb  = int(payload.get("mb")  or -1)
+        if uid <= 0 or mb < 0:
+            return (None, None, "invalid")
+    except BadSignature:
+        return (None, None, "invalid")
+    except Exception:
+        return (None, None, "invalid")
+
+    now = _t.time()
+    now_bucket = int(now // 60)
+    grace = int(current_app.config.get("WALLET_QR_GRACE_S", 8))
+    secs_into_min = int(now % 60)
+
+    if mb == now_bucket:
+        return (uid, False, None)
+    if mb == (now_bucket - 1) and secs_into_min <= grace:
+        return (uid, True, None)
+    # older than allowed window → expired; future/garbage → invalid
+    return (None, None, "expired" if mb < (now_bucket - 1) else "invalid")
+
+# Accept minute-bucket wallet tokens from /commuter/wallet/qrcode
+SALT_WALLET_QR = "wallet-qr-rot-v1"
+
+def _wallet_rot_serializer():
+    from itsdangerous import URLSafeSerializer
+    return URLSafeSerializer(current_app.config["SECRET_KEY"], salt=SALT_WALLET_QR)
+
+
 def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extra):
     """Send realtime wallet balance to the commuter's device via MQTT."""
     try:
@@ -384,39 +461,61 @@ def pao_wallet_charge():
         db.session.rollback()
         return jsonify(error="internal error"), 500
 
-
 @pao_bp.route("/wallet/resolve", methods=["POST", "GET"])
 @require_role("pao")
 def wallet_resolve():
     """
-    Resolve a scanned QR into a commuter:
-      Accepts JSON body or query string:
-        { "token": "...", "wallet_token": "...", "raw": "full URL or token", "autopay": true|false }
-      Returns:
-        {
-          "valid": true,
-          "token_type": "user_qr" | "wallet_token",
-          "autopay": false,
-          "user": { "id": 123, "name": "First Last" },
-          "balance_php": 123.45
-        }
+    Resolve a scanned QR into a commuter.
+
+    Accepts JSON body or query string:
+      { "token": "...", "wallet_token": "...", "raw": "full URL or token", "autopay": true|false }
+
+    Returns on success (200):
+      {
+        "valid": true,
+        "token_type": "user_qr" | "wallet_token",
+        "autopay": false,
+        "user": { "id": 123, "name": "First Last" },
+        "user_id": 123,                # legacy mirror
+        "name": "First Last",          # legacy mirror
+        "balance_php": 123.0
+      }
+
+    Failure codes:
+      410 Gone          -> signed commuter QR expired (grace not applicable / exceeded)
+      422 Unprocessable -> invalid token/signature
+      404               -> user not found
+      400               -> missing token
     """
     import time
     from urllib.parse import urlparse, parse_qs
+    from itsdangerous import BadSignature, SignatureExpired
+    from datetime import datetime, timezone
 
     rid = request.headers.get("X-Request-ID") or f"resolve-{int(time.time()*1000)}"
     data = request.get_json(silent=True) or {}
 
-    # --- collect inputs (works for POST or GET) ------------------------------
-    raw = (data.get("raw") or data.get("token") or data.get("wallet_token")
-           or request.args.get("token") or request.args.get("wallet_token") or "").strip()
+    # --- collect inputs (works for POST or GET) --------------------------------
+    raw = (
+        data.get("raw")
+        or data.get("token")
+        or data.get("wallet_token")
+        or request.args.get("token")
+        or request.args.get("wallet_token")
+        or ""
+    ).strip()
     qp_token = None
     autopay = bool(data.get("autopay"))
+
     try:
         u = urlparse(raw)
         if u.scheme and u.netloc:
             qs = parse_qs(u.query)
-            qp_token = qs.get("wallet_token", [None])[0] or qs.get("token", [None])[0] or qs.get("wlt", [None])[0]
+            qp_token = (
+                qs.get("wallet_token", [None])[0]
+                or qs.get("token", [None])[0]
+                or qs.get("wlt", [None])[0]
+            )
             autopay = autopay or (qs.get("autopay", ["0"])[0] == "1")
     except Exception:
         pass
@@ -425,24 +524,67 @@ def wallet_resolve():
     if not token:
         return jsonify(error="missing token"), 400
 
-    # --- try both token families --------------------------------------------
+    dbg = {"raw": raw, "parsed_token": token} if _debug_enabled() else {}
     user_id = None
     token_type = None
-    dbg = {"raw": raw, "parsed_token": token}
+    expired_hint = False  # used to pick 410 vs 422
 
-    # First: commuter QR signed by itsdangerous (from /commuter/users/me/qr.png)
-    try:
-        payload = verify_user_qr_token(token)  # defined above in this file
-        uid = int(payload.get("uid"))
-        if uid > 0:
-            user_id = uid
-            token_type = "user_qr"
-    except (BadSignature, SignatureExpired) as e:
-        dbg["user_qr_error"] = f"{type(e).__name__}: {e}"
-    except Exception as e:
-        dbg["user_qr_error"] = f"{type(e).__name__}: {e}"
+    # --- helper: soften expiry for signed commuter QR --------------------------
+    def _try_user_qr_soft(tok: str):
+        """
+        Try signed commuter-QR with small post-expiry grace.
+        Returns: (user_id | None, grace_used | None, error_kind | None)
+        """
+        s = _user_qr_serializer()
+        max_age = int(current_app.config.get("WALLET_QR_MAX_AGE_S", 60))
+        grace = int(current_app.config.get("WALLET_QR_GRACE_S", 8))
 
-    # Second: wallet_token (opaque, from utils.wallet_qr)
+        try:
+            payload = s.loads(tok, max_age=max_age)
+            uid = int(payload.get("uid") or 0)
+            return (uid if uid > 0 else None, False, None)
+        except SignatureExpired as e:
+            # Signature ok but too old; allow small grace if within max_age+grace
+            try:
+                valid, payload = s.loads_unsafe(tok)  # (bool, payload)
+            except Exception:
+                valid, payload = False, None
+
+            signed_at = getattr(e, "date_signed", None)
+            if valid and payload and signed_at:
+                if signed_at.tzinfo is None:
+                    signed_at = signed_at.replace(tzinfo=timezone.utc)
+                age_sec = (datetime.now(timezone.utc) - signed_at).total_seconds()
+                if age_sec <= (max_age + grace):
+                    uid = int(payload.get("uid") or 0)
+                    return (uid if uid > 0 else None, True, None)
+            return (None, None, "expired")
+        except BadSignature:
+            return (None, None, "invalid")
+        except Exception:
+            return (None, None, "invalid")
+
+    # --- First: commuter QR signed by itsdangerous -----------------------------
+    try_uid, grace_used, err_kind = _try_user_qr_soft(token)
+    if try_uid:
+        user_id = try_uid
+        token_type = "user_qr"
+        if _debug_enabled():
+            dbg["user_qr_grace"] = bool(grace_used)
+    elif err_kind == "expired":
+        expired_hint = True
+    elif err_kind == "invalid":
+        if _debug_enabled():
+            dbg["user_qr_error"] = "invalid"
+    if user_id is None:
+        uid2, grace2, err2 = _try_wallet_rot_soft(token)
+        if uid2:
+            user_id = uid2
+            token_type = "wallet_token_rot"
+            if _debug_enabled():
+                dbg["rot_grace"] = bool(grace2)
+        elif err2 == "expired":
+            expired_hint = True
     if user_id is None and verify_wallet_token:
         try:
             uid = int(verify_wallet_token(token))
@@ -450,34 +592,39 @@ def wallet_resolve():
                 user_id = uid
                 token_type = "wallet_token"
         except Exception as e:
-            dbg["wallet_token_error"] = f"{type(e).__name__}: {e}"
+            if _debug_enabled():
+                dbg["wallet_token_error"] = f"{type(e).__name__}: {e}"
     elif user_id is None and verify_wallet_token is None:
-        dbg["wallet_token_error"] = "verify_wallet_token unavailable"
+        if _debug_enabled():
+            dbg["wallet_token_error"] = "verify_wallet_token unavailable"
 
+    # --- no match --------------------------------------------------------------
     if not user_id:
+        status = 410 if expired_hint else 422  # Gone vs Unprocessable
         current_app.logger.warning("[PAO:resolve][%s] invalid/expired token", rid)
-        out = {"valid": False, "error": "invalid or expired token"}
+        out = {"valid": False, "error": ("expired" if expired_hint else "invalid")}
         if _debug_enabled():
             out["debug"] = dbg
-        return jsonify(out), 400
+        return jsonify(out), status
 
-    # --- look up user + balance ---------------------------------------------
+    # --- look up user + balance -----------------------------------------------
     user = User.query.get(user_id)
     if not user:
         return jsonify(valid=False, error="user not found"), 404
 
-    # Raw SQL avoid ORM drift
-    balance_pesos = int(db.session.execute(
-        text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
-        {"uid": user_id}
-    ).scalar() or 0)
+    balance_pesos = int(
+        db.session.execute(
+            text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
+            {"uid": user_id},
+        ).scalar() or 0
+    )
 
     payload = {
         "valid": True,
         "token_type": token_type,
         "autopay": bool(autopay),
         "user": {"id": user.id, "name": f"{user.first_name} {user.last_name}"},
-        # convenience mirrors for older clients:
+        # legacy mirrors for older clients
         "user_id": int(user.id),
         "name": f"{user.first_name} {user.last_name}",
         "balance_php": float(balance_pesos),
@@ -491,9 +638,15 @@ def wallet_resolve():
         resp.headers["X-Resolve-Type"] = token_type or ""
         resp.headers["X-Resolve-Autopay"] = "1" if autopay else "0"
         resp.headers["X-Resolve-UserId"] = str(user_id)
-        current_app.logger.info("[PAO:resolve][%s] ok user=%s type=%s autopay=%s",
-                                rid, user_id, token_type, autopay)
+        if dbg.get("user_qr_grace"):
+            resp.headers["X-Resolve-Grace"] = "1"
+        current_app.logger.info(
+            "[PAO:resolve][%s] ok user=%s type=%s autopay=%s grace=%s",
+            rid, user_id, token_type, autopay, bool(dbg.get("user_qr_grace")),
+        )
+
     return resp, 200
+
 
 
 @pao_bp.route("/wallet/<int:user_id>/overview", methods=["GET"])
@@ -1589,7 +1742,7 @@ def list_tickets():
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')
                 )
             )
-            ORDER BY head_id ASC
+            ORDER BY head_id DESC
         """),
         {"bus": bus_id, "s": start_dt, "e": end_dt},
     ).mappings().all()
