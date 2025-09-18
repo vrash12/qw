@@ -1,0 +1,7 @@
+# Ignore Python virtual environments
+venv/
+__pycache__/
+*.py[cod]
+*.exe
+*.dll
+*.so
