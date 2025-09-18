@@ -1,4 +1,3 @@
-# mqtt_ingest.py
 """
 MQTT ingest service for:
 - Passenger counts: device/<device_id>/people
@@ -14,16 +13,24 @@ Assumes MySQL/MariaDB and that you've run the provided SQL to create:
   gps_test, gps_test_sample
 """
 
+from __future__ import annotations
+
 import json
 import logging
+import os
 import ssl
+import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+from typing import Optional
 
 import paho.mqtt.client as mqtt
 from dateutil import parser as dtparse  # pip install python-dateutil
-from sqlalchemy import create_engine, func, text, event, select
-from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy import create_engine, func, text, event
+from sqlalchemy.orm import sessionmaker, scoped_session, declarative_base, mapped_column
+from sqlalchemy import Integer, String
 
 from config import Config
 
@@ -32,6 +39,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s"
 )
+_log = logging.getLogger("pgt.mqtt")
 
 # ─── MQTT CONFIG ──────────────────────────────────────────────────────
 MQTT_HOST     = "35010b9ea10d41c0be8ac5e9a700a957.s1.eu.hivemq.cloud"
@@ -60,9 +68,6 @@ def _set_manila_timezone(dbapi_conn, _):
 Session = scoped_session(sessionmaker(bind=engine, expire_on_commit=False))
 
 # Lightweight ORM only for 'bus' lookup (your existing table)
-from sqlalchemy.orm import declarative_base, mapped_column
-from sqlalchemy import Integer, String
-
 Base = declarative_base()
 
 class Bus(Base):
@@ -70,23 +75,41 @@ class Bus(Base):
     id = mapped_column(Integer, primary_key=True)
     identifier = mapped_column(String(255))
 
-# For writes we use SQL text() so you don't need migrations for models.
-
-# ─── MQTT CLIENT ──────────────────────────────────────────────────────
+# ─── MQTT CLIENT (single global) ──────────────────────────────────────
 transport = "websockets" if USE_WS else "tcp"
-client = mqtt.Client(client_id="pgt-ingest", transport=transport)
+
+CLIENT_ID = f"pgt-ingest-{os.getpid()}-{uuid4().hex[:6]}"  # ✅ unique per process
+client = mqtt.Client(
+    client_id=CLIENT_ID,
+    clean_session=True,
+    transport=transport,
+    protocol=mqtt.MQTTv311
+)
+client.enable_logger(_log)
 client.username_pw_set(MQTT_USER, MQTT_PASS)
 
 ssl_ctx = ssl.create_default_context()
 client.tls_set_context(ssl_ctx)
+client.tls_insecure_set(False)
+
 if USE_WS:
     client.ws_set_options(path=MQTT_PATH)
 
-# ─── CACHES ───────────────────────────────────────────────────────────
-_last_totals: dict[int, int] = {}          # bus_id -> last total_count
-_current_test_id: dict[tuple[int, str], int] = {}  # (bus_id, label) -> gps_test.id
+# Backoff & inflight settings
+client.reconnect_delay_set(min_delay=1, max_delay=30)
+client.max_inflight_messages_set(20)  # tune as needed
+client.max_queued_messages_set(0)     # 0 = unlimited (or set a cap)
 
-# ─── HELPERS ──────────────────────────────────────────────────────────
+# ─── STATE/CACHES ─────────────────────────────────────────────────────
+_started = False
+_last_totals: dict[int, int] = {}                    # bus_id -> last total_count
+_current_test_id: dict[tuple[int, str], int] = {}    # (bus_id, label) -> gps_test.id
+
+# Outbox queue to survive offline periods
+_outbox: deque[tuple[str, str, int, bool]] = deque()      # (topic, payload, qos, retain)
+_outbox_lock = threading.Lock()
+
+# ─── TIME/HELPERS ─────────────────────────────────────────────────────
 def now_ph():
     # If you prefer UTC in DB, use datetime.now(timezone.utc)
     return datetime.utcnow() + timedelta(hours=8)
@@ -102,14 +125,119 @@ def _bus_by_device(sess, topic: str):
            .first())
     return bus, device_id
 
-# ─── HANDLERS ─────────────────────────────────────────────────────────
+def _flush_outbox():
+    if not client.is_connected():
+        return
+    with _outbox_lock:
+        while _outbox:
+            topic, payload, qos, retain = _outbox[0]
+            info = client.publish(topic, payload=payload, qos=qos, retain=retain)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                # Stop flushing and retry next time we connect or publish
+                break
+            _outbox.popleft()
+
+# ─── MQTT CALLBACKS ───────────────────────────────────────────────────
+def on_connect(c, _u, _f, rc):
+    if rc == 0:
+        subs = [(TOPIC_PEOPLE, 1), (TOPIC_TEST_SAMPLE, 1), (TOPIC_TEST_SUMMARY, 1)]
+        try:
+            c.subscribe(subs)
+        except Exception:
+            _log.exception("Subscribe failed")
+        _log.info("MQTT connected; subscribed to topics. client_id=%s", CLIENT_ID)
+        _flush_outbox()   # ✅ send anything queued during downtime
+    else:
+        _log.error("❌ MQTT connect failed rc=%s client_id=%s", rc, CLIENT_ID)
+
+def on_disconnect(_c, _u, rc):
+    # With loop_start() running, Paho will try to reconnect using our backoff
+    _log.warning("MQTT disconnected rc=%s client_id=%s", rc, CLIENT_ID)
+
+def on_message(_c, _u, msg):
+    topic = msg.topic
+    payload = msg.payload.decode("utf-8", errors="ignore")
+
+    try:
+        if topic.endswith("/people"):
+            handle_people(topic, payload); return
+        if topic.endswith("/test/sample"):
+            handle_test_sample(topic, payload); return
+        if topic.endswith("/test/summary"):
+            handle_test_summary(topic, payload); return
+    except Exception:
+        _log.exception("Unhandled error for topic=%s", topic)
+
+# ─── CLIENT STARTUP GUARD ─────────────────────────────────────────────
+def _ensure_started():
+    """Idempotently start the MQTT client and its network loop."""
+    global _started
+    if _started:
+        return
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    # connect_async + loop_start → non-blocking and auto-reconnect
+    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=45)
+    client.loop_start()
+    _started = True
+    _log.info("MQTT client auto-started (publisher/ingest mode) client_id=%s", CLIENT_ID)
+
+# ─── PUBLISH HELPERS ──────────────────────────────────────────────────
+def publish(topic: str, message: dict | list | str, qos: int = 1, retain: bool = False) -> bool:
+    """
+    Fire-and-forget publish suitable for web request threads.
+    - Starts the client if needed.
+    - Queues the message when offline and flushes on reconnect.
+    - Returns True unless we synchronously know broker refused (still queued).
+    """
+    _ensure_started()
+    payload = json.dumps(message, separators=(",", ":")) if isinstance(message, (dict, list)) else str(message)
+
+    if not client.is_connected():
+        with _outbox_lock:
+            _outbox.append((topic, payload, qos, retain))
+        _log.debug("queued (offline) → %s", topic)
+        return True
+
+    try:
+        info = client.publish(topic, payload=payload, qos=qos, retain=retain)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            with _outbox_lock:
+                _outbox.append((topic, payload, qos, retain))
+            _log.warning("publish refused rc=%s; re-queued topic=%s", info.rc, topic)
+            return False
+        return True
+    except Exception:
+        _log.exception("Failed to publish to %s", topic)
+        # keep the payload; add to outbox
+        with _outbox_lock:
+            _outbox.append((topic, payload, qos, retain))
+        return False
+
+def publish_sync(topic: str, message: dict | list | str, qos: int = 1, retain: bool = False, timeout: float = 2.0) -> bool:
+    """
+    Synchronous publish (avoid in Flask request threads).
+    """
+    _ensure_started()
+    payload = json.dumps(message, separators=(",", ":")) if isinstance(message, (dict, list)) else str(message)
+    try:
+        info = client.publish(topic, payload=payload, qos=qos, retain=retain)
+        info.wait_for_publish(timeout=timeout)
+        return info.is_published()
+    except Exception:
+        _log.exception("Failed to publish_sync to %s", topic)
+        return False
+
+# ─── HANDLERS (INGEST) ────────────────────────────────────────────────
 def handle_people(topic: str, payload_raw: str):
     sess = Session()
     try:
         p = json.loads(payload_raw)
         bus, device_id = _bus_by_device(sess, topic)
         if not bus:
-            logging.error("No bus found for topic=%s", topic); return
+            _log.error("No bus found for topic=%s", topic)
+            return
 
         total = int(p.get("total", 0))
         if _last_totals.get(bus.id) == total:
@@ -130,10 +258,11 @@ def handle_people(topic: str, payload_raw: str):
             ts=now_ph(),
         ))
         sess.commit()
-        logging.debug("Inserted SensorReading for bus=%s", device_id)
+        _log.debug("Inserted SensorReading for bus=%s", device_id)
 
     except Exception:
-        sess.rollback(); logging.exception("people ingest failed: %s", payload_raw)
+        sess.rollback()
+        _log.exception("people ingest failed: %s", payload_raw)
     finally:
         sess.close()
 
@@ -143,7 +272,8 @@ def handle_test_sample(topic: str, payload_raw: str):
         p = json.loads(payload_raw)
         bus, device_id = _bus_by_device(sess, topic)
         if not bus:
-            logging.error("No bus for topic=%s", topic); return
+            _log.error("No bus for topic=%s", topic)
+            return
 
         label    = str(p.get("label", "test"))
         lat      = float(p["lat"])
@@ -167,14 +297,14 @@ def handle_test_sample(topic: str, payload_raw: str):
                 VALUES
                   (:bus_id, :label, :lat_true, :lng_true, :started_at, 0)
             """)
-            res = sess.execute(ins, dict(
+            sess.execute(ins, dict(
                 bus_id=bus.id, label=label,
                 lat_true=lat_true, lng_true=lng_true,
                 started_at=ts
             ))
             sess.commit()
 
-            # Retrieve id (LAST_INSERT_ID works per-connection, so re-select)
+            # Retrieve id (LAST_INSERT_ID is connection-scoped; re-select)
             sel = text("""
                 SELECT id FROM gps_test
                 WHERE bus_id=:bus_id AND label=:label
@@ -182,7 +312,7 @@ def handle_test_sample(topic: str, payload_raw: str):
             """)
             test_id = sess.execute(sel, dict(bus_id=bus.id, label=label)).scalar()
             _current_test_id[key] = test_id
-            logging.info("➕ New GpsTest id=%s bus=%s label=%s", test_id, device_id, label)
+            _log.info("➕ New GpsTest id=%s bus=%s label=%s", test_id, device_id, label)
 
         # Insert sample
         sess.execute(text("""
@@ -195,7 +325,7 @@ def handle_test_sample(topic: str, payload_raw: str):
             lat=lat, lng=lng, err_m=err_m, sats=sats, hdop=hdop
         ))
 
-        # Increment sample counter (optional but handy)
+        # Increment sample counter (optional)
         sess.execute(text("""
             UPDATE gps_test SET samples = COALESCE(samples,0) + 1
             WHERE id = :test_id
@@ -204,7 +334,8 @@ def handle_test_sample(topic: str, payload_raw: str):
         sess.commit()
 
     except Exception:
-        sess.rollback(); logging.exception("test/sample ingest failed: %s", payload_raw)
+        sess.rollback()
+        _log.exception("test/sample ingest failed: %s", payload_raw)
     finally:
         sess.close()
 
@@ -214,7 +345,8 @@ def handle_test_summary(topic: str, payload_raw: str):
         p = json.loads(payload_raw)
         bus, device_id = _bus_by_device(sess, topic)
         if not bus:
-            logging.error("No bus for topic=%s", topic); return
+            _log.error("No bus for topic=%s", topic)
+            return
 
         label      = str(p.get("label", "test"))
         mean_err_m = float(p.get("mean_err_m", 0))
@@ -272,62 +404,27 @@ def handle_test_summary(topic: str, payload_raw: str):
         # Clear open-session cache so the next /start_test makes a new row
         _current_test_id.pop((bus.id, label), None)
 
-        logging.info("✅ Closed GpsTest id=%s bus=%s label=%s", test_id, device_id, label)
+        _log.info("✅ Closed GpsTest id=%s bus=%s label=%s", test_id, device_id, label)
 
     except Exception:
-        sess.rollback(); logging.exception("test/summary ingest failed: %s", payload_raw)
+        sess.rollback()
+        _log.exception("test/summary ingest failed: %s", payload_raw)
     finally:
         sess.close()
 
-# ─── MQTT CALLBACKS ───────────────────────────────────────────────────
-def on_connect(c, _u, _f, rc):
-    if rc == 0:
-        c.subscribe([(TOPIC_PEOPLE, 1),
-                     (TOPIC_TEST_SAMPLE, 1),
-                     (TOPIC_TEST_SUMMARY, 1)])
-        logging.info("MQTT connected; subscribed to topics.")
-    else:
-        logging.error("❌ MQTT connect failed rc=%s", rc)
-
-def on_message(_c, _u, msg):
-    topic = msg.topic
-    payload = msg.payload.decode("utf-8", errors="ignore")
-
-    try:
-        if topic.endswith("/people"):
-            handle_people(topic, payload); return
-        if topic.endswith("/test/sample"):
-            handle_test_sample(topic, payload); return
-        if topic.endswith("/test/summary"):
-            handle_test_summary(topic, payload); return
-    except Exception:
-        logging.exception("Unhandled error for topic=%s", topic)
-
 # ─── RUNNERS ──────────────────────────────────────────────────────────
 def run():
+    """Blocking runner (CLI): keeps the ingest loop alive."""
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+    client.connect(MQTT_HOST, MQTT_PORT, keepalive=45)
     client.loop_forever()
 
 def start_in_background():
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
-    client.loop_start()
-    logging.info("MQTT ingest started in background (ws=%s)", USE_WS)
-
-# ─── PUBLISH HELPER (optional) ────────────────────────────────────────
-def publish(topic: str, message: dict):
-    payload = json.dumps(message)
-    for _ in range(3):
-        try:
-            client.publish(topic, payload, qos=1)
-            logging.debug("Published %s → %s", topic, payload)
-            return
-        except:
-            time.sleep(0.1)
-    logging.error("Failed to publish to %s after retries", topic)
+    """Non-blocking runner (embed in Flask, etc.)."""
+    _ensure_started()
+    _log.info("MQTT ingest started in background (ws=%s)", USE_WS)
 
 if __name__ == "__main__":
     run()

@@ -158,9 +158,6 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
     except Exception:
         current_app.logger.exception("[mqtt] user-wallet publish failed")
 
-# --- imports near top of file (already present) ---
-# from app.realtime import emit_announcement
-
 def _post_commit_notify(
     app,
     bus_id: int,
@@ -172,53 +169,113 @@ def _post_commit_notify(
     new_balance_pesos: int | None = None,
     wallet_owner_id: int | None = None,
     total_pesos: int | None = None,
-    pao_id: int | None = None,              # 👈 NEW: who authored (the PAO)
+    pao_id: int | None = None,
 ):
     """
     Background notifier to run *after* a successful DB commit.
-    IMPORTANT: Pass the real Flask app object (current_app._get_current_object()).
+
+    Args:
+        app: The real Flask app object (pass current_app._get_current_object()).
+        bus_id: The bus related to the transaction/operation.
+        user_id: The commuter (or actor) id that initiated the action.
+        items_ids: Related DB row ids (e.g., tickets) for context/telemetry.
+        o_name: Origin name (for user-facing push content).
+        d_name: Destination name (for user-facing push content).
+        new_balance_pesos: If provided, publish a wallet balance update (PHP).
+        wallet_owner_id: The wallet owner to notify/publish balance for (defaults to user_id if omitted).
+        total_pesos: Optional total amount for context in payloads and pushes.
+        pao_id: PAO user id (kept for parity, unused here).
     """
     import logging
     import time as _time
 
+    # Defensive copy / normalization
+    try:
+        items_ids = list(items_ids or [])
+    except Exception:
+        items_ids = []
+
     try:
         with app.app_context():
-            # ... (existing MQTT + push logic stays the same)
-
-            # --- (existing blocks) ---
-
-            # ✅ New: announce the ticket ~2s after creation
+            # ------------------------------
+            # 1) MQTT: wallet update (if any)
+            # ------------------------------
             try:
-                _time.sleep(2)  # target ≈ 2 seconds after commit
-
-                # Persist an Announcement so the UI list stays consistent
-                msg = f"Ticket issued • {o_name} → {d_name}"
-                if total_pesos is not None:
-                    msg += f" • ₱{float(total_pesos):.2f}"
-
-                ann = Announcement(message=msg, created_by=int(pao_id or user_id or 0))
-                db.session.add(ann)
-                db.session.commit()
-
-                # Mirror the broadcast payload shape
-                bus_row = Bus.query.get(bus_id)
-                bus_identifier = (bus_row.identifier or f"bus-{bus_row.id:02d}") if bus_row else "—"
-                payload = {
-                    "id": ann.id,
-                    "message": ann.message,
-                    "timestamp": _iso_utc(ann.timestamp),
-                    "bus_identifier": bus_identifier,
-                }
-                emit_announcement(payload, bus_id=bus_id)
+                # Prefer explicit wallet_owner_id; fall back to user_id
+                wallet_uid = wallet_owner_id or user_id
+                if wallet_uid is not None and new_balance_pesos is not None:
+                    _publish_user_wallet(
+                        int(wallet_uid),
+                        new_balance_pesos=int(new_balance_pesos),
+                        event="wallet_update",
+                        bus_id=bus_id,
+                        related_items=items_ids,
+                    )
             except Exception:
-                app.logger.exception("[post-commit] ticket announcement emit failed")
+                try:
+                    current_app.logger.exception("[mqtt] wallet publish failed")
+                except Exception:
+                    logging.exception("[mqtt] wallet publish failed (no app logger)")
+
+            # ---------------------------------------------------
+            # 2) Optional: ticket/payment push (NOT announcements)
+            # ---------------------------------------------------
+            # We intentionally DO NOT create Announcement rows or emit_announcement here.
+            # Only push a user-facing notification (if we can identify a recipient).
+            try:
+                push_uid = user_id or wallet_owner_id
+                if push_uid:
+                    # Build a concise push message; keep it short & localized-friendly.
+                    title = "Ticket processed"
+                    body = f"{o_name} → {d_name}"
+                    if total_pesos is not None:
+                        try:
+                            body = f"{body} • ₱{float(total_pesos):.2f}"
+                        except Exception:
+                            pass
+
+                    # Add structured data for client-side handling (optional)
+                    data = {
+                        "type": "ticket",
+                        "bus_id": int(bus_id) if bus_id is not None else None,
+                        "items": items_ids,
+                        "origin": o_name,
+                        "destination": d_name,
+                        "total_php": float(total_pesos) if total_pesos is not None else None,
+                        "sentAt": int(_epoch_ms() * 1000),
+                    }
+
+                    # Fire-and-forget push
+                    try:
+                        push_to_user(int(push_uid), title=title, body=body, data=data)
+                    except Exception:
+                        # Fallback: best-effort
+                        current_app.logger.exception("[push] push_to_user failed")
+            except Exception:
+                try:
+                    current_app.logger.exception("[push] block crashed")
+                except Exception:
+                    logging.exception("[push] block crashed (no app logger)")
+
+            # ---------------------------------------------------
+            # 3) (Intentionally removed) Ticket Announcements
+            # ---------------------------------------------------
+            # NOTE:
+            # Previously this function persisted an Announcement and emitted it
+            # ~2 seconds after commit:
+            #   - created an Announcement("Ticket issued • {o_name} → {d_name} …")
+            #   - emit_announcement(payload, bus_id=bus_id)
+            #
+            # Per request, that behavior has been removed so ticket-create events
+            # will NOT appear in the Announcements feed anymore.
 
     except Exception:
-        # ... (keep existing error logging)
+        # Top-level guard: never let this background worker crash the caller.
         try:
-            app.logger.exception("[post-commit] worker crashed")
+            current_app.logger.exception("[post-commit] worker crashed")
         except Exception:
             logging.exception("[post-commit] worker crashed (no app logger)")
+
 
 
 # ---- Time helpers (UTC canonical; Manila convenience) ----
