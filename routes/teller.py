@@ -12,7 +12,7 @@ from db import db
 from models.user import User
 from models.wallet import WalletAccount, WalletLedger, TopUp
 from models.device_token import DeviceToken
-from utils.push import push_to_user
+from utils.push import push_to_user  # (kept if you still use FCM push elsewhere)
 from sqlalchemy import func
 
 try:
@@ -25,9 +25,10 @@ from services.wallet import topup_cash, topup_gcash, approve_topup_existing
 
 # Optional realtime publish (best-effort / no-op if module missing)
 try:
-    from mqtt_ingest import publish as mqtt_publish  # def publish(topic: str, payload: dict) -> bool
+    # def publish(topic: str, payload: dict) -> bool
+    from mqtt_ingest import publish as mqtt_publish
 except Exception:
-    mqtt_publish = None
+    mqtt_publish = None  # type: ignore[assignment]
 
 # For verifying commuter QR tokens (must match routes/commuter.py)
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -77,14 +78,6 @@ def _as_php(x: Optional[int]) -> int:
     except Exception:
         return 0
 
-def _receipt_url_if_exists(tid: int) -> Optional[str]:
-    """Return absolute URL to the stored receipt image for this top-up id, if any."""
-    for ext in (".jpg", ".jpeg", ".png", ".webp"):
-        p = os.path.join(current_app.root_path, "static", RECEIPTS_DIR, f"{tid}{ext}")
-        if os.path.exists(p):
-            return url_for("static", filename=f"{RECEIPTS_DIR}/{tid}{ext}", _external=True)
-    return None
-
 def _reject_reason_path(tid: int) -> str:
     """Local file path for a saved reject reason (no DB migration needed)."""
     return os.path.join(current_app.root_path, "static", RECEIPTS_DIR, f"{tid}.reject.txt")
@@ -100,43 +93,94 @@ def _reject_reason_if_exists(tid: int) -> Optional[str]:
         current_app.logger.exception("[teller] read reject reason failed tid=%s", tid)
     return None
 
+# … imports unchanged …
+try:
+    from mqtt_ingest import publish as mqtt_publish  # best-effort; returns bool
+except Exception:
+    mqtt_publish = None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PUBLISH HELPERS (UPDATE THESE)
+
 def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extra) -> bool:
     """
-    Best-effort realtime wallet update for the commuter's device(s).
-    Mirrors the PAO/commuter payload shape so clients can reuse handlers.
+    Best-effort realtime wallet update for the commuter device(s).
+    Publishes to BOTH topic roots to cover app variants:
+      user/{uid}/wallet   and   users/{uid}/wallet
     """
     if not mqtt_publish:
+        current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (wallet)")
+        return False
+    payload = {
+        "type": "wallet_update",
+        "event": event,  # "wallet_topup" | "wallet_debit" | …
+        "new_balance_php": int(new_balance_pesos),
+        "sentAt": int(_time.time() * 1000),
+        **extra,
+    }
+    ok = True
+    for root in ("user", "users"):
+        topic = f"{root}/{int(uid)}/wallet"
+        ok = mqtt_publish(topic, payload) and ok
+        current_app.logger.info("[mqtt] wallet → %s ok=%s", topic, ok)
+    return ok
+
+def _publish_user_event(uid: int, payload: dict) -> bool:
+    """
+    Publish a generic event to the commuter stream.
+    Publishes to BOTH:
+      user/{uid}/events   and   users/{uid}/events
+    """
+    if not mqtt_publish:
+        current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (events)")
+        return False
+    if "sentAt" not in payload:
+        payload["sentAt"] = int(_time.time() * 1000)
+    ok = True
+    for root in ("user", "users"):
+        topic = f"{root}/{int(uid)}/events"
+        ok = mqtt_publish(topic, payload) and ok
+        current_app.logger.info("[mqtt] event → %s ok=%s type=%s", topic, ok, payload.get("type"))
+    return ok
+
+def _publish_user_event(uid: int, payload: dict) -> bool:
+    """
+    Publish a generic event to the commuter's MQTT stream.
+    Mobile app subscribes to: user/{uid}/events
+    """
+    if not mqtt_publish:
+        current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (events)")
         return False
     try:
-        payload = {
-            "type": "wallet_update",
-            "event": event,  # "wallet_topup" | "wallet_debit" | ...
-            "new_balance_php": int(new_balance_pesos),
-            "sentAt": int(_time.time() * 1000),
-            **extra,
-        }
-        mqtt_publish(f"user/{uid}/wallet", payload)
+        if "sentAt" not in payload:
+            payload["sentAt"] = int(_time.time() * 1000)
+        mqtt_publish(f"user/{uid}/events", payload)
         return True
     except Exception:
-        current_app.logger.exception("[mqtt] teller wallet publish failed")
+        current_app.logger.exception("[mqtt] user event publish failed uid=%s", uid)
         return False
 
-# helper (put near _publish_user_wallet)
+# helper (put near publish helpers)
 def _publish_tellers(event: str, **data) -> bool:
     if not mqtt_publish:
+        current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (tellers)")
         return False
     try:
-        mqtt_publish("tellers/topups", { "event": event, **data })
+        mqtt_publish("tellers/topups", {"event": event, **data})
         return True
     except Exception:
         current_app.logger.exception("[mqtt] tellers publish failed")
         return False
 
+def _receipt_url_if_exists(tid: int) -> Optional[str]:
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        p = os.path.join(current_app.root_path, "static", RECEIPTS_DIR, f"{tid}{ext}")
+        if os.path.exists(p):
+            return url_for("static", filename=f"{RECEIPTS_DIR}/{tid}{ext}", _external=True)
+    return None
 
 def _unsign_user_qr(token: str, *, max_age: Optional[int] = None) -> int:
-    """
-    Returns the user id encoded in commuter QR token from /commuter/users/me/qr.png.
-    """
+    """Returns the user id encoded in commuter QR token from /commuter/users/me/qr.png."""
     s = URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt=SALT_USER_QR)
     data = s.loads(token, max_age=max_age) if max_age else s.loads(token)
     uid = int(data.get("uid"))
@@ -176,9 +220,7 @@ def register_teller_device_token():
         return jsonify(error=str(e)), 400
 
 def _ensure_wallet_row(user_id: int) -> int:
-    """
-    Ensure wallet_accounts row exists; return current balance (pesos).
-    """
+    """Ensure wallet_accounts row exists; return current balance (pesos)."""
     acct = WalletAccount.query.get(user_id)
     if not acct:
         acct = WalletAccount(user_id=user_id, balance_pesos=0)
@@ -393,7 +435,6 @@ def approve_topup(tid: int):
                     "new_balance_php": int(new_balance),
                     "deeplink": "/(tabs)/commuter/wallet",
                     "sentAt": sent_at,
-                    # Let client show an optimistic row in "Recent Activity"
                     "ledger_hint": {
                         "direction": "credit",
                         "event": f"topup:{t.method or 'cash'}",
@@ -402,6 +443,19 @@ def approve_topup(tid: int):
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "ref": {"table": "wallet_topups", "id": int(t.id)},
                     },
+                },
+            )
+
+            _publish_user_event(
+                int(t.account_id),
+                {
+                    "type": "wallet_topup",
+                    "method": t.method,
+                    "amount_php": int(t.amount_pesos or 0),
+                    "topup_id": int(t.id),
+                    "ledger_id": int(ledger_id),
+                    "new_balance_php": int(new_balance),
+                    "deeplink": "/(tabs)/commuter/wallet",
                 },
             )
 
@@ -699,6 +753,19 @@ def create_topup():
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "ref": {"table": "wallet_topups", "id": int(topup_id)},
                     },
+                },
+            )
+
+            _publish_user_event(
+                account_user_id,
+                {
+                    "type": "wallet_topup",
+                    "method": method,
+                    "amount_php": int(amount_pesos),
+                    "topup_id": int(topup_id),
+                    "ledger_id": int(ledger_id),
+                    "new_balance_php": int(round(float(new_bal))),
+                    "deeplink": "/(tabs)/commuter/wallet",
                 },
             )
 

@@ -1,13 +1,17 @@
 """
-MQTT ingest service for:
+MQTT ingest + publish helpers.
+
+Listens for:
 - Passenger counts: device/<device_id>/people
 - GPS accuracy tests:
     device/<device_id>/test/sample   (per-fix error, JSON)
     device/<device_id>/test/summary  (mean/RMSE/min/max, JSON, retained)
 
-Run modes:
-- Blocking:  python -m mqtt_ingest
-- Background (for embedding into another app): import start_in_background()
+Also exposes convenient publishers:
+- publish(topic, message, qos=1, retain=False)
+- notify_tellers(payload)
+- notify_user_event(uid, payload)
+- notify_user_wallet(uid, payload)
 
 Assumes MySQL/MariaDB and that you've run the provided SQL to create:
   gps_test, gps_test_sample
@@ -20,11 +24,10 @@ import logging
 import os
 import ssl
 import threading
-import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
 from typing import Optional
+from uuid import uuid4
 
 import paho.mqtt.client as mqtt
 from dateutil import parser as dtparse  # pip install python-dateutil
@@ -35,23 +38,20 @@ from sqlalchemy import Integer, String
 from config import Config
 
 # ─── LOGGING ──────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 _log = logging.getLogger("pgt.mqtt")
 
 # ─── MQTT CONFIG ──────────────────────────────────────────────────────
-MQTT_HOST     = "35010b9ea10d41c0be8ac5e9a700a957.s1.eu.hivemq.cloud"
-USE_WS        = True
-MQTT_PORT     = 8884 if USE_WS else 8883
-MQTT_PATH     = "/mqtt"      # only used when USE_WS=True
-MQTT_USER     = "vanrodolf"
-MQTT_PASS     = "Vanrodolf123."
+MQTT_HOST = "35010b9ea10d41c0be8ac5e9a700a957.s1.eu.hivemq.cloud"
+USE_WS = True
+MQTT_PORT = 8884 if USE_WS else 8883
+MQTT_PATH = "/mqtt"  # only used when USE_WS=True
+MQTT_USER = "vanrodolf"
+MQTT_PASS = "Vanrodolf123."
 
-TOPIC_PEOPLE        = "device/+/people"
-TOPIC_TEST_SAMPLE   = "device/+/test/sample"
-TOPIC_TEST_SUMMARY  = "device/+/test/summary"
+TOPIC_PEOPLE = "device/+/people"
+TOPIC_TEST_SAMPLE = "device/+/test/sample"
+TOPIC_TEST_SUMMARY = "device/+/test/summary"
 
 # ─── DB SETUP ─────────────────────────────────────────────────────────
 engine = create_engine(Config.SQLALCHEMY_DATABASE_URI, pool_pre_ping=True)
@@ -69,7 +69,6 @@ Session = scoped_session(sessionmaker(bind=engine, expire_on_commit=False))
 
 # Lightweight ORM only for 'bus' lookup (your existing table)
 Base = declarative_base()
-
 class Bus(Base):
     __tablename__ = "bus"
     id = mapped_column(Integer, primary_key=True)
@@ -77,14 +76,8 @@ class Bus(Base):
 
 # ─── MQTT CLIENT (single global) ──────────────────────────────────────
 transport = "websockets" if USE_WS else "tcp"
-
-CLIENT_ID = f"pgt-ingest-{os.getpid()}-{uuid4().hex[:6]}"  # ✅ unique per process
-client = mqtt.Client(
-    client_id=CLIENT_ID,
-    clean_session=True,
-    transport=transport,
-    protocol=mqtt.MQTTv311
-)
+CLIENT_ID = f"pgt-ingest-{os.getpid()}-{uuid4().hex[:6]}"
+client = mqtt.Client(client_id=CLIENT_ID, clean_session=True, transport=transport, protocol=mqtt.MQTTv311)
 client.enable_logger(_log)
 client.username_pw_set(MQTT_USER, MQTT_PASS)
 
@@ -97,16 +90,16 @@ if USE_WS:
 
 # Backoff & inflight settings
 client.reconnect_delay_set(min_delay=1, max_delay=30)
-client.max_inflight_messages_set(20)  # tune as needed
-client.max_queued_messages_set(0)     # 0 = unlimited (or set a cap)
+client.max_inflight_messages_set(20)
+client.max_queued_messages_set(0)  # 0 = unlimited (or set a cap)
 
 # ─── STATE/CACHES ─────────────────────────────────────────────────────
 _started = False
-_last_totals: dict[int, int] = {}                    # bus_id -> last total_count
-_current_test_id: dict[tuple[int, str], int] = {}    # (bus_id, label) -> gps_test.id
+_last_totals: dict[int, int] = {}                 # bus_id -> last total_count
+_current_test_id: dict[tuple[int, str], int] = {} # (bus_id, label) -> gps_test.id
 
 # Outbox queue to survive offline periods
-_outbox: deque[tuple[str, str, int, bool]] = deque()      # (topic, payload, qos, retain)
+_outbox: deque[tuple[str, str, int, bool]] = deque()  # (topic, payload, qos, retain)
 _outbox_lock = threading.Lock()
 
 # ─── TIME/HELPERS ─────────────────────────────────────────────────────
@@ -133,7 +126,6 @@ def _flush_outbox():
             topic, payload, qos, retain = _outbox[0]
             info = client.publish(topic, payload=payload, qos=qos, retain=retain)
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
-                # Stop flushing and retry next time we connect or publish
                 break
             _outbox.popleft()
 
@@ -145,19 +137,17 @@ def on_connect(c, _u, _f, rc):
             c.subscribe(subs)
         except Exception:
             _log.exception("Subscribe failed")
-        _log.info("MQTT connected; subscribed to topics. client_id=%s", CLIENT_ID)
-        _flush_outbox()   # ✅ send anything queued during downtime
+        _log.info("MQTT connected; subscribed. client_id=%s", CLIENT_ID)
+        _flush_outbox()
     else:
         _log.error("❌ MQTT connect failed rc=%s client_id=%s", rc, CLIENT_ID)
 
 def on_disconnect(_c, _u, rc):
-    # With loop_start() running, Paho will try to reconnect using our backoff
     _log.warning("MQTT disconnected rc=%s client_id=%s", rc, CLIENT_ID)
 
 def on_message(_c, _u, msg):
     topic = msg.topic
     payload = msg.payload.decode("utf-8", errors="ignore")
-
     try:
         if topic.endswith("/people"):
             handle_people(topic, payload); return
@@ -177,11 +167,10 @@ def _ensure_started():
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     client.on_message = on_message
-    # connect_async + loop_start → non-blocking and auto-reconnect
     client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=45)
     client.loop_start()
     _started = True
-    _log.info("MQTT client auto-started (publisher/ingest mode) client_id=%s", CLIENT_ID)
+    _log.info("MQTT client auto-started (publisher/ingest) client_id=%s", CLIENT_ID)
 
 # ─── PUBLISH HELPERS ──────────────────────────────────────────────────
 def publish(topic: str, message: dict | list | str, qos: int = 1, retain: bool = False) -> bool:
@@ -210,15 +199,11 @@ def publish(topic: str, message: dict | list | str, qos: int = 1, retain: bool =
         return True
     except Exception:
         _log.exception("Failed to publish to %s", topic)
-        # keep the payload; add to outbox
         with _outbox_lock:
             _outbox.append((topic, payload, qos, retain))
         return False
 
-def publish_sync(topic: str, message: dict | list | str, qos: int = 1, retain: bool = False, timeout: float = 2.0) -> bool:
-    """
-    Synchronous publish (avoid in Flask request threads).
-    """
+def publish_sync(topic: str, message: dict | list | str, qos: int = 1, retain: bool = False, timeout: float = 2.5) -> bool:
     _ensure_started()
     payload = json.dumps(message, separators=(",", ":")) if isinstance(message, (dict, list)) else str(message)
     try:
@@ -229,8 +214,34 @@ def publish_sync(topic: str, message: dict | list | str, qos: int = 1, retain: b
         _log.exception("Failed to publish_sync to %s", topic)
         return False
 
+# Convenience wrappers (keeps topic naming consistent)
+def notify_tellers(payload: dict) -> bool:
+    """Broadcast to all tellers' consoles."""
+    if "sentAt" not in payload:
+        payload["sentAt"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return publish("tellers/topups", payload)
+
+def notify_user_event(uid: int, payload: dict) -> bool:
+    """Send a one-off event to a commuter device; publishes to both singular/plural topic roots."""
+    if "sentAt" not in payload:
+        payload["sentAt"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+    ok = True
+    for root in ("user", "users"):  # support both client subscriptions
+        ok = publish(f"{root}/{int(uid)}/events", payload) and ok
+    return ok
+
+def notify_user_wallet(uid: int, payload: dict) -> bool:
+    """Send wallet/balance updates; publishes to both singular/plural topic roots."""
+    if "sentAt" not in payload:
+        payload["sentAt"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+    ok = True
+    for root in ("user", "users"):
+        ok = publish(f"{root}/{int(uid)}/wallet", payload) and ok
+    return ok
+
 # ─── HANDLERS (INGEST) ────────────────────────────────────────────────
 def handle_people(topic: str, payload_raw: str):
+    from sqlalchemy import text
     sess = Session()
     try:
         p = json.loads(payload_raw)
@@ -238,12 +249,10 @@ def handle_people(topic: str, payload_raw: str):
         if not bus:
             _log.error("No bus found for topic=%s", topic)
             return
-
         total = int(p.get("total", 0))
         if _last_totals.get(bus.id) == total:
             return
         _last_totals[bus.id] = total
-
         stmt = text("""
             INSERT INTO sensor_reading
               (in_count, out_count, total_count, bus_id, timestamp)
@@ -259,7 +268,6 @@ def handle_people(topic: str, payload_raw: str):
         ))
         sess.commit()
         _log.debug("Inserted SensorReading for bus=%s", device_id)
-
     except Exception:
         sess.rollback()
         _log.exception("people ingest failed: %s", payload_raw)
@@ -274,12 +282,9 @@ def handle_test_sample(topic: str, payload_raw: str):
         if not bus:
             _log.error("No bus for topic=%s", topic)
             return
-
         label    = str(p.get("label", "test"))
-        lat      = float(p["lat"])
-        lng      = float(p["lng"])
-        lat_true = float(p["lat_true"])
-        lng_true = float(p["lng_true"])
+        lat      = float(p["lat"]);      lng      = float(p["lng"])
+        lat_true = float(p["lat_true"]); lng_true = float(p["lng_true"])
         err_m    = float(p["err_m"])
         sats     = int(p.get("sats", -1)) if p.get("sats") is not None else None
         hdop     = float(p.get("hdop", -1.0)) if p.get("hdop") is not None else None
@@ -288,9 +293,7 @@ def handle_test_sample(topic: str, payload_raw: str):
 
         key = (bus.id, label)
         test_id = _current_test_id.get(key)
-
         if not test_id:
-            # Create/open a session row in gps_test
             ins = text("""
                 INSERT INTO gps_test
                   (bus_id, label, lat_true, lng_true, started_at, samples)
@@ -298,13 +301,9 @@ def handle_test_sample(topic: str, payload_raw: str):
                   (:bus_id, :label, :lat_true, :lng_true, :started_at, 0)
             """)
             sess.execute(ins, dict(
-                bus_id=bus.id, label=label,
-                lat_true=lat_true, lng_true=lng_true,
-                started_at=ts
+                bus_id=bus.id, label=label, lat_true=lat_true, lng_true=lng_true, started_at=ts
             ))
             sess.commit()
-
-            # Retrieve id (LAST_INSERT_ID is connection-scoped; re-select)
             sel = text("""
                 SELECT id FROM gps_test
                 WHERE bus_id=:bus_id AND label=:label
@@ -314,25 +313,15 @@ def handle_test_sample(topic: str, payload_raw: str):
             _current_test_id[key] = test_id
             _log.info("➕ New GpsTest id=%s bus=%s label=%s", test_id, device_id, label)
 
-        # Insert sample
         sess.execute(text("""
             INSERT INTO gps_test_sample
               (test_id, bus_id, ts, lat, lng, err_m, sats, hdop)
             VALUES
               (:test_id, :bus_id, :ts, :lat, :lng, :err_m, :sats, :hdop)
-        """), dict(
-            test_id=test_id, bus_id=bus.id, ts=ts,
-            lat=lat, lng=lng, err_m=err_m, sats=sats, hdop=hdop
-        ))
+        """), dict(test_id=test_id, bus_id=bus.id, ts=ts, lat=lat, lng=lng, err_m=err_m, sats=sats, hdop=hdop))
 
-        # Increment sample counter (optional)
-        sess.execute(text("""
-            UPDATE gps_test SET samples = COALESCE(samples,0) + 1
-            WHERE id = :test_id
-        """), dict(test_id=test_id))
-
+        sess.execute(text("UPDATE gps_test SET samples = COALESCE(samples,0) + 1 WHERE id = :test_id"), dict(test_id=test_id))
         sess.commit()
-
     except Exception:
         sess.rollback()
         _log.exception("test/sample ingest failed: %s", payload_raw)
@@ -358,7 +347,6 @@ def handle_test_summary(topic: str, payload_raw: str):
         lng_true   = float(p.get("lng_true", 0))
         duration_s = int(p.get("duration_s", 0))
 
-        # Find most recent test session (last 24h) with same label
         cutoff = now_ph() - timedelta(hours=24)
         sel = text("""
             SELECT id, started_at FROM gps_test
@@ -368,7 +356,6 @@ def handle_test_summary(topic: str, payload_raw: str):
         row = sess.execute(sel, dict(bus_id=bus.id, label=label, cutoff=cutoff)).first()
 
         if not row:
-            # Summary arrived before samples; create one
             started_at = now_ph() - timedelta(seconds=duration_s)
             ins = text("""
                 INSERT INTO gps_test
@@ -376,14 +363,12 @@ def handle_test_summary(topic: str, payload_raw: str):
                 VALUES (:bus_id, :label, :lat_true, :lng_true, :started_at)
             """)
             sess.execute(ins, dict(
-                bus_id=bus.id, label=label, lat_true=lat_true, lng_true=lng_true,
-                started_at=started_at
+                bus_id=bus.id, label=label, lat_true=lat_true, lng_true=lng_true, started_at=started_at
             ))
             sess.commit()
             row = sess.execute(sel, dict(bus_id=bus.id, label=label, cutoff=cutoff)).first()
 
         test_id, started_at = row
-
         upd = text("""
             UPDATE gps_test
             SET mean_err_m=:mean_err_m, rmse_m=:rmse_m,
@@ -394,18 +379,12 @@ def handle_test_summary(topic: str, payload_raw: str):
             WHERE id=:id
         """)
         sess.execute(upd, dict(
-            mean_err_m=mean_err_m, rmse_m=rmse_m,
-            min_err_m=min_err_m, max_err_m=max_err_m,
-            samples=samples, duration_s=duration_s,
-            started_at=started_at, id=test_id
+            mean_err_m=mean_err_m, rmse_m=rmse_m, min_err_m=min_err_m, max_err_m=max_err_m,
+            samples=samples, duration_s=duration_s, started_at=started_at, id=test_id
         ))
         sess.commit()
-
-        # Clear open-session cache so the next /start_test makes a new row
         _current_test_id.pop((bus.id, label), None)
-
         _log.info("✅ Closed GpsTest id=%s bus=%s label=%s", test_id, device_id, label)
-
     except Exception:
         sess.rollback()
         _log.exception("test/summary ingest failed: %s", payload_raw)

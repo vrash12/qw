@@ -4,7 +4,7 @@ from flask import Flask, jsonify
 from config import Config
 from db import db, migrate
 from werkzeug.exceptions import HTTPException
-
+from werkzeug.middleware.proxy_fix import ProxyFix
 # import your models so flask-migrate sees them
 from models.user          import User
 from models.bus           import Bus
@@ -30,6 +30,9 @@ from tasks.snap_trips import snap_finished_trips
 
 def create_app():
     app = Flask(__name__)
+
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+    app.config['PREFERRED_URL_SCHEME'] = 'https'
     CORS(app, resources={r"/*": {"origins": "*"}})
     app.config.from_object(Config)
 

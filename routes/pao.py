@@ -158,6 +158,19 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
     except Exception:
         current_app.logger.exception("[mqtt] user-wallet publish failed")
 
+def _publish_user_event(uid: int, payload: dict) -> bool:
+    if not mqtt_publish:
+        return False
+    try:
+        if "sentAt" not in payload:
+            payload = {**payload, "sentAt": int(_time.time() * 1000)}
+        mqtt_publish(f"user/{int(uid)}/events", payload)
+        return True
+    except Exception:
+        current_app.logger.exception("[mqtt] user event publish failed uid=%s", uid)
+        return False
+
+
 def _post_commit_notify(
     app,
     bus_id: int,

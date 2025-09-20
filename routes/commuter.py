@@ -84,7 +84,51 @@ RECEIPTS_DIR = "topup_receipts"
 ALLOWED_EXTS = {"jpg", "jpeg", "png", "webp"}
 
 
+# add after other imports
+try:
+    # optional realtime publish (best-effort)
+    from mqtt_ingest import publish as mqtt_publish  # def publish(topic, payload) -> bool
+except Exception:
+    mqtt_publish = None
 
+def _publish_user_event(uid: int, payload: dict) -> bool:
+    """
+    Publish a generic event to the commuter's MQTT stream.
+    Mobile app should subscribe to: user/{uid}/events
+    """
+    if not mqtt_publish:
+        current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (commuter/events)")
+        return False
+    try:
+        payload.setdefault("sentAt", int(_time.time() * 1000))
+        return bool(mqtt_publish(f"user/{uid}/events", payload))
+    except Exception:
+        current_app.logger.exception("[mqtt] commuter _publish_user_event failed uid=%s", uid)
+        return False
+
+@commuter_bp.route("/me", methods=["GET"])
+@require_role("commuter")
+def commuter_me():
+    """
+    GET /commuter/me
+    Basic profile for the logged-in commuter.
+    """
+    u = g.user
+    def _val(x):  # normalize None -> '' for strings
+        return (x or "").strip() if isinstance(x, str) else x
+
+    return jsonify(
+        id=int(u.id),
+        username=_val(getattr(u, "username", None)),
+        phone_number=_val(getattr(u, "phone_number", None)),
+        first_name=_val(getattr(u, "first_name", None)),
+        last_name=_val(getattr(u, "last_name", None)),
+        role=_val(getattr(u, "role", None)) or "commuter",
+        created_at=(
+            getattr(u, "created_at", None).isoformat()
+            if getattr(u, "created_at", None) else None
+        ),
+    ), 200
 
 def _unique_ref(prefix: str) -> str:
     return f"{prefix}-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
@@ -297,7 +341,7 @@ def create_topup_request():
         notify_tellers({
             "type": "topup_request",
             "title": "🧾 New top-up request",
-            "body": f"₱{amt:,} via GCash from {commuter_name}",
+            "body": f"from {commuter_name}",
 
             # ✅ include multiple ID aliases for compatibility
             "topup_id": tid,           # snake_case
@@ -1740,6 +1784,13 @@ def _local_day_bounds_utc(day: dt.date):
 @commuter_bp.route("/tickets/mine", methods=["GET"])
 @require_role("commuter")
 def my_receipts():
+    """
+    GET /commuter/tickets/mine
+    Query params:
+      page, page_size, date=YYYY-MM-DD, days=7|30, bus_id, light=1, group=1
+    - Ungrouped: one row per ticket (paid or voided).
+    - Grouped: one row per batch/group (paid or voided).
+    """
     page      = max(1, request.args.get("page", type=int, default=1))
     page_size = max(1, request.args.get("page_size", type=int, default=5))
     date_str  = request.args.get("date")
@@ -1748,11 +1799,12 @@ def my_receipts():
     light     = (request.args.get("light") or "").lower() in {"1", "true", "yes"}
     group     = (request.args.get("group") or "").lower() in {"1", "true", "yes"}
 
-    # ---------- UNGROUPED (one row per ticket, PAID-ONLY) ----------
+    # ---------- UNGROUPED (one row per ticket, PAID-OR-VOIDED) ----------
     if not group:
         void_statuses = {"void", "voided", "refunded", "cancelled"}
         conds = [TicketSale.user_id == g.user.id]
 
+        # Include voided tickets in results (paid OR voided), schema-agnostic
         if _has_column("ticket_sales", "voided"):
             conds.append(or_(TicketSale.paid.is_(True), TicketSale.voided.is_(True)))
         elif _has_column("ticket_sales", "status"):
@@ -1768,7 +1820,8 @@ def my_receipts():
             )
             .filter(*conds)
         )
-        # time window
+
+        # Date/day window (LOCAL_TZ semantics)
         try:
             q = _day_range_filter(q, date_str, days)
         except ValueError as e:
@@ -1787,7 +1840,7 @@ def my_receipts():
 
         items = []
         for t in rows:
-            # names via StopTime or TicketStop fallback
+            # Resolve stop names with StopTime or TicketStop fallback
             if t.origin_stop_time:
                 origin_name = t.origin_stop_time.stop_name
             else:
@@ -1800,33 +1853,33 @@ def my_receipts():
                 tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
                 destination_name = tsd.stop_name if tsd else ""
 
-        is_void = _is_ticket_void(t)
+            is_void = _is_ticket_void(t)
+            fare = int(round(float(t.price or 0)))
 
-        fare = int(round(float(t.price or 0)))
-        base = {
-            "id": t.id,
-            "referenceNo": t.reference_no,
-            "date": t.created_at.strftime("%B %d, %Y"),
-            "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
-            "origin": origin_name,
-            "destination": destination_name,
-            "fare": fare,
-            "paid": bool(t.paid) and not is_void,        # never mark paid when voided
-            "voided": bool(is_void),
-            "state": "voided" if is_void else ("paid" if bool(t.paid) else "unpaid"),
-            "created_at": t.created_at.isoformat(),       # helps your app group by day
-            "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
-            "view_url": url_for("commuter.commuter_ticket_view", ticket_id=t.id, _external=True),
-        }
-        if not light:
-            base.update({
-                "passengerType": (t.passenger_type or "").title(),
-                "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "Guest",
-                "bus_id": t.bus_id,
-                "batch_id": int(getattr(t, "batch_id", None) or t.id),
-                "status": getattr(t, "status", None),
-            })
-        items.append(base)
+            base = {
+                "id": t.id,
+                "referenceNo": t.reference_no,
+                "date": t.created_at.strftime("%B %d, %Y"),
+                "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+                "origin": origin_name,
+                "destination": destination_name,
+                "fare": fare,
+                "paid": bool(t.paid) and not is_void,  # never mark paid when voided
+                "voided": bool(is_void),
+                "state": "voided" if is_void else ("paid" if bool(t.paid) else "unpaid"),
+                "created_at": t.created_at.isoformat(),  # helps the app group by day
+                "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
+                "view_url": url_for("commuter.commuter_ticket_view", ticket_id=t.id, _external=True),
+            }
+            if not light:
+                base.update({
+                    "passengerType": (t.passenger_type or "").title(),
+                    "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "Guest",
+                    "bus_id": t.bus_id,
+                    "batch_id": int(getattr(t, "batch_id", None) or t.id),
+                    "status": getattr(t, "status", None),
+                })
+            items.append(base)
 
         return jsonify(
             items=items,
@@ -1836,7 +1889,7 @@ def my_receipts():
             has_more=(page * page_size) < total,
         ), 200
 
-    # ---------- GROUPED (one row per batch, PAID-ONLY) ----------
+    # ---------- GROUPED (one row per batch/group, PAID-OR-VOIDED) ----------
     where_dates = []
     params = {}
 
@@ -1856,12 +1909,14 @@ def my_receipts():
         where_dates.append("bus_id = :bus_id")
         params["bus_id"] = bus_id
 
-    # Only this user's PAID tickets
+    # Only this user's paid or voided tickets (schema-agnostic)
     if _has_column("ticket_sales", "voided"):
         base_where = "user_id = :uid AND (paid = 1 OR voided = 1)"
     elif _has_column("ticket_sales", "status"):
-        base_where = ("user_id = :uid AND (paid = 1 OR status IN "
-                    "('void','voided','refunded','cancelled'))")
+        base_where = (
+            "user_id = :uid AND (paid = 1 OR status IN "
+            "('void','voided','refunded','cancelled'))"
+        )
     else:
         base_where = "user_id = :uid AND paid = 1"
     params["uid"] = g.user.id
@@ -1918,6 +1973,7 @@ def my_receipts():
         if not head:
             continue
 
+        # Resolve stop names
         if head.origin_stop_time:
             origin_name = head.origin_stop_time.stop_name
         else:
@@ -1942,13 +1998,14 @@ def my_receipts():
             "destination": destination_name,
             "commuter": f"{head.user.first_name} {head.user.last_name}" if head.user else "Guest",
             "fare": int(grow["total_pesos"] or 0),
-            "paid": (not is_void) and True,         # keep “paid” true only if not voided
+            "paid": (not is_void) and True,             # keep “paid” true only if not voided
             "voided": bool(is_void),
             "state": "voided" if is_void else "paid",
             "created_at": head.created_at.isoformat(),
             "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=head.id, _external=True),
             "view_url": url_for("commuter.commuter_ticket_view", ticket_id=head.id, _external=True),
         })
+
     return jsonify(
         items=items,
         page=page,
@@ -1956,6 +2013,7 @@ def my_receipts():
         total=total,
         has_more=(page * page_size) < total,
     ), 200
+
 
 # Alias: /commuter/my/receipts  → same payload as /commuter/tickets/mine
 @commuter_bp.route("/my/receipts", methods=["GET"])
@@ -2209,16 +2267,6 @@ def announcements():
     return jsonify(anns), 200
 
 
-@commuter_bp.route("/notify-test-mqtt", methods=["POST"])
-@require_role("commuter")
-def commuter_notify_test_mqtt():
-    from utils.notify_user import notify_user
-    ok = notify_user(g.user.id, {
-        "type": "test",
-        "message": "Hello commuter 👋",
-        "sentAt": int(_time.time() * 1000),
-    })
-    return jsonify(ok=bool(ok)), 200
 
 
 @commuter_bp.route("/notify-test-mqtt-tellers", methods=["POST"])
@@ -2248,20 +2296,20 @@ def commuter_notify_test_mqtt_tellers():
         current_app.logger.exception("[mqtt] notify_tellers test failed")
         return jsonify(ok=False), 500
 
+@commuter_bp.route("/notify-test-mqtt", methods=["POST"])
+@require_role("commuter")
+def commuter_notify_test_mqtt():
+    ok = _publish_user_event(g.user.id, {"type": "test", "message": "Hello from server"})
+    return jsonify(ok=bool(ok)), (200 if ok else 502)
+
+
 @commuter_bp.route("/notify-tellers", methods=["POST"])
-@require_role("commuter")  # or whoever can trigger it
+@require_role("commuter")
 def commuter_notify_tellers():
-    from utils.notify_user import notify_tellers
     data = request.get_json(silent=True) or {}
-    # Shape a payload tellers can act on (keep it tiny)
-    payload = {
-        "type": data.get("type") or "topup_pending",
-        "title": data.get("title") or "New GCash receipt",
-        "body": data.get("body") or "Tap to review.",
-        # custom data your Teller app reads:
-        "topup_id": data.get("topup_id"),
-        "deeplink": "/(tabs)/teller?tab=pending",
-        "sentAt": int(_time.time() * 1000),
-    }
-    delivered = notify_tellers(payload)
-    return jsonify(ok=True, delivered=int(delivered)), 200
+    ok = notify_tellers({
+        **data,
+        "type": data.get("type") or "topup_request"
+    })
+    return jsonify(ok=ok), (200 if ok else 502)
+
