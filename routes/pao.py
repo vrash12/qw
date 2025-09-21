@@ -855,15 +855,15 @@ def wallet_overview(user_id: int):
         },
     ), 200
 
-
 def _serialize_ticket_json(t: TicketSale, origin_name: str, destination_name: str) -> dict:
     amount = int(round(float(t.price or 0)))
-    prefix = "discount" if t.passenger_type == "discount" else "regular"
-    filename = f"{prefix}_{amount}.jpg"
-    qr_url   = url_for("static", filename=f"qr/{filename}", _external=True)
-    qr_link  = url_for("commuter.commuter_ticket_receipt_qr", ticket_id=t.id, _external=True)
+    # snap to the right JPG (uses REGULAR_VALUES/DISCOUNT_VALUES from tickets_static)
     img      = jpg_name(amount, t.passenger_type)
+    # public static file (Flask static) — IMPORTANT: filename should be relative to /static
+    qr_url   = url_for("static", filename=f"qr/{img}", _external=True)
+    # background helper that some clients use (absolute path); QR_PATH is "static/qr"
     qr_bg_url= f"{request.url_root.rstrip('/')}/{QR_PATH}/{img}"
+    qr_link  = url_for("commuter.commuter_ticket_receipt_qr", ticket_id=t.id, _external=True)
     payload  = build_qr_payload(t, origin_name=origin_name, destination_name=destination_name)
 
     return {
@@ -881,7 +881,6 @@ def _serialize_ticket_json(t: TicketSale, origin_name: str, destination_name: st
         "commuter": _commuter_label(t),
         "paoId": getattr(t, "issued_by", None),
     }
-
 
 @pao_bp.route("/tickets/<int:ticket_id>/receipt.png", methods=["GET"])
 def pao_ticket_receipt_image(ticket_id: int):

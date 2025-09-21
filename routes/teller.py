@@ -62,6 +62,30 @@ def _today_bounds_mnl() -> Tuple[datetime, datetime]:
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     return start, end
+# add import at top with the others
+from itsdangerous import URLSafeSerializer
+
+# keep existing SALT_USER_QR
+SALT_USER_QR = "user-qr-v1"
+# 👇 add this to match routes/commuter.py
+SALT_WALLET_QR = "wallet-qr-rot-v1"
+
+def _unsign_wallet_qr(token: str, *, leeway_buckets: int = 2) -> Optional[int]:
+    """
+    Accepts rotating wallet QR tokens from /commuter/wallet/qrcode.
+    Valid only if |now_bucket - mb| <= leeway_buckets.
+    """
+    try:
+        s = URLSafeSerializer(current_app.config["SECRET_KEY"], salt=SALT_WALLET_QR)
+        data = s.loads(token)
+        uid = int(data.get("uid", 0))
+        mb  = int(data.get("mb", -1))
+        now_bucket = int(_time.time() // 60)
+        if uid > 0 and mb >= 0 and abs(now_bucket - mb) <= max(0, int(leeway_buckets)):
+            return uid
+    except Exception:
+        pass
+    return None
 
 def _user_name(u: Optional[User]) -> str:
     if not u:
@@ -125,42 +149,29 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
         current_app.logger.info("[mqtt] wallet → %s ok=%s", topic, ok)
     return ok
 
+# routes/teller.py — REPLACE _publish_user_event with this version
 def _publish_user_event(uid: int, payload: dict) -> bool:
     """
     Publish a generic event to the commuter stream.
-    Publishes to BOTH:
-      user/{uid}/events   and   users/{uid}/events
-    """
-    if not mqtt_publish:
-        current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (events)")
-        return False
-    if "sentAt" not in payload:
-        payload["sentAt"] = int(_time.time() * 1000)
-    ok = True
-    for root in ("user", "users"):
-        topic = f"{root}/{int(uid)}/events"
-        ok = mqtt_publish(topic, payload) and ok
-        current_app.logger.info("[mqtt] event → %s ok=%s type=%s", topic, ok, payload.get("type"))
-    return ok
-
-def _publish_user_event(uid: int, payload: dict) -> bool:
-    """
-    Publish a generic event to the commuter's MQTT stream.
-    Mobile app subscribes to: user/{uid}/events
+    Publishes to BOTH roots and BOTH channels:
+      user/{uid}/events, users/{uid}/events,
+      user/{uid}/notify, users/{uid}/notify
     """
     if not mqtt_publish:
         current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (events)")
         return False
     try:
-        if "sentAt" not in payload:
-            payload["sentAt"] = int(_time.time() * 1000)
-        mqtt_publish(f"user/{uid}/events", payload)
-        return True
+        payload.setdefault("sentAt", int(_time.time() * 1000))
+        ok = True
+        for root in ("user", "users"):
+            ok = mqtt_publish(f"{root}/{int(uid)}/events", payload) and ok
+            ok = mqtt_publish(f"{root}/{int(uid)}/notify", payload) and ok
+        return ok
     except Exception:
         current_app.logger.exception("[mqtt] user event publish failed uid=%s", uid)
         return False
 
-# helper (put near publish helpers)
+
 def _publish_tellers(event: str, **data) -> bool:
     if not mqtt_publish:
         current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (tellers)")
@@ -243,20 +254,20 @@ def _debug_log_push(uid: int, payload: dict):
         )
     except Exception:
         current_app.logger.exception("[push][debug] failed to list tokens")
-
 @teller_bp.route("/users/scan", methods=["GET"])
-@require_role("teller")  # adjust if your PAO role is used to scan
+@require_role("teller")
 def user_qr_scan():
-    """
-    GET /teller/users/scan?token=...
-    Verifies commuter QR token and returns minimal identity for display before charging.
-    """
     tok = (request.args.get("token") or "").strip()
     if not tok:
         return jsonify(error="token required"), 400
+
+    uid = None
     try:
-        uid = _unsign_user_qr(tok)  # token minted by commuter qr endpoint
+        uid = _unsign_user_qr(tok)  # user QR (from /commuter/users/me/qr.png)
     except (BadSignature, SignatureExpired, ValueError):
+        uid = _unsign_wallet_qr(tok, leeway_buckets=2)  # graceful fallback
+
+    if not uid:
         return jsonify(error="invalid token"), 400
 
     user = User.query.get(uid)
@@ -536,19 +547,9 @@ def reject_topup(tid: int):
         current_app.logger.exception("[mqtt] reject_topup realtime publish failed tid=%s", tid)
 
     return jsonify({"ok": True, "status": "rejected", "topup_id": tid, "reason": reason or None}), 200
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Wallet utilities for Teller screens
-
 @teller_bp.route("/wallet/resolve", methods=["POST"])
 @require_role("teller")
 def resolve_wallet_token():
-    """
-    Resolve a commuter wallet by either:
-      - wallet_token (matches WalletAccount.qr_token), or
-      - user_id (direct).
-    Response aligns with the app's ResolveResp shape.
-    """
     data = request.get_json(silent=True) or {}
     wallet_token = (data.get("wallet_token") or data.get("token") or "").strip()
     wallet_user_id = data.get("user_id") or data.get("wallet_user_id")
@@ -557,11 +558,19 @@ def resolve_wallet_token():
     token_type: Optional[str] = None
 
     if wallet_token:
+        # 1) static DB token (from /wallet/qrcode/rotate)
         acct = WalletAccount.query.filter_by(qr_token=wallet_token).first()
-        if not acct:
-            return jsonify(error="invalid wallet token"), 400
-        account_user_id = int(acct.user_id)
-        token_type = "wallet_token"
+        if acct:
+            account_user_id = int(acct.user_id)
+            token_type = "wallet_token"
+        else:
+            # 2) rotating signed token (from /wallet/qrcode)
+            uid = _unsign_wallet_qr(wallet_token, leeway_buckets=2)
+            if uid:
+                account_user_id = int(uid)
+                token_type = "wallet_qr"
+            else:
+                return jsonify(error="invalid wallet token"), 400
 
     if not account_user_id and wallet_user_id not in (None, "", 0, "0"):
         try:
@@ -582,14 +591,15 @@ def resolve_wallet_token():
 
     return jsonify({
         "valid": True,
-        "token_type": token_type or "wallet_token",
+        "token_type": token_type or "wallet_qr",
         "autopay": False,
         "user": {"id": user.id, "name": _user_name(user)},
         "user_id": user.id,
-        "balance_php": balance_php,
+        "balance_php": int(balance_php),
         "name": _user_name(user),
         "id": user.id,
     }), 200
+
 
 @teller_bp.route("/wallet/<int:user_id>/overview", methods=["GET"])
 @require_role("teller")

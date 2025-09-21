@@ -2,15 +2,17 @@
 from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request, url_for, current_app, g
 from db import db
-from models.schedule    import StopTime
+from models.ticket_stop import TicketStop           # ← use TicketStop (not StopTime)
 from models.ticket_sale import TicketSale
-from routes.auth        import require_role
-from sqlalchemy import func
+from routes.auth import require_role
 
 tickets_bp = Blueprint("tickets", __name__)
+
+# Keep this as an absolute web path for convenience in PAO (used to build qr_bg_url)
+# NOTE: when calling url_for('static', filename=...), pass ONLY the path relative to /static
 QR_PATH = "static/qr"
 
-# routes/tickets_static.py
+# ─────────── QR image catalog (snapping) ──────────────────────────────────────
 REGULAR_VALUES  = [10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44]
 DISCOUNT_VALUES = [ 8,10,13,14,16,18,19,21,22,24,26,27,29,30,32,34,35]
 
@@ -18,79 +20,82 @@ def _nearest(value: int, allowed: list[int]) -> int:
     return min(allowed, key=lambda v: abs(v - value))
 
 def jpg_name(peso: int, passenger_type: str) -> str:
+    """
+    Choose the closest existing fare image; keeps working even if an odd fare
+    is computed (e.g., very long route) but only a discrete set of JPGs exists.
+    """
     prefix  = "discount" if (passenger_type or "").lower() == "discount" else "regular"
     allowed = DISCOUNT_VALUES if prefix == "discount" else REGULAR_VALUES
     snap    = _nearest(int(round(float(peso or 0))), allowed)
     return f"{prefix}_{snap}.jpg"
 
-# ─────────── helpers ───────────────────────────────────────────────────
-def hops_between(a: StopTime, b: StopTime) -> int:
-    return abs(a.seq - b.seq)
+# ─────────── helpers ──────────────────────────────────────────────────────────
+def hops_between(a: TicketStop, b: TicketStop) -> int:
+    return abs(int(a.seq) - int(b.seq))
 
 def base_fare(hops: int) -> int:
+    # first hop ₱10, then +₱2 per additional hop
     return 10 + max(hops - 1, 0) * 2
 
 def calc_fare(hops: int, passenger_type: str) -> int:
     reg = base_fare(hops)
-    return reg if passenger_type == "regular" else round(reg * 0.8)
-
-def jpg_name(peso: int, passenger_type: str) -> str:
-    """
-    Return the exact filename you already have:
-      regular →  'regular_12.jpg'
-      discount → 'discount_14.jpg'
-    """
-    prefix = "regular" if passenger_type == "regular" else "discount"
-    return f"{prefix}_{peso}.jpg"
+    return reg if (passenger_type or "").lower() == "regular" else round(reg * 0.8)
 
 def gen_reference() -> str:
-    last = (
-        db.session.query(TicketSale)
-          .order_by(TicketSale.id.desc())
-          .first()
-    )
+    last = db.session.query(TicketSale).order_by(TicketSale.id.desc()).first()
     nxt = (last.id if last else 0) + 1
     return f"BUS1-{nxt:04d}"
 
-# ─────────── 1. fare preview ───────────────────────────────────────────
+def _resolve_stops_from_payload(data: dict):
+    """
+    Accept both new and legacy keys. We now store/use TicketStop ids.
+    - preferred: origin_stop_id / destination_stop_id
+    - legacy fallback: origin_stop_time_id / destination_stop_time_id
+    """
+    o_id = data.get("origin_stop_id") or data.get("origin_stop_time_id")
+    d_id = data.get("destination_stop_id") or data.get("destination_stop_time_id")
+    if not o_id or not d_id:
+        return None, None
+    o = TicketStop.query.get(o_id)
+    d = TicketStop.query.get(d_id)
+    return o, d
+
+# ─────────── 1) fare preview ─────────────────────────────────────────────────
 @tickets_bp.route("/tickets/preview", methods=["POST"])
 @require_role("commuter")
 def preview():
     data  = request.get_json() or {}
-    ptype = data.get("passenger_type")
+    ptype = (data.get("passenger_type") or "").lower()
     if ptype not in ("regular", "discount"):
         return jsonify(error="invalid passenger_type"), 400
 
-    o = StopTime.query.get(data.get("origin_stop_time_id"))
-    d = StopTime.query.get(data.get("destination_stop_time_id"))
-    if not o or not d or o.trip_id != d.trip_id:
+    o, d = _resolve_stops_from_payload(data)
+    if not o or not d:
         return jsonify(error="invalid stops"), 400
 
     fare = calc_fare(hops_between(o, d), ptype)
     return jsonify(fare=f"{fare:.2f}"), 200
 
-# ─────────── 2. issue ticket ───────────────────────────────────────────
+# ─────────── 2) issue ticket (UNPAID, QR background only) ────────────────────
 @tickets_bp.route("/tickets", methods=["POST"])
 @require_role("commuter")
 def create_ticket():
     data  = request.get_json() or {}
-    ptype = data.get("passenger_type")
+    ptype = (data.get("passenger_type") or "").lower()
     if ptype not in ("regular", "discount"):
         return jsonify(error="invalid passenger_type"), 400
 
-    o = StopTime.query.get(data.get("origin_stop_time_id"))
-    d = StopTime.query.get(data.get("destination_stop_time_id"))
-    if not o or not d or o.trip_id != d.trip_id:
+    o, d = _resolve_stops_from_payload(data)
+    if not o or not d:
         return jsonify(error="invalid stops"), 400
 
     hops      = hops_between(o, d)
-    reg_peso  = base_fare(hops)
     fare_peso = calc_fare(hops, ptype)
 
     ticket = TicketSale(
         user_id                  = g.user.id,
-        origin_stop_time_id      = o.id,
-        destination_stop_time_id = d.id,
+        origin_stop_time_id      = o.id,   # column name kept for compatibility
+        destination_stop_time_id = d.id,   # (stores TicketStop ids)
         price                    = fare_peso,
         passenger_type           = ptype,
         reference_no             = gen_reference(),
@@ -99,10 +104,10 @@ def create_ticket():
     db.session.add(ticket)
     db.session.commit()
 
-    # Build the URL for your existing JPEG
+    # Build a URL to the nearest existing JPG under /static/qr/
     img_file = jpg_name(fare_peso, ptype)
-    qr_url   = url_for("static", filename=f"{QR_PATH}/{img_file}", _external=True)
-    current_app.logger.info(f"[create_ticket] qr_url → {qr_url}")
+    qr_url   = url_for("static", filename=f"qr/{img_file}", _external=True)
+    current_app.logger.info(f"[tickets_static:create_ticket] qr_url → {qr_url}")
 
     return jsonify({
         "id":            ticket.id,
@@ -115,7 +120,7 @@ def create_ticket():
         "paid":          False
     }), 201
 
-# ─────────── 4. commuter’s own receipts ───────────────────────────────
+# ─────────── 3) commuter’s own receipts ──────────────────────────────────────
 @tickets_bp.route("/tickets/mine", methods=["GET"])
 @require_role("commuter")
 def my_receipts():
@@ -134,11 +139,17 @@ def my_receipts():
 
     out = []
     for t in rows:
-        # Recompute base so we pick the correct image
-        hops      = hops_between(t.origin_stop_time, t.destination_stop_time)
-        fare_peso = calc_fare(hops, t.passenger_type)
-        img_file  = jpg_name(fare_peso, t.passenger_type)
-        qr_url    = url_for("static", filename=f"{QR_PATH}/{img_file}", _external=True)
+        # Resolve O/D directly via TicketStop ids stored in the ticket
+        o = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
+        d = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
+        if not o or not d:
+            # skip malformed rows gracefully
+            continue
+
+        hops      = hops_between(o, d)
+        fare_peso = calc_fare(hops, (t.passenger_type or "").lower())
+        img_file  = jpg_name(fare_peso, (t.passenger_type or "").lower())
+        qr_url    = url_for("static", filename=f"qr/{img_file}", _external=True)
 
         out.append({
             "id":          t.id,
@@ -147,7 +158,7 @@ def my_receipts():
             "time":        t.created_at.strftime("%-I:%M %p").lower(),
             "fare":        f"{float(t.price):.2f}",
             "paid":        bool(t.paid),
-            "qr_url":      qr_url,     # front-end will pick this up and render the <Image/>
+            "qr_url":      qr_url,
         })
 
     return jsonify(out), 200
