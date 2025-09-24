@@ -1721,8 +1721,6 @@ def void_ticket(ticket_id: int):
         current_app.logger.exception("[void] failed publishing fare update")
 
     return jsonify(id=t.id, voided=True, refunded_php=float(refunded), reason=reason), 200
-
-
 @pao_bp.route("/tickets/preview", methods=["POST"])
 @require_role("pao")
 def preview_ticket():
@@ -1771,7 +1769,6 @@ def preview_ticket():
     except Exception as e:
         current_app.logger.exception("preview_ticket failed")
         return jsonify(error=str(e)), 500
-
 
 
 @pao_bp.route("/tickets", methods=["GET"])

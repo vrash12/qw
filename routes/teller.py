@@ -685,14 +685,15 @@ def create_topup():
     Create an immediate wallet top-up (token-free notifications).
     Body:
       - user_id (int) OR token (signed commuter QR)
-      - method: 'cash' | 'gcash'
+      - method: 'cash' | 'gcash' | 'maya'
       - amount_pesos (int)  OR amount_php
-      - external_ref (optional, for gcash)
+      - external_ref (optional, for e-wallets)
     """
     from utils.notify_user import notify_user  # token-free
 
     data = request.get_json(silent=True) or {}
 
+    # Identify target wallet (by user_id or signed commuter QR token)
     account_user_id: Optional[int] = None
     if data.get("user_id") is not None:
         try:
@@ -708,6 +709,8 @@ def create_topup():
         return jsonify(error="user_id or token is required"), 400
 
     method = str(data.get("method") or "cash").strip().lower()
+
+    # Amount validation (whole pesos)
     try:
         amount_pesos = int(data.get("amount_pesos") or data.get("amount_php") or 0)
     except Exception:
@@ -723,7 +726,9 @@ def create_topup():
                 account_id=account_user_id,
                 amount_pesos=amount_pesos,
             )
-        elif method == "gcash":
+        elif method in ("gcash", "maya"):
+            # Treat both e-wallets the same for crediting purposes.
+            # (Notifications below still carry the actual `method` value.)
             ext = (data.get("external_ref") or "").strip() or None
             topup_id, ledger_id, new_bal = topup_gcash(
                 account_id=account_user_id,

@@ -278,18 +278,18 @@ def _load_font(size: int, *candidates: str) -> ImageFont.FreeTypeFont:
 @require_role("commuter")
 def create_topup_request():
     """
-    Create a pending commuter top-up request (GCash with receipt).
+    Create a pending commuter top-up request (e-wallet with receipt).
     Accepts multipart/form-data:
-      - amount_pesos (int)
-      - method = 'gcash' (required for commuter)
+      - amount_pesos (int, optional)
+      - method = 'gcash' | 'maya'
       - note (optional) -> used as provider_ref if present
-      - receipt (image file)
+      - receipt (image file)  <-- required
     """
     form = request.form
     files = request.files
 
     method = (form.get("method") or "gcash").strip().lower()
-    if method != "gcash":
+    if method not in {"gcash", "maya"}:
         return jsonify(error="unsupported method"), 400
 
     try:
@@ -299,7 +299,7 @@ def create_topup_request():
     if amount_pesos < 0:
         return jsonify(error="invalid amount"), 400
 
-    provider = "gcash"
+    provider = method  # 'gcash' or 'maya'
     note = (form.get("note") or "").strip()
     provider_ref = (form.get("external_ref") or "").strip() or note or _unique_ref(provider)
 
@@ -319,7 +319,6 @@ def create_topup_request():
         db.session.add(tu)
         db.session.flush()  # assign tu.id
 
-        # Save and persist the receipt URL
         receipt_url = _save_receipt(receipt_fs, tu.id)
         tu.receipt_url = receipt_url
 
@@ -329,30 +328,18 @@ def create_topup_request():
         current_app.logger.exception("Failed to create top-up request")
         return jsonify(error="failed to create top-up request"), 500
 
-    # Notify tellers (best-effort; do not affect response)
     try:
-        tid = int(tu.id)
-        amt = int(tu.amount_pesos or 0)
-        commuter_name = (
-            f"{(g.user.first_name or '').strip()} {(g.user.last_name or '').strip()}".strip()
-            or (g.user.username or f'User #{g.user.id}')
-        )
-
         notify_tellers({
             "type": "topup_request",
             "title": "🧾 New top-up request",
-            "body": f"from {commuter_name}",
-
-            # ✅ include multiple ID aliases for compatibility
-            "topup_id": tid,           # snake_case
-            "topupId": tid,            # camelCase
-            "createdTopupId": tid,     # legacy camelCase your client expects
-
-            # other useful fields
-            "amount_php": amt,         # snake_case
-            "amountPhp": amt,          # camelCase
-            "method": "gcash",
-            "commuter": {"id": int(g.user.id), "name": commuter_name},
+            "body": f"from {((g.user.first_name or '').strip() + ' ' + (g.user.last_name or '').strip()).strip() or (g.user.username or f'User #{g.user.id}')}",
+            "topup_id": int(tu.id),
+            "topupId": int(tu.id),
+            "createdTopupId": int(tu.id),
+            "amount_php": int(tu.amount_pesos or 0),
+            "amountPhp": int(tu.amount_pesos or 0),
+            "method": method,
+            "commuter": {"id": int(g.user.id)},
             "receipt_url": tu.receipt_url,
             "deeplink": "/teller/pending",
             "sentAt": int(_time.time() * 1000),
@@ -365,8 +352,7 @@ def create_topup_request():
     except Exception:
         current_app.logger.exception("[push] notify tellers of new topup failed")
 
-    # Build response
-    payload = {
+    return jsonify({
         "id": int(tu.id),
         "account_id": int(tu.account_id),
         "amount_pesos": int(tu.amount_pesos or 0),
@@ -376,8 +362,8 @@ def create_topup_request():
         "provider_ref": tu.provider_ref,
         "receipt_url": tu.receipt_url,
         "created_at": getattr(tu, "created_at", None).isoformat() if getattr(tu, "created_at", None) else None,
-    }
-    return jsonify(payload), 201
+    }), 201
+
 
 def _has_column(table: str, column: str) -> bool:
     try:

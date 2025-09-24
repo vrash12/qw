@@ -92,7 +92,7 @@ class TopUp(db.Model):
     account_id   = db.Column(db.Integer, db.ForeignKey("wallet_accounts.user_id"), nullable=False, index=True)
 
     # Operator-less: no pao_id / teller_id
-    method       = db.Column(db.Enum("cash", "gcash", name="topup_method"), nullable=False, default="cash")
+    method       = db.Column(db.Enum("cash", "gcash", 'maya',  name="topup_method"), nullable=False, default="cash")
     amount_pesos = db.Column(db.Integer, nullable=False)                 # whole pesos
 
     # We allow pending/succeeded/rejected/cancelled
