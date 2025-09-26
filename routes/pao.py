@@ -1081,20 +1081,64 @@ def pao_summary():
     ), 200
 
 
+# backend/routes/pao.py
+
+@pao_bp.route("/stops", methods=["GET"])
+@require_role("pao")
+def list_stops():
+    ALLOWED_STOPS = [
+        "San Manuel","Lanat","Colobot","Carthel or Rodriguez","San Vicente or San Juan",
+        "San Pedro or Leasing","Binhonan or Rizal","Moncada","Mormoni","Alma Villo",
+        "San Julian","Sta Lucia","San Isidro","Saint Peter","Apulid",
+        "Bdo Panqui or Walter","Green Meadows","LTO","Carino","Caturay",
+        "Magapac","Dreamwoods","Gerona","San Antonio","Salapungan or Iddaan",
+        "Tarelco","Oishi","Villa Paz or Dph or Tmdc","Parsolingan or Img",
+        "Sta Cruz","Aguso","Panampunan","Osias or Palm Plaza","SM Tarlac City Jr Siesta",
+    ]
+    order_map = {name: i for i, name in enumerate(ALLOWED_STOPS)}
+
+    # Pull only rows that match the whitelist, then dedupe-by-name, then order by whitelist index
+    rows = TicketStop.query.filter(TicketStop.stop_name.in_(ALLOWED_STOPS)).all()
+
+    by_name = {}
+    for r in rows:
+        key = (r.stop_name or "").strip()
+        # keep the one with the lowest seq if duplicates exist
+        if key and (key not in by_name or (getattr(r, "seq", 1_000_000) < getattr(by_name[key], "seq", 1_000_000))):
+            by_name[key] = r
+
+    filtered = sorted(by_name.values(), key=lambda r: order_map.get(r.stop_name, 1_000_000))
+
+    return jsonify([
+        {"id": r.id, "name": r.stop_name, "seq": order_map.get(r.stop_name, getattr(r, "seq", None))}
+        for r in filtered
+    ]), 200
+
+
+
 @pao_bp.route("/recent-tickets", methods=["GET"])
 @require_role("pao")
 def recent_tickets():
     limit = request.args.get("limit", type=int) or 5
+    # NEW: default to my tickets; pass ?scope=bus to see all on the bus
+    scope = (request.args.get("scope") or "mine").lower()
+    only_mine = scope not in ("bus", "all")
+
     bus_id = _current_bus_id()
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
 
-    rows = (
+    q = (
         TicketSale.query.options(joinedload(TicketSale.user))
         .filter(TicketSale.bus_id == bus_id, TicketSale.paid.is_(True))
-        .order_by(TicketSale.id.desc())
-        .limit(limit)
-        .all()
+    )
+    if only_mine:
+        q = q.filter(TicketSale.issued_by == g.user.id)
+
+    rows = (
+        q.order_by(TicketSale.id.desc())
+         .limit(limit)
+         .all()
     )
 
     out = []
@@ -1105,12 +1149,9 @@ def recent_tickets():
             "commuter": _commuter_label(t),
             "fare": f"{float(t.price):.2f}",
             "paid": bool(t.paid),
-            # Canonical ISO (UTC) for clients to format
-            "created_at": _iso_utc(t.created_at),
-            # Keep human strings, but make them Manila-correct (UI-friendly)
+            "created_at": _iso_utc(t.created_at),                               # canonical UTC
             "time": _as_mnl(t.created_at).strftime("%I:%M %p").lstrip("0").lower(),
             "voided": bool(getattr(t, "voided", False)),
-
         })
 
     return jsonify(out), 200
@@ -1774,6 +1815,10 @@ def preview_ticket():
 @pao_bp.route("/tickets", methods=["GET"])
 @require_role("pao")
 def list_tickets():
+    # NEW: default to only my tickets; pass ?scope=bus to see all tickets on the bus
+    scope = (request.args.get("scope") or "mine").lower()
+    only_mine = scope not in ("bus", "all")
+
     date_str = request.args.get("date")
     try:
         day = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else datetime.utcnow().date()
@@ -1787,9 +1832,11 @@ def list_tickets():
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
 
-    # 1) Find batches for the day
+    # ---- GROUP HEADS ---------------------------------------------------------
+    # We scope by bus AND (optionally) by issued_by = current PAO.
+    where_extra = " AND issued_by = :pao " if only_mine else " "
     groups = db.session.execute(
-        text("""
+        text(f"""
             SELECT
             MIN(id)  AS head_id,
             COUNT(*) AS qty,
@@ -1798,6 +1845,7 @@ def list_tickets():
             WHERE bus_id = :bus
             AND created_at BETWEEN :s AND :e
             AND (paid = 1 OR COALESCE(voided, 0) = 1)
+            {where_extra}
             GROUP BY
             COALESCE(
                 CAST(batch_id AS CHAR),
@@ -1810,16 +1858,15 @@ def list_tickets():
             )
             ORDER BY head_id DESC
         """),
-        {"bus": bus_id, "s": start_dt, "e": end_dt},
+        {"bus": bus_id, "s": start_dt, "e": end_dt, "pao": int(g.user.id)},
     ).mappings().all()
-
 
     if not groups:
         return jsonify([]), 200
 
     head_ids = [int(r["head_id"]) for r in groups]
 
-    # 2) Load head tickets in one go for details (commuter, O/D, timestamps, ref)
+    # ---- LOAD HEAD ROWS ------------------------------------------------------
     heads = (
         TicketSale.query.options(
             joinedload(TicketSale.user),
@@ -1849,6 +1896,7 @@ def list_tickets():
         else:
             tsd = TicketStop.query.get(getattr(head, "destination_stop_time_id", None))
             destination_name = tsd.stop_name if tsd else ""
+
         is_void = bool(getattr(head, "voided", False))
         out.append({
             "id": head.id,                                 # use head-id as the row id
@@ -1860,11 +1908,9 @@ def list_tickets():
             "destination": destination_name,
             "fare": f"{float(r['total_pesos'] or 0):.2f}", # TOTAL for the batch
             "paid": (bool(getattr(head, "paid", True)) and not is_void),
-            # Optional extras (UI can ignore safely):
             "passengers": int(r["qty"] or 0),
             "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=head.id, _external=True),
             "voided": is_void,
-
         })
 
     return jsonify(out), 200
@@ -2059,12 +2105,6 @@ def update_ticket(ticket_id):
         db.session.rollback()
         return jsonify(error=str(e)), 500
 
-
-@pao_bp.route("/stops", methods=["GET"])
-@require_role("pao")
-def list_stops():
-    rows = TicketStop.query.order_by(TicketStop.seq).all()
-    return jsonify([{"id": r.id, "name": r.stop_name, "seq": r.seq} for r in rows]), 200
 
 
 @pao_bp.route("/commuters", methods=["GET"])
