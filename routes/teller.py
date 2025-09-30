@@ -20,8 +20,9 @@ try:
 except Exception:
     from auth import require_role
 
-# Wallet services (operator-less)
-from services.wallet import topup_cash, topup_gcash, approve_topup_existing
+# ──────────────────────────────────────────────────────────────────────────────
+# Wallet services (operator-less) — CASH ONLY
+from services.wallet import topup_cash, approve_topup_existing
 
 # Optional realtime publish (best-effort / no-op if module missing)
 try:
@@ -32,6 +33,7 @@ except Exception:
 
 # For verifying commuter QR tokens (must match routes/commuter.py)
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from itsdangerous import URLSafeSerializer
 
 teller_bp = Blueprint("teller", __name__, url_prefix="/teller")
 
@@ -48,8 +50,9 @@ MAX_TOPUP = 1000
 # Where commuter receipts are stored by /commuter/topup-requests
 RECEIPTS_DIR = "topup_receipts"
 
-# Must match SALT_USER_QR in routes/commuter.py
+# Must match SALT_USER_QR and SALT_WALLET_QR in routes/commuter.py
 SALT_USER_QR = "user-qr-v1"
+SALT_WALLET_QR = "wallet-qr-rot-v1"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Small helpers
@@ -62,13 +65,6 @@ def _today_bounds_mnl() -> Tuple[datetime, datetime]:
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     return start, end
-# add import at top with the others
-from itsdangerous import URLSafeSerializer
-
-# keep existing SALT_USER_QR
-SALT_USER_QR = "user-qr-v1"
-# 👇 add this to match routes/commuter.py
-SALT_WALLET_QR = "wallet-qr-rot-v1"
 
 def _unsign_wallet_qr(token: str, *, leeway_buckets: int = 2) -> Optional[int]:
     """
@@ -117,14 +113,8 @@ def _reject_reason_if_exists(tid: int) -> Optional[str]:
         current_app.logger.exception("[teller] read reject reason failed tid=%s", tid)
     return None
 
-# … imports unchanged …
-try:
-    from mqtt_ingest import publish as mqtt_publish  # best-effort; returns bool
-except Exception:
-    mqtt_publish = None
-
 # ──────────────────────────────────────────────────────────────────────────────
-# PUBLISH HELPERS (UPDATE THESE)
+# PUBLISH HELPERS
 
 def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extra) -> bool:
     """
@@ -149,7 +139,6 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
         current_app.logger.info("[mqtt] wallet → %s ok=%s", topic, ok)
     return ok
 
-# routes/teller.py — REPLACE _publish_user_event with this version
 def _publish_user_event(uid: int, payload: dict) -> bool:
     """
     Publish a generic event to the commuter stream.
@@ -170,7 +159,6 @@ def _publish_user_event(uid: int, payload: dict) -> bool:
     except Exception:
         current_app.logger.exception("[mqtt] user event publish failed uid=%s", uid)
         return False
-
 
 def _publish_tellers(event: str, **data) -> bool:
     if not mqtt_publish:
@@ -199,8 +187,11 @@ def _unsign_user_qr(token: str, *, max_age: Optional[int] = None) -> int:
         raise ValueError("bad uid")
     return uid
 
+# ──────────────────────────────────────────────────────────────────────────────
+# TOKEN REGISTRATION
+
 @teller_bp.route("/device-token", methods=["POST"])
-@require_role("teller","pao")
+@require_role("teller", "pao")
 def register_teller_device_token():
     data = request.get_json(silent=True) or {}
     token = (data.get("token") or "").strip()
@@ -230,6 +221,9 @@ def register_teller_device_token():
         current_app.logger.exception("[teller] device-token upsert failed")
         return jsonify(error=str(e)), 400
 
+# ──────────────────────────────────────────────────────────────────────────────
+# WALLET HELPERS
+
 def _ensure_wallet_row(user_id: int) -> int:
     """Ensure wallet_accounts row exists; return current balance (pesos)."""
     acct = WalletAccount.query.get(user_id)
@@ -254,6 +248,10 @@ def _debug_log_push(uid: int, payload: dict):
         )
     except Exception:
         current_app.logger.exception("[push][debug] failed to list tokens")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SCANNING / LOOKUPS
+
 @teller_bp.route("/users/scan", methods=["GET"])
 @require_role("teller")
 def user_qr_scan():
@@ -281,6 +279,9 @@ def user_qr_scan():
         balance_pesos=int(bal),
         balance_php=int(bal),
     ), 200
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TOP-UP REQUESTS (COMMUTER-SUBMITTED)
 
 @teller_bp.route("/topup-requests", methods=["GET"])
 @require_role("teller")
@@ -339,7 +340,7 @@ def list_topup_requests():
             "id": t.id,
             "account_id": t.account_id,
             "amount_pesos": int(getattr(t, "amount_pesos", 0) or 0),
-            "method": getattr(t, "method", "gcash"),
+            "method": getattr(t, "method", "cash"),  # may contain legacy 'gcash'/'maya' from old data
             "status": getattr(t, "status", "pending"),
             "created_at": (t.created_at.isoformat() if getattr(t, "created_at", None) else None),
             "note": None,
@@ -367,7 +368,7 @@ def get_topup_request(tid: int):
         "account_id": t.account_id,
         "commuter_name": _user_name(u),
         "amount_pesos": int(t.amount_pesos or 0),
-        "method": t.method,
+        "method": t.method,  # may be legacy value in DB
         "note": None,
         "status": t.status,
         "receipt_url": _receipt_url_if_exists(t.id),
@@ -379,7 +380,7 @@ def get_topup_request(tid: int):
 @require_role("teller")
 def approve_topup(tid: int):
     """
-    Approve a commuter-submitted top-up request (token-free notifications):
+    Approve a commuter-submitted top-up request (cash-only; token-free notifications):
       - optional amount override (validated and persisted)
       - credits the wallet and writes ledger
       - marks topup.status='succeeded'
@@ -414,11 +415,14 @@ def approve_topup(tid: int):
             current_app.logger.exception("[teller] failed to persist override amount tid=%s", tid)
             return jsonify(error="failed to save override amount"), 400
 
+    # Normalize any legacy method to 'cash' for new ledger/events
+    method_norm = "cash"
+
     try:
         ledger_id, new_balance = approve_topup_existing(
             account_id=t.account_id,
             topup_id=t.id,
-            method=t.method,
+            method=method_norm,
             amount_pesos=int(t.amount_pesos or 0),
             rid=f"approve-{t.id}",
         )
@@ -439,7 +443,7 @@ def approve_topup(tid: int):
                 int(t.account_id),
                 {
                     "type": "wallet_topup",
-                    "method": t.method,
+                    "method": method_norm,
                     "amount_php": int(t.amount_pesos or 0),
                     "topup_id": int(t.id),
                     "ledger_id": int(ledger_id),
@@ -448,7 +452,7 @@ def approve_topup(tid: int):
                     "sentAt": sent_at,
                     "ledger_hint": {
                         "direction": "credit",
-                        "event": f"topup:{t.method or 'cash'}",
+                        "event": "topup:cash",
                         "amount_php": int(t.amount_pesos or 0),
                         "running_balance_php": int(new_balance),
                         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -461,7 +465,7 @@ def approve_topup(tid: int):
                 int(t.account_id),
                 {
                     "type": "wallet_topup",
-                    "method": t.method,
+                    "method": method_norm,
                     "amount_php": int(t.amount_pesos or 0),
                     "topup_id": int(t.id),
                     "ledger_id": int(ledger_id),
@@ -537,7 +541,7 @@ def reject_topup(tid: int):
                 "type": "wallet_topup_rejected",
                 "topup_id": int(tid),
                 "amount_php": int(t.amount_pesos or 0),
-                "method": t.method,
+                "method": "cash",  # normalize for client displays
                 "reason": preview,
                 "deeplink": "/(tabs)/commuter/wallet",
                 "sentAt": int(_time.time() * 1000),
@@ -547,6 +551,10 @@ def reject_topup(tid: int):
         current_app.logger.exception("[mqtt] reject_topup realtime publish failed tid=%s", tid)
 
     return jsonify({"ok": True, "status": "rejected", "topup_id": tid, "reason": reason or None}), 200
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WALLET RESOLUTION / OVERVIEW
+
 @teller_bp.route("/wallet/resolve", methods=["POST"])
 @require_role("teller")
 def resolve_wallet_token():
@@ -600,7 +608,6 @@ def resolve_wallet_token():
         "id": user.id,
     }), 200
 
-
 @teller_bp.route("/wallet/<int:user_id>/overview", methods=["GET"])
 @require_role("teller")
 def wallet_overview(user_id: int):
@@ -635,7 +642,7 @@ def wallet_overview(user_id: int):
             "id": tup.id,
             "amount_php": _as_php(getattr(tup, "amount_pesos", 0)),
             "created_at": ts,
-            "method": getattr(tup, "method", None),
+            "method": getattr(tup, "method", None),  # legacy-safe
             "status": getattr(tup, "status", None),
         })
 
@@ -678,16 +685,17 @@ def wallet_overview(user_id: int):
         "recent_ledger": recent_ledger,
     }), 200
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CREATE TOP-UP (CASH ONLY)
+
 @teller_bp.route("/wallet/topups", methods=["POST"])
 @require_role("teller")
 def create_topup():
     """
-    Create an immediate wallet top-up (token-free notifications).
+    Create an immediate wallet top-up (cash-only; token-free notifications).
     Body:
       - user_id (int) OR token (signed commuter QR)
-      - method: 'cash' | 'gcash' | 'maya'
       - amount_pesos (int)  OR amount_php
-      - external_ref (optional, for e-wallets)
     """
     from utils.notify_user import notify_user  # token-free
 
@@ -708,7 +716,10 @@ def create_topup():
     else:
         return jsonify(error="user_id or token is required"), 400
 
+    # Cash-only (reject any non-cash method passed by old clients)
     method = str(data.get("method") or "cash").strip().lower()
+    if method != "cash":
+        return jsonify(error="unsupported method: cash only"), 400
 
     # Amount validation (whole pesos)
     try:
@@ -721,22 +732,11 @@ def create_topup():
     _ensure_wallet_row(account_user_id)
 
     try:
-        if method == "cash":
-            topup_id, ledger_id, new_bal = topup_cash(
-                account_id=account_user_id,
-                amount_pesos=amount_pesos,
-            )
-        elif method in ("gcash", "maya"):
-            # Treat both e-wallets the same for crediting purposes.
-            # (Notifications below still carry the actual `method` value.)
-            ext = (data.get("external_ref") or "").strip() or None
-            topup_id, ledger_id, new_bal = topup_gcash(
-                account_id=account_user_id,
-                amount_pesos=amount_pesos,
-                external_ref=ext,
-            )
-        else:
-            return jsonify(error="unsupported method"), 400
+        # Cash only
+        topup_id, ledger_id, new_bal = topup_cash(
+            account_id=account_user_id,
+            amount_pesos=amount_pesos,
+        )
 
         out = {
             "ok": True,
@@ -753,7 +753,7 @@ def create_topup():
                 account_user_id,
                 {
                     "type": "wallet_topup",
-                    "method": method,
+                    "method": "cash",
                     "amount_php": int(amount_pesos),
                     "topup_id": int(topup_id),
                     "ledger_id": int(ledger_id),
@@ -762,7 +762,7 @@ def create_topup():
                     "sentAt": sent_at,
                     "ledger_hint": {
                         "direction": "credit",
-                        "event": f"topup:{method}",
+                        "event": "topup:cash",
                         "amount_php": int(amount_pesos),
                         "running_balance_php": int(round(float(new_bal))),
                         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -775,7 +775,7 @@ def create_topup():
                 account_user_id,
                 {
                     "type": "wallet_topup",
-                    "method": method,
+                    "method": "cash",
                     "amount_php": int(amount_pesos),
                     "topup_id": int(topup_id),
                     "ledger_id": int(ledger_id),
@@ -800,6 +800,9 @@ def create_topup():
     except Exception as e:
         current_app.logger.exception("[teller] create_topup failed")
         return jsonify(error=str(e)), 400
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MISC
 
 @teller_bp.route("/notify-test", methods=["POST"])
 @require_role("teller")

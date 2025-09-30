@@ -420,43 +420,6 @@ def _user_qr_sign(uid: int) -> str:
     s = URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt=SALT_USER_QR)
     return s.dumps({"uid": int(uid)})
 
-# ADD this near your other wallet routes in routes/commuter.py
-
-@commuter_bp.route("/wallet/share-text", methods=["GET"])
-@require_role("commuter")
-def wallet_share_text():
-    """
-    Returns a pre-filled message the commuter can copy/share to a Teller.
-    Optional query params:
-      - amount: int pesos (e.g., 250)
-      - receipt: str (free-form GCash text, link or reference no.)
-      - method: 'gcash' | 'cash' (default 'gcash')
-    """
-    amount = max(0, request.args.get("amount", type=int, default=0))
-    method = (request.args.get("method") or "gcash").lower().strip()
-    receipt = (request.args.get("receipt") or "").strip()
-
-    # Stable wallet token + deep link (you already have this)
-    token = build_wallet_token(g.user.id)
-    deep_link = f"https://pay.example/charge?wallet_token={token}&autopay=1"
-
-    # Compose a short, Teller-friendly note
-    pretty = []
-    pretty.append("PGT Onboard — Wallet Top-up")
-    pretty.append(f"Name: {g.user.first_name} {g.user.last_name}")
-    pretty.append(f"Method: {'GCash' if method == 'gcash' else 'Cash'}")
-    if amount > 0:
-        pretty.append(f"Amount: ₱{amount:,}")
-    if receipt:
-        pretty.append(f"Receipt/Ref: {receipt}")
-    pretty.append(f"Wallet Token: {token}")
-    pretty.append(f"Deep Link: {deep_link}")
-
-    return jsonify({
-        "wallet_token": token,
-        "deep_link": deep_link,
-        "message": "\n".join(pretty),
-    }), 200
 
 
 @commuter_bp.route("/users/me/qr.png", methods=["GET"])

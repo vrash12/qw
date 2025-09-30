@@ -24,6 +24,7 @@ from utils.push            import send_push, push_to_bus
 from flask_cors import CORS
 from mqtt_ingest import start_in_background
 from sqlalchemy import event
+from routes.devices import devices_bp 
 
 from tasks.snap_trips import snap_finished_trips
 
@@ -70,7 +71,8 @@ def create_app():
     app.register_blueprint(pao_bp,      url_prefix="/pao")
     app.register_blueprint(manager_bp,  url_prefix="/manager")
     app.register_blueprint(tickets_bp,  url_prefix="/tickets")
-    app.register_blueprint(teller_bp,  url_prefix="/teller")  # ✅ ADD THIS
+    app.register_blueprint(teller_bp,  url_prefix="/teller") 
+    app.register_blueprint(devices_bp)
 
 
 

@@ -1050,7 +1050,7 @@ def tickets_for_day():
 
 
 @manager_bp.route("/buses", methods=["GET"])
-@require_role("manager")
+@require_role("manager", "pao")
 def list_buses():
     try:
         out = []

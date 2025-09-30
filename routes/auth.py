@@ -8,9 +8,17 @@ from datetime import datetime, timedelta
 import jwt
 import os
 from sqlalchemy.exc import OperationalError
+from models.device_token import DeviceToken
 
 auth_bp = Blueprint('auth', __name__, url_prefix='/auth')
 
+
+import time
+from sqlalchemy.orm import load_only
+
+@auth_bp.route('/ping', methods=['GET'])
+def ping():
+    return jsonify(ok=True, ts=time.time()), 200
 
 SECRET_KEY = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 @auth_bp.route("/me", methods=["GET"])
@@ -77,8 +85,14 @@ def login():
         return jsonify(error='Missing username or password'), 400
 
     def _get_user():
-        return User.query.filter_by(username=data['username']).first()
-
+        return (User.query
+                .options(load_only(
+                    User.id, User.username, User.role,
+                    User.first_name, User.last_name,
+                    User.assigned_bus_id, User.password_hash  # whatever your check uses
+                ))
+                .filter_by(username=data['username'])
+                .first())
     try:
         user = _get_user()
     except OperationalError as e:
@@ -100,6 +114,16 @@ def login():
             SECRET_KEY,
             algorithm='HS256',
         )
+        expo_token = (data.get('expoPushToken') or '').strip()
+        platform   = (data.get('platform') or '').strip()
+        if expo_token:
+            rec = DeviceToken.query.filter_by(token=expo_token).first()
+            if rec:
+                rec.user_id = user.id
+                rec.platform = platform or rec.platform
+            else:
+                db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
+            db.session.commit()
         return jsonify(
             message='Login successful',
             token=token,
