@@ -1,17 +1,20 @@
-# backend/push.py
-from exponent_server_sdk import PushClient, PushMessage
+# push.py
+import firebase_init  # ensures admin is initialized
+from firebase_admin import messaging
 
-push_client = PushClient()
+def subscribe_topics(token: str, topics: list[str]):
+    for t in topics:
+        # topic names: letters, numbers, _ or - (no spaces)
+        messaging.subscribe_to_topic([token], t)
 
-def _msg(token, title, body, data):
-    return PushMessage(
-        to=token, title=title, body=body, data=data,
-        sound="default", channel_id="payments", priority="high"
+def send_to_topic(topic: str, title: str, body: str, data: dict | None = None):
+    msg = messaging.Message(
+        topic=topic,
+        notification=messaging.Notification(title=title, body=body),
+        data={k: str(v) for k, v in (data or {}).items()},
+        android=messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(channel_id="announcements"),
+        ),
     )
-
-async def send_expo_push(tokens: list[str], title: str, body: str, data: dict):
-    await push_client.publish_multiple([_msg(t, title, body, data) for t in tokens])
-
-def send_expo_push_sync(tokens, title, body, data):
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(send_expo_push(tokens, title, body, data))
+    return messaging.send(msg)

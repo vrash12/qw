@@ -1,7 +1,13 @@
 # backend/routes/manager.py
 from flask import Blueprint, request, jsonify, send_from_directory, current_app, g
 import os
+import uuid
+from datetime import datetime, timedelta
+from werkzeug.utils import secure_filename
+from sqlalchemy import func, text, literal
+from sqlalchemy.orm import aliased
 
+from db import db
 from routes.auth import require_role
 from models.bus import Bus
 from models.schedule import Trip

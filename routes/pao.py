@@ -159,12 +159,11 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
         current_app.logger.exception("[mqtt] user-wallet publish failed")
 
 def _publish_user_event(uid: int, payload: dict) -> bool:
-    if not mqtt_publish:
-        return False
+    # Use the already-imported `publish` (best-effort).
     try:
         if "sentAt" not in payload:
             payload = {**payload, "sentAt": int(_time.time() * 1000)}
-        mqtt_publish(f"user/{int(uid)}/events", payload)
+        publish(f"user/{int(uid)}/events", payload)
         return True
     except Exception:
         current_app.logger.exception("[mqtt] user event publish failed uid=%s", uid)
@@ -260,9 +259,13 @@ def _post_commit_notify(
 
                     # Fire-and-forget push
                     try:
-                        push_to_user(int(push_uid), title=title, body=body, data=data)
+                        # use the same signature you use everywhere else
+                        push_to_user(
+                            db, DeviceToken, int(push_uid),
+                            title, body, data,
+                            channelId="payments", priority="high", ttl=600
+                        )
                     except Exception:
-                        # Fallback: best-effort
                         current_app.logger.exception("[push] push_to_user failed")
             except Exception:
                 try:
@@ -2176,21 +2179,8 @@ def broadcast():
         }
         emit_announcement(payload, bus_id=bus_id)
 
-        tokens = [
-            t.token
-            for t in DeviceToken.query
-            .join(User, User.id == DeviceToken.user_id)
-            .filter(User.role == "commuter")
-            .all()
-        ]
-        if tokens:
-            send_push_async(
-                tokens,
-                "🗞️ Announcement",
-                f"{bus_identifier}: {message}",
-                {"deeplink": "/commuter/notifications"},
-                channelId="announcements",
-            )
+        from services.notify_fcm import notify_commuters_announcement_fcm
+        notify_commuters_announcement_fcm(bus_id=bus_id, message=message)
 
         return jsonify({
             "id": ann.id,
@@ -2264,3 +2254,48 @@ def validate_fare():
 def _gen_reference(bus_id: int, row_id: int) -> str:
     # Row-safe, no race: use the id we just flushed
     return f"BUS{bus_id}-{row_id:04d}"
+
+
+# in backend/routes/pao.py
+@pao_bp.route("/debug/push/commuter-ping", methods=["POST"])
+@require_role("pao")
+def debug_push_commuter_ping():
+    from services.notify import notify_commuters_announcement
+
+    bus_id = _current_bus_id()
+    if not bus_id:
+        return jsonify(error="PAO has no assigned bus"), 400
+
+    # Use a distinctive message so it’s obvious
+    ok = notify_commuters_announcement(
+        bus_id=bus_id,
+        message="🔔 Test broadcast: If you see this, commuter pushes are wired."
+    )
+
+    # Also return counts so the app can display them immediately
+    rows = (
+        db.session.query(DeviceToken.token)
+        .join(User, User.id == DeviceToken.user_id)
+        .filter(User.role == "commuter")
+        .all()
+    )
+    tokens = [t for (t,) in rows if t]
+    preview = [tok[:12] + "…" for tok in tokens[:3]]
+
+    return jsonify(sent=bool(ok), tokens=len(tokens), preview=preview), 200
+
+
+# routes/pao.py
+@pao_bp.route("/debug/push/commuter-ping-fcm", methods=["POST"])
+@require_role("pao")
+def debug_push_commuter_ping_fcm():
+    bus_id = _current_bus_id()
+    if not bus_id:
+        return jsonify(error="PAO has no assigned bus"), 400
+
+    from services.notify_fcm import notify_commuters_announcement_fcm
+    msg_id = notify_commuters_announcement_fcm(
+        bus_id=bus_id,
+        message="🔔 FCM topic test: If you see this, Firebase topics work."
+    )
+    return jsonify(ok=True, message_id=msg_id, topic=f"commuters.bus.{bus_id}"), 200
