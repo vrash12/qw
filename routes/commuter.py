@@ -11,7 +11,6 @@ from sqlalchemy import func, text, or_
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import text
-from utils.notify_user import notify_user, notify_tellers 
 from sqlalchemy.orm import joinedload
 from models.wallet import WalletAccount, WalletLedger, TopUp
 from utils.wallet_qr import build_wallet_token
@@ -36,7 +35,6 @@ import traceback
 from werkzeug.exceptions import HTTPException
 from datetime import timedelta
 from sqlalchemy.exc import OperationalError
-from services.notify import notify_tellers_new_topup
 from sqlalchemy import desc
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 import os, uuid, time
@@ -306,96 +304,6 @@ def _load_font(size: int, *candidates: str) -> ImageFont.FreeTypeFont:
                 continue
     return ImageFont.load_default()
 
-@commuter_bp.route("/topup-requests", methods=["POST"])
-@require_role("commuter")
-def create_topup_request():
-    """
-    Create a pending commuter top-up request (e-wallet with receipt).
-    Accepts multipart/form-data:
-      - amount_pesos (int, optional)
-      - method = 'gcash' | 'maya'
-      - note (optional) -> used as provider_ref if present
-      - receipt (image file)  <-- required
-    """
-    form = request.form
-    files = request.files
-
-    method = (form.get("method") or "gcash").strip().lower()
-    if method not in {"gcash", "maya"}:
-        return jsonify(error="unsupported method"), 400
-
-    try:
-        amount_pesos = int(form.get("amount_pesos") or form.get("amount_php") or 0)
-    except Exception:
-        amount_pesos = 0
-    if amount_pesos < 0:
-        return jsonify(error="invalid amount"), 400
-
-    provider = method  # 'gcash' or 'maya'
-    note = (form.get("note") or "").strip()
-    provider_ref = (form.get("external_ref") or "").strip() or note or _unique_ref(provider)
-
-    receipt_fs = files.get("receipt")
-    if not receipt_fs or not getattr(receipt_fs, "filename", None):
-        return jsonify(error="receipt image is required"), 400
-
-    try:
-        tu = TopUp(
-            account_id=int(g.user.id),
-            method=method,
-            amount_pesos=amount_pesos,
-            status="pending",
-            provider=provider,
-            provider_ref=provider_ref,
-        )
-        db.session.add(tu)
-        db.session.flush()  # assign tu.id
-
-        receipt_url = _save_receipt(receipt_fs, tu.id)
-        tu.receipt_url = receipt_url
-
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        current_app.logger.exception("Failed to create top-up request")
-        return jsonify(error="failed to create top-up request"), 500
-
-    try:
-        notify_tellers({
-            "type": "topup_request",
-            "title": "🧾 New top-up request",
-            "body": f"from {((g.user.first_name or '').strip() + ' ' + (g.user.last_name or '').strip()).strip() or (g.user.username or f'User #{g.user.id}')}",
-            "topup_id": int(tu.id),
-            "topupId": int(tu.id),
-            "createdTopupId": int(tu.id),
-            "amount_php": int(tu.amount_pesos or 0),
-            "amountPhp": int(tu.amount_pesos or 0),
-            "method": method,
-            "commuter": {"id": int(g.user.id)},
-            "receipt_url": tu.receipt_url,
-            "deeplink": "/teller/pending",
-            "sentAt": int(_time.time() * 1000),
-        })
-    except Exception:
-        current_app.logger.exception("[mqtt] notify_tellers (topup_request) failed")
-
-    try:
-        _notify_tellers_new_topup(tu, commuter=g.user)
-    except Exception:
-        current_app.logger.exception("[push] notify tellers of new topup failed")
-
-    return jsonify({
-        "id": int(tu.id),
-        "account_id": int(tu.account_id),
-        "amount_pesos": int(tu.amount_pesos or 0),
-        "method": tu.method,
-        "status": tu.status,
-        "provider": tu.provider,
-        "provider_ref": tu.provider_ref,
-        "receipt_url": tu.receipt_url,
-        "created_at": getattr(tu, "created_at", None).isoformat() if getattr(tu, "created_at", None) else None,
-    }), 201
-
 
 def _has_column(table: str, column: str) -> bool:
     try:
@@ -498,17 +406,6 @@ def _day_range_filter(q, date_str: Optional[str], days: Optional[str]):
         q = q.filter(TicketSale.created_at >= cutoff)
     return q
 
-@commuter_bp.route("/notify-test", methods=["POST"])
-@require_role("commuter")
-def commuter_notify_test():
-    ok = push_to_user(
-        db, DeviceToken, g.user.id,
-        "🔔 Test notification",
-        "If you see this, push is working!",
-        {"deeplink": "/commuter/notifications"},
-        channelId="announcements", priority="high", ttl=600,
-    )
-    return jsonify(ok=ok), (200 if ok else 202)
 
 
 def _payment_method_for_ticket(t) -> str:
@@ -1002,43 +899,6 @@ def commuter_ticket_image(ticket_id: int):
     resp.headers["Cache-Control"] = "public, max-age=86400"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
-
-def _notify_tellers_new_topup(t, commuter: User):
-    """Fire-and-forget push to every teller that a new GCash request is waiting."""
-    try:
-        # list all tellers
-        teller_ids = [uid for (uid,) in db.session.query(User.id).filter(User.role == "teller").all()]
-        if not teller_ids:
-            return
-
-        # compose message
-        amount = int(getattr(t, "amount_pesos", 0) or 0)
-        name = f"{(commuter.first_name or '').strip()} {(commuter.last_name or '').strip()}".strip() or (commuter.username or f"User #{commuter.id}")
-        title = "🧾 New top-up request"
-        body  = f"₱{amount:,} via GCash from {name}"
-
-        payload = {
-            "type": "topup_request",
-            # ✅ include all aliases
-            "topup_id": int(t.id),
-            "topupId": int(t.id),
-            "createdTopupId": int(t.id),
-
-            "amount_php": amount,
-            "amountPhp": amount,
-            "method": "gcash",
-            "deeplink": "/teller/pending",
-            "sentAt": int(_time.time() * 1000),
-        }
-
-
-        for uid in teller_ids:
-            # Android channel must match TellerConsole ("topups")
-            push_to_user(db, DeviceToken, uid, title, body, payload,
-                         channelId="topups", priority="high", ttl=600)
-    except Exception:
-        current_app.logger.exception("[push] notify tellers of new topup failed")
-
 
 def _is_unknown_col(err: Exception) -> bool:
     # MySQL error code for "Unknown column": 1054
@@ -2298,51 +2158,4 @@ def announcements():
         for ann, first, last, bus_identifier in rows
     ]
     return jsonify(anns), 200
-
-
-
-
-@commuter_bp.route("/notify-test-mqtt-tellers", methods=["POST"])
-@require_role("commuter")
-def commuter_notify_test_mqtt_tellers():
-    """
-    Publish a simple MQTT test event to all tellers.
-    Useful for verifying the Teller consoles receive broker messages.
-    """
-    try:
-        name = (f"{(g.user.first_name or '').strip()} {(g.user.last_name or '').strip()}").strip() or (g.user.username or f"User #{g.user.id}")
-        payload = {
-            "type": "test",
-            "message": f"Hello tellers 👋 — from {name}",
-            "fromUser": {
-                "id": int(g.user.id),
-                "name": name,
-            },
-            # optional: makes Teller apps jump to Pending, if you hook it up
-            "deeplink": "/teller/pending",
-            "sentAt": int(_time.time() * 1000),
-        }
-        # Broadcast to the teller topic(s)
-        notify_tellers(payload)
-        return jsonify(ok=True), 200
-    except Exception:
-        current_app.logger.exception("[mqtt] notify_tellers test failed")
-        return jsonify(ok=False), 500
-
-@commuter_bp.route("/notify-test-mqtt", methods=["POST"])
-@require_role("commuter")
-def commuter_notify_test_mqtt():
-    ok = _publish_user_event(g.user.id, {"type": "test", "message": "Hello from server"})
-    return jsonify(ok=bool(ok)), (200 if ok else 502)
-
-
-@commuter_bp.route("/notify-tellers", methods=["POST"])
-@require_role("commuter")
-def commuter_notify_tellers():
-    data = request.get_json(silent=True) or {}
-    ok = notify_tellers({
-        **data,
-        "type": data.get("type") or "topup_request"
-    })
-    return jsonify(ok=ok), (200 if ok else 502)
 

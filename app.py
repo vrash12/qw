@@ -24,23 +24,6 @@ from mqtt_ingest import start_in_background
 from sqlalchemy import event
 from tasks.snap_trips import snap_finished_trips
 
-# ---- Firebase Admin (server-side) ----
-import firebase_admin
-from firebase_admin import credentials, messaging
-
-def _init_firebase_admin():
-    """Initialize Firebase Admin using a service account JSON path from env."""
-    if firebase_admin._apps:
-        return
-    sa_path = os.environ.get("FIREBASE_SA_PATH")
-    if not sa_path or not os.path.exists(sa_path):
-        # Don't crash the app; endpoints will return a helpful error
-        print("[firebase] WARNING: FIREBASE_SA_PATH not set or file missing")
-        return
-    cred = credentials.Certificate(sa_path)
-    firebase_admin.initialize_app(cred)
-    print("[firebase] Admin SDK initialized")
-
 
 def create_app():
     app = Flask(__name__)
@@ -98,79 +81,8 @@ def create_app():
     # ---- Socket.io ----
     socketio.init_app(app, cors_allowed_origins="*")
 
-    # ---- Firebase topics endpoints ----
-    _init_firebase_admin()
 
-    def _firebase_ready():
-        return bool(firebase_admin._apps)
 
-    @app.post("/push/subscribe-topics")
-    def push_subscribe_topics():
-        """
-        Body: { "token": "<fcm-token>", "topics": ["announcements", "bus-12"] }
-        Subscribes the given token to the provided topics.
-        """
-        if not _firebase_ready():
-            return jsonify(ok=False, error="Firebase Admin not initialized on server"), 500
 
-        j = request.get_json(force=True, silent=True) or {}
-        token = j.get("token")
-        topics = j.get("topics") or []
-        if not token or not topics:
-            return jsonify(ok=False, error="token/topics required"), 400
-
-        # Simple sanitization: topics must be non-empty strings without spaces
-        clean_topics = []
-        for t in topics:
-            if not isinstance(t, str):
-                continue
-            t = t.strip()
-            if not t or " " in t:
-                continue
-            clean_topics.append(t)
-
-        if not clean_topics:
-            return jsonify(ok=False, error="no valid topics"), 400
-
-        # Subscribe per topic (idempotent; Firebase deduplicates)
-        for t in clean_topics:
-            try:
-                messaging.subscribe_to_topic([token], t)
-            except Exception as e:
-                return jsonify(ok=False, error=f"subscribe failed for {t}: {e}"), 500
-
-        return jsonify(ok=True)
-
-    @app.post("/push/test")
-    def push_test():
-        """
-        Body: { "topic": "announcements", "title": "Test", "body": "Hello", "data": { ... } }
-        Sends a test message to a topic.
-        """
-        if not _firebase_ready():
-            return jsonify(ok=False, error="Firebase Admin not initialized on server"), 500
-
-        j = request.get_json(force=True, silent=True) or {}
-        topic = j.get("topic") or "announcements"
-        title = j.get("title") or "Test"
-        body  = j.get("body")  or "Hello from server"
-        data  = j.get("data")  or {}
-
-        try:
-            msg = messaging.Message(
-                topic=topic,
-                notification=messaging.Notification(title=title, body=body),
-                data={k: str(v) for k, v in data.items()},
-                android=messaging.AndroidConfig(
-                    priority="high",
-                    notification=messaging.AndroidNotification(
-                        channel_id="announcements"  # must exist on the app
-                    ),
-                ),
-            )
-            mid = messaging.send(msg)
-            return jsonify(ok=True, message_id=mid)
-        except Exception as e:
-            return jsonify(ok=False, error=str(e)), 500
 
     return app

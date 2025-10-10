@@ -27,7 +27,6 @@ from decimal import Decimal
 import datetime as dt
 from models.wallet import TopUp                     # for daily-cap query
 from services.wallet import topup_cash, topup_gcash
-from services.notify_ticket import notify_commuter_ticket_received
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 
@@ -1721,12 +1720,7 @@ def pao_create_ticket():
 
         db.session.commit()
 
-        # Push notify commuter (only if linked & paid)
-        if t.user_id and bool(t.paid):
-            try:
-                notify_commuter_ticket_received(int(t.id))
-            except Exception:
-                current_app.logger.exception("[push] ticket_received notify failed (ticket_id=%s)", t.id)
+ 
 
         origin_name = totals["origin_name"]
         destination_name = totals["destination_name"]
@@ -2347,10 +2341,7 @@ def broadcast():
             "timestamp": _iso_utc(ann.timestamp),
             "bus_identifier": bus_identifier,
         }
-        emit_announcement(payload, bus_id=bus_id)
-
-        from services.notify_fcm import notify_commuters_announcement_fcm
-        notify_commuters_announcement_fcm(bus_id=bus_id, message=message)
+   
 
         return jsonify({
             "id": ann.id,
@@ -2426,46 +2417,3 @@ def _gen_reference(bus_id: int, row_id: int) -> str:
     return f"BUS{bus_id}-{row_id:04d}"
 
 
-# in backend/routes/pao.py
-@pao_bp.route("/debug/push/commuter-ping", methods=["POST"])
-@require_role("pao")
-def debug_push_commuter_ping():
-    from services.notify import notify_commuters_announcement
-
-    bus_id = _current_bus_id()
-    if not bus_id:
-        return jsonify(error="PAO has no assigned bus"), 400
-
-    # Use a distinctive message so it’s obvious
-    ok = notify_commuters_announcement(
-        bus_id=bus_id,
-        message="🔔 Test broadcast: If you see this, commuter pushes are wired."
-    )
-
-    # Also return counts so the app can display them immediately
-    rows = (
-        db.session.query(DeviceToken.token)
-        .join(User, User.id == DeviceToken.user_id)
-        .filter(User.role == "commuter")
-        .all()
-    )
-    tokens = [t for (t,) in rows if t]
-    preview = [tok[:12] + "…" for tok in tokens[:3]]
-
-    return jsonify(sent=bool(ok), tokens=len(tokens), preview=preview), 200
-
-
-# routes/pao.py
-@pao_bp.route("/debug/push/commuter-ping-fcm", methods=["POST"])
-@require_role("pao")
-def debug_push_commuter_ping_fcm():
-    bus_id = _current_bus_id()
-    if not bus_id:
-        return jsonify(error="PAO has no assigned bus"), 400
-
-    from services.notify_fcm import notify_commuters_announcement_fcm
-    msg_id = notify_commuters_announcement_fcm(
-        bus_id=bus_id,
-        message="🔔 FCM topic test: If you see this, Firebase topics work."
-    )
-    return jsonify(ok=True, message_id=msg_id, topic=f"commuters.bus.{bus_id}"), 200
