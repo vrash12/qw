@@ -7,13 +7,13 @@ from typing import Optional, Tuple
 
 from flask import Blueprint, request, jsonify, current_app, url_for, g
 from sqlalchemy.orm import aliased
+from sqlalchemy import func
 
 from db import db
 from models.user import User
 from models.wallet import WalletAccount, WalletLedger, TopUp
 from models.device_token import DeviceToken
 from utils.push import push_to_user  # (kept if you still use FCM push elsewhere)
-from sqlalchemy import func
 
 try:
     from routes.auth import require_role
@@ -66,22 +66,12 @@ def _today_bounds_mnl() -> Tuple[datetime, datetime]:
     end = start + timedelta(days=1)
     return start, end
 
-def _unsign_wallet_qr(token: str, *, leeway_buckets: int = 2) -> Optional[int]:
-    """
-    Accepts rotating wallet QR tokens from /commuter/wallet/qrcode.
-    Valid only if |now_bucket - mb| <= leeway_buckets.
-    """
+def _as_php(x: Optional[int]) -> int:
+    """All wallet domain amounts are whole pesos already; coerce to int."""
     try:
-        s = URLSafeSerializer(current_app.config["SECRET_KEY"], salt=SALT_WALLET_QR)
-        data = s.loads(token)
-        uid = int(data.get("uid", 0))
-        mb  = int(data.get("mb", -1))
-        now_bucket = int(_time.time() // 60)
-        if uid > 0 and mb >= 0 and abs(now_bucket - mb) <= max(0, int(leeway_buckets)):
-            return uid
+        return int(x or 0)
     except Exception:
-        pass
-    return None
+        return 0
 
 def _user_name(u: Optional[User]) -> str:
     if not u:
@@ -91,12 +81,37 @@ def _user_name(u: Optional[User]) -> str:
     name = (fn + " " + ln).strip()
     return name or (u.username or f"User #{u.id}")
 
-def _as_php(x: Optional[int]) -> int:
-    """All wallet domain amounts are whole pesos already; coerce to int."""
+# Signed user QR (static per user, time-limited)
+def _unsign_user_qr(token: str, *, max_age_sec: int = 7 * 24 * 3600) -> Optional[int]:
+    """
+    Accepts signed user QR tokens (from /commuter/users/me/qr.png).
+    Defaults to 7 days validity unless your commuter.py uses another window.
+    """
     try:
-        return int(x or 0)
+        s = URLSafeTimedSerializer(current_app.config["SECRET_KEY"], salt=SALT_USER_QR)
+        data = s.loads(token, max_age=max_age_sec)
+        uid = int(data.get("uid", 0))
+        return uid if uid > 0 else None
     except Exception:
-        return 0
+        return None
+
+# Rotating wallet QR (minute bucket)
+def _unsign_wallet_qr(token: str, *, leeway_buckets: int = 2) -> Optional[int]:
+    """
+    Accepts rotating wallet QR tokens from /commuter/wallet/qrcode.
+    Valid only if |now_bucket - mb| <= leeway_buckets.
+    """
+    try:
+        s = URLSafeSerializer(current_app.config["SECRET_KEY"], salt=SALT_WALLET_QR)
+        data = s.loads(token)
+        uid = int(data.get("uid", 0))
+        mb = int(data.get("mb", -1))
+        now_bucket = int(_time.time() // 60)
+        if uid > 0 and mb >= 0 and abs(now_bucket - mb) <= max(0, int(leeway_buckets)):
+            return uid
+    except Exception:
+        pass
+    return None
 
 def _reject_reason_path(tid: int) -> str:
     """Local file path for a saved reject reason (no DB migration needed)."""
@@ -111,6 +126,18 @@ def _reject_reason_if_exists(tid: int) -> Optional[str]:
                 return (f.read() or "").strip() or None
     except Exception:
         current_app.logger.exception("[teller] read reject reason failed tid=%s", tid)
+    return None
+
+def _receipt_url_if_exists(tid: int) -> Optional[str]:
+    """
+    If a commuter uploaded a receipt, return its public static URL.
+    Tries jpg/png/jpeg under /static/topup_receipts/{tid}.<ext>.
+    """
+    static_root = os.path.join(current_app.root_path, "static", RECEIPTS_DIR)
+    for ext in ("jpg", "png", "jpeg", "webp"):
+        candidate = os.path.join(static_root, f"{tid}.{ext}")
+        if os.path.exists(candidate):
+            return url_for("static", filename=f"{RECEIPTS_DIR}/{tid}.{ext}", _external=False)
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -139,7 +166,20 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
         current_app.logger.info("[mqtt] wallet → %s ok=%s", topic, ok)
     return ok
 
-
+def _debug_log_push(uid: int, payload: dict):
+    try:
+        toks = (
+            db.session.query(DeviceToken.platform, DeviceToken.token)
+            .filter(DeviceToken.user_id == uid)
+            .all()
+        )
+        sample = [(p or "?", (t or "")[:16] + "…") for (p, t) in toks]
+        current_app.logger.info(
+            "[push][debug] target uid=%s tokens=%s sample=%s payload_keys=%s",
+            uid, len(toks), sample, sorted(list(payload.keys())),
+        )
+    except Exception:
+        current_app.logger.exception("[push][debug] failed to list tokens")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TOKEN REGISTRATION
@@ -188,21 +228,6 @@ def _ensure_wallet_row(user_id: int) -> int:
         return 0
     return _as_php(getattr(acct, "balance_pesos", 0))
 
-def _debug_log_push(uid: int, payload: dict):
-    try:
-        toks = (
-            db.session.query(DeviceToken.platform, DeviceToken.token)
-            .filter(DeviceToken.user_id == uid)
-            .all()
-        )
-        sample = [(p or "?", (t or "")[:16] + "…") for (p, t) in toks]
-        current_app.logger.info(
-            "[push][debug] target uid=%s tokens=%s sample=%s payload_keys=%s",
-            uid, len(toks), sample, sorted(list(payload.keys())),
-        )
-    except Exception:
-        current_app.logger.exception("[push][debug] failed to list tokens")
-
 # ──────────────────────────────────────────────────────────────────────────────
 # SCANNING / LOOKUPS
 
@@ -241,7 +266,7 @@ def user_qr_scan():
 @require_role("teller")
 def list_topup_requests():
     status = (request.args.get("status") or "pending").strip().lower()
-    limit  = max(1, min(200, request.args.get("limit", type=int, default=50)))
+    limit = max(1, min(200, request.args.get("limit", type=int, default=50)))
 
     # NEW: parse optional date range
     def _parse_date(s: Optional[str]) -> Optional[datetime]:
@@ -262,10 +287,10 @@ def list_topup_requests():
             return None
 
     from_q = request.args.get("from") or request.args.get("start") or request.args.get("start_date")
-    to_q   = request.args.get("to")   or request.args.get("end")   or request.args.get("end_date")
+    to_q = request.args.get("to") or request.args.get("end") or request.args.get("end_date")
 
     dt_from = _parse_date(from_q)
-    dt_to   = _parse_date(to_q)
+    dt_to = _parse_date(to_q)
 
     if dt_to and len((to_q or "").strip()) == 10:
         dt_to = dt_to + timedelta(days=1)
@@ -282,11 +307,7 @@ def list_topup_requests():
     if dt_to:
         q = q.filter(TopUp.created_at < dt_to)
 
-    rows = (
-        q.order_by(TopUp.created_at.desc(), TopUp.id.desc())
-         .limit(limit)
-         .all()
-    )
+    rows = q.order_by(TopUp.created_at.desc(), TopUp.id.desc()).limit(limit).all()
 
     items = []
     for t, u in rows:
@@ -330,6 +351,8 @@ def get_topup_request(tid: int):
         "reject_reason": _reject_reason_if_exists(t.id),
     }), 200
 
+# ──────────────────────────────────────────────────────────────────────────────
+# WALLET TOKEN RESOLVE / OVERVIEW
 
 @teller_bp.route("/wallet/resolve", methods=["POST"])
 @require_role("teller")
@@ -467,7 +490,6 @@ def wallet_overview(user_id: int):
 @teller_bp.route("/wallet/topups", methods=["POST"])
 @require_role("teller")
 def create_topup():
-
     data = request.get_json(silent=True) or {}
 
     # Identify target wallet (by user_id or signed commuter QR token)
@@ -479,9 +501,12 @@ def create_topup():
             return jsonify(error="invalid user_id"), 400
     elif (data.get("token") or "").strip():
         try:
-            account_user_id = _unsign_user_qr((data.get("token") or "").strip())
+            uid = _unsign_user_qr((data.get("token") or "").strip())
         except (BadSignature, SignatureExpired, ValueError):
+            uid = None
+        if not uid:
             return jsonify(error="invalid token"), 400
+        account_user_id = uid
     else:
         return jsonify(error="user_id or token is required"), 400
 
@@ -514,9 +539,29 @@ def create_topup():
             "new_balance_php": int(round(float(new_bal))),
         }
 
+        # Best-effort realtime publish to commuter device(s)
+        _publish_user_wallet(
+            account_user_id,
+            new_balance_pesos=int(round(float(new_bal))),
+            event="wallet_topup",
+            topup_id=int(topup_id),
+            method="cash",
+            amount_php=int(amount_pesos),
+        )
 
+        # Optional: push notification (if you still use FCM in production)
+        try:
+            push_to_user(
+                account_user_id,
+                title="Wallet Top-up",
+                body=f"₱{amount_pesos} added. New balance: ₱{int(round(float(new_bal)))}",
+                data={"type": "wallet_topup", "topup_id": int(topup_id)},
+            )
+        except Exception:
+            current_app.logger.info("[push] skipped or failed (non-fatal) uid=%s", account_user_id)
+
+        return jsonify(out), 200
 
     except Exception as e:
         current_app.logger.exception("[teller] create_topup failed")
         return jsonify(error=str(e)), 400
-
