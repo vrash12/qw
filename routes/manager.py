@@ -487,6 +487,7 @@ def commuter_tickets(user_id: int):
 
         fields = [
             TicketSale.id,
+            TicketSale.reference_no,  # ← include reference number
             TicketSale.created_at,
             TicketSale.price,
             TicketSale.passenger_type,
@@ -518,11 +519,15 @@ def commuter_tickets(user_id: int):
             items.append(
                 {
                     "id": r.id,
+                    "referenceNo": getattr(r, "reference_no", None),
                     "created_at": r.created_at.isoformat(),
                     "time": r.created_at.strftime("%Y-%m-%d %H:%M"),
                     "fare": f"{float(r.price or 0):.2f}",
                     "paid": bool(getattr(r, "paid", False)) and not is_void,
-                    "status": (getattr(r, "status", None) or ("voided" if is_void else ("paid" if getattr(r, "paid", False) else "unpaid"))),
+                    "status": (
+                        getattr(r, "status", None)
+                        or ("voided" if is_void else ("paid" if getattr(r, "paid", False) else "unpaid"))
+                    ),
                     "voided": is_void,
                     "passenger_type": (r.passenger_type or "regular"),
                     "bus": r.bus,
@@ -922,6 +927,9 @@ def tickets_composition():
     return jsonify(regular=regular, discount=discount, total=regular + discount), 200
 
 
+
+
+
 @manager_bp.route("/tickets", methods=["GET"])
 @require_role("manager")
 def tickets_for_day():
@@ -953,6 +961,7 @@ def tickets_for_day():
     # Base fields (always present)
     fields = [
         TicketSale.id,
+        TicketSale.reference_no,  # ← include reference number
         TicketSale.created_at,
         TicketSale.price,
         TicketSale.passenger_type,
@@ -1022,13 +1031,17 @@ def tickets_for_day():
         tickets.append(
             {
                 "id": r.id,
+                "referenceNo": getattr(r, "reference_no", None),
                 "bus": r.bus,
                 "commuter": f"{(r.first_name or '')} {(r.last_name or '')}".strip() or "Guest",
                 "origin": r.origin or "",
                 "destination": r.destination or "",
                 "fare": f"{float(r.price):.2f}",
                 "paid": bool(getattr(r, "paid", False)) and not is_void,
-                "status": (getattr(r, "status", None) or ("voided" if is_void else ("paid" if getattr(r, "paid", False) else "unpaid"))),
+                "status": (
+                    getattr(r, "status", None)
+                    or ("voided" if is_void else ("paid" if getattr(r, "paid", False) else "unpaid"))
+                ),
                 "passenger_type": (r.passenger_type or "regular"),
                 "passengerType": (r.passenger_type or "regular"),
                 "voided": is_void,
@@ -1043,11 +1056,12 @@ def tickets_for_day():
     total = sum(
         float(r.price or 0)
         for r in rows
-        if not (bool(getattr(r, "voided", False)) or (str(getattr(r, "status", "") or "").lower() in {"void", "voided", "refunded", "cancelled", "canceled"}))
+        if not (
+            bool(getattr(r, "voided", False))
+            or (str(getattr(r, "status", "") or "").lower() in {"void", "voided", "refunded", "cancelled", "canceled"})
+        )
     )
     return jsonify(tickets=tickets, total=f"{total:.2f}"), 200
-
-
 
 @manager_bp.route("/buses", methods=["GET"])
 @require_role("manager", "pao")

@@ -1,17 +1,14 @@
 # backend/routes/pao.py
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
+from flask import Blueprint, request, jsonify, g, current_app, url_for
 
 from dateutil import parser as dtparse
-from flask import Blueprint, request, jsonify, g, current_app, url_for, redirect
 from sqlalchemy import func
 from sqlalchemy.orm import joinedload
 
-try:
-    from app.realtime import emit_announcement  # when app is a package
-except ImportError:
-    from realtime import emit_announcement      # when files are top-level
+
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from db import db
 from models.announcement import Announcement
@@ -30,8 +27,7 @@ from decimal import Decimal
 import datetime as dt
 from models.wallet import TopUp                     # for daily-cap query
 from services.wallet import topup_cash, topup_gcash
-
-
+from services.notify_ticket import notify_commuter_ticket_received
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 
@@ -341,8 +337,6 @@ def user_qr_scan():
         return jsonify(error="user not found"), 404
 
     return jsonify(user_id=user_id, name=f"{u.first_name} {u.last_name}"), 200
-
-
 @pao_bp.route("/wallet/charge", methods=["POST"])
 @require_role("pao")
 def pao_wallet_charge():
@@ -369,7 +363,7 @@ def pao_wallet_charge():
         return jsonify(error="invalid amount_php"), 400
     if amount_php <= 0:
         return jsonify(error="amount must be > 0"), 400
-    amount_pesos = int(round(amount_php))  # WHOLE PESOS (no *100)
+    amount_pesos = int(round(amount_php))  # WHOLE PESOS
 
     # --- resolve user ---
     token = (data.get("wallet_token") or "").strip()
@@ -389,7 +383,7 @@ def pao_wallet_charge():
     t = None  # TicketSale row, if provided
 
     try:
-        # --- lock the wallet row (table has no 'id') ---
+        # --- lock the wallet row ---
         row = db.session.execute(
             text(
                 "SELECT user_id, COALESCE(balance_pesos,0) AS balance_pesos "
@@ -419,6 +413,12 @@ def pao_wallet_charge():
                 db.session.rollback()
                 return jsonify(error="already paid"), 409
 
+            # STRICT: only wallet tickets can be wallet-charged
+            if _has_column("ticket_sales", "payment_method"):
+                if (getattr(t, "payment_method", None) or "wallet") != "wallet":
+                    db.session.rollback()
+                    return jsonify(error="cannot wallet-charge a non-wallet ticket"), 409
+
             # Duplicate guard in ledger (same ticket already charged)
             dup_id = db.session.execute(
                 text("""
@@ -440,11 +440,10 @@ def pao_wallet_charge():
 
         # --- funds check ---
         if balance_pesos < amount_pesos:
-            # If a ticket exists and isn't paid, delete it to avoid stray UNPAID rows
             if t is not None and not t.paid:
                 try:
                     db.session.delete(t)
-                    db.session.commit()  # commit the delete to release locks
+                    db.session.commit()
                     current_app.logger.info(
                         "[PAO:wallet_charge] insufficient funds → deleted ticket_id=%s", t.id
                     )
@@ -533,6 +532,7 @@ def pao_wallet_charge():
         current_app.logger.exception("[PAO:wallet_charge] unexpected failure")
         db.session.rollback()
         return jsonify(error="internal error"), 500
+
 
 @pao_bp.route("/wallet/resolve", methods=["POST", "GET"])
 @require_role("pao")
@@ -1084,39 +1084,25 @@ def pao_summary():
     ), 200
 
 
-# backend/routes/pao.py
-
 @pao_bp.route("/stops", methods=["GET"])
 @require_role("pao")
 def list_stops():
-    ALLOWED_STOPS = [
-        "San Manuel","Lanat","Colobot","Carthel or Rodriguez","San Vicente or San Juan",
-        "San Pedro or Leasing","Binhonan or Rizal","Moncada","Mormoni","Alma Villo",
-        "San Julian","Sta Lucia","San Isidro","Saint Peter","Apulid",
-        "Bdo Panqui or Walter","Green Meadows","LTO","Carino","Caturay",
-        "Magapac","Dreamwoods","Gerona","San Antonio","Salapungan or Iddaan",
-        "Tarelco","Oishi","Villa Paz or Dph or Tmdc","Parsolingan or Img",
-        "Sta Cruz","Aguso","Panampunan","Osias or Palm Plaza","SM Tarlac City Jr Siesta",
-    ]
-    order_map = {name: i for i, name in enumerate(ALLOWED_STOPS)}
+    # use explicit ?bus_id=, or default to the PAO’s assigned bus
+    bus_id = request.args.get("bus_id", type=int) or getattr(g.user, "assigned_bus_id", None)
+    if not bus_id:
+        return jsonify(error="no assigned bus"), 400
 
-    # Pull only rows that match the whitelist, then dedupe-by-name, then order by whitelist index
-    rows = TicketStop.query.filter(TicketStop.stop_name.in_(ALLOWED_STOPS)).all()
-
-    by_name = {}
-    for r in rows:
-        key = (r.stop_name or "").strip()
-        # keep the one with the lowest seq if duplicates exist
-        if key and (key not in by_name or (getattr(r, "seq", 1_000_000) < getattr(by_name[key], "seq", 1_000_000))):
-            by_name[key] = r
-
-    filtered = sorted(by_name.values(), key=lambda r: order_map.get(r.stop_name, 1_000_000))
+    rows = (
+        TicketStop.query
+        .filter(TicketStop.bus_id == bus_id)
+        .order_by(TicketStop.seq.asc(), TicketStop.id.asc())
+        .all()
+    )
 
     return jsonify([
-        {"id": r.id, "name": r.stop_name, "seq": order_map.get(r.stop_name, getattr(r, "seq", None))}
-        for r in filtered
+        {"id": r.id, "name": r.stop_name, "seq": int(getattr(r, "seq", 0) or 0)}
+        for r in rows
     ]), 200
-
 
 
 @pao_bp.route("/recent-tickets", methods=["GET"])
@@ -1408,229 +1394,397 @@ def _fare_for(o, d, passenger_type: str) -> int:
     base = 10 + max(hops - 1, 0) * 2
     return round(base * 0.8) if passenger_type == "discount" else base
 
+def _stop_name_and_seq(stop_id: int) -> Tuple[str, Optional[int]]:
+    """
+    Resolve a stop id to (name, seq). We use TicketStop as a simple lookup.
+    If your schema uses StopTime ids instead, adapt this function accordingly.
+    """
+    ts = TicketStop.query.get(stop_id)
+    if not ts:
+        return ("", None)
+    try:
+        seq = int(getattr(ts, "seq", None) or 0)
+    except Exception:
+        seq = None
+    return (ts.stop_name or "", seq)
+
+def _fare_each(seq_o: Optional[int], seq_d: Optional[int], ptype: str) -> Optional[int]:
+    """
+    Same formula you use in the app:
+      base = 10 + max(hops-1, 0)*2; discount = base*0.8
+    """
+    if seq_o is None or seq_d is None:
+        return None
+    hops = abs(int(seq_o) - int(seq_d))
+    base = 10 + max(hops - 1, 0) * 2
+    return int(round(base * 0.8)) if ptype == "discount" else int(base)
+
+def _sum_group_fare(seq_o: Optional[int], seq_d: Optional[int], items: List[Dict]) -> int:
+    if not items:
+        return 0
+    total = 0
+    for it in items:
+        ptype = (it.get("passenger_type") or "regular").lower()
+        qty   = int(it.get("quantity") or 0)
+        each  = _fare_each(seq_o, seq_d, ptype)
+        # if we cannot compute locally, fall back to 0 for that component
+        if each is not None and qty > 0:
+            total += each * qty
+    return int(total)
+
+def _primary_from_items(items: List[Dict], fallback: str = "regular") -> str:
+    """
+    Choose primary type (solo or group). Your client sends `primary_type` already,
+    but in case it’s missing, infer it with a simple majority.
+    """
+    try:
+        reg = next((int(x.get("quantity") or 0) for x in items if (x.get("passenger_type") or "") == "regular"), 0)
+        dis = next((int(x.get("quantity") or 0) for x in items if (x.get("passenger_type") or "") == "discount"), 0)
+        if reg == 0 and dis == 0:
+            return fallback
+        return "regular" if reg >= dis else "discount"
+    except Exception:
+        return fallback
+
+def _has_column(table: str, column: str) -> bool:
+    try:
+        row = db.session.execute(
+            text("""SELECT 1
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = :t AND COLUMN_NAME = :c
+                    LIMIT 1"""),
+            {"t": table, "c": column},
+        ).first()
+        return bool(row)
+    except Exception:
+        return False
+
+def _resolve_stop(stop_id: Optional[int]) -> Tuple[str, Optional[int]]:
+    """
+    Return (stop_name, seq) for a TicketStop id.
+    """
+    if not stop_id:
+        return ("", None)
+    ts = TicketStop.query.get(stop_id)
+    if not ts:
+        return ("", None)
+    name = getattr(ts, "stop_name", "") or getattr(ts, "name", "") or ""
+    seq = None
+    try:
+        seq = int(getattr(ts, "seq", None) or 0)
+    except Exception:
+        seq = None
+    return (name, seq)
+
+def _fare_each(seq_o: Optional[int], seq_d: Optional[int], ptype: str) -> int:
+    """
+    Same fare math as the app preview:
+      base = 10 + max(hops-1, 0)*2
+      discount = round(base * 0.8)
+    If sequence/hops unknown, assume minimum base=10.
+    """
+    try:
+        if seq_o is not None and seq_d is not None:
+            hops = abs(int(seq_o) - int(seq_d))
+            base = 10 + max(hops - 1, 0) * 2
+        else:
+            base = 10
+    except Exception:
+        base = 10
+    return int(round(base * 0.8)) if (ptype or "").lower() == "discount" else int(base)
+
+def _compute_totals(origin_stop_id: int, destination_stop_id: int, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    o_name, o_seq = _resolve_stop(origin_stop_id)
+    d_name, d_seq = _resolve_stop(destination_stop_id)
+
+    reg_qty = sum(int(i.get("quantity") or 0) for i in items if (i.get("passenger_type") or "regular") == "regular")
+    dis_qty = sum(int(i.get("quantity") or 0) for i in items if (i.get("passenger_type") or "regular") == "discount")
+    total_qty = reg_qty + dis_qty if (reg_qty + dis_qty) > 0 else 1
+
+    reg_each = _fare_each(o_seq, d_seq, "regular")
+    dis_each = _fare_each(o_seq, d_seq, "discount")
+    total_fare = (reg_qty * reg_each) + (dis_qty * dis_each)
+    if total_qty == 1 and total_fare == 0:
+        # Solo but no quantity in payload -> treat as 1 regular
+        total_fare = reg_each
+        reg_qty = 1
+        total_qty = 1
+
+    return {
+        "origin_name": o_name,
+        "destination_name": d_name,
+        "o_seq": o_seq,
+        "d_seq": d_seq,
+        "reg_qty": reg_qty,
+        "dis_qty": dis_qty,
+        "total_qty": total_qty,
+        "reg_each": reg_each,
+        "dis_each": dis_each,
+        "total_fare": int(total_fare),
+    }
+
+def _charge_wallet_pesos(user_id: int, pesos: int, ref_ticket_id: Optional[int] = None) -> bool:
+    """
+    Atomic wallet deduction + ledger insert (pesos-only).
+    Returns True on success (sufficient balance), False on insufficient.
+    """
+    if pesos <= 0:
+        return True
+
+    # 1) Deduct if balance is sufficient
+    upd = db.session.execute(
+        text("""
+            UPDATE wallet_accounts
+            SET balance_pesos = balance_pesos - :amt
+            WHERE user_id = :uid AND balance_pesos >= :amt
+        """),
+        {"uid": user_id, "amt": pesos},
+    )
+    if upd.rowcount == 0:
+        db.session.rollback()
+        return False
+
+    # 2) Read new balance to log into ledger
+    bal = db.session.execute(
+        text("SELECT balance_pesos FROM wallet_accounts WHERE user_id = :uid"),
+        {"uid": user_id},
+    ).scalar()
+    new_bal = int(bal or 0)
+
+    # 3) Ledger entry
+    db.session.execute(
+        text("""
+            INSERT INTO wallet_ledger
+                (account_id, direction, event, amount_pesos, running_balance_pesos, ref_table, ref_id, created_at)
+            VALUES
+                (:uid, 'debit', 'ticket_purchase', :amt, :run, 'ticket_sales', :ref, NOW())
+        """),
+        {"uid": user_id, "amt": pesos, "run": new_bal, "ref": ref_ticket_id or 0},
+    )
+    return True
+
+def _who_is_pao_user_id() -> Optional[int]:
+    try:
+        return int(getattr(g, "user", None).id)
+    except Exception:
+        return None
+
+def _bus_for_pao() -> Optional[int]:
+    try:
+        bus_id = getattr(g.user, "assigned_bus_id", None)
+        return int(bus_id) if bus_id else None
+    except Exception:
+        return None
+
+def _primary_type_from_items(items: List[Dict[str, Any]], fallback: str = "regular") -> str:
+    if not items:
+        return fallback
+    # If only one item with qty>0, use that type; else choose the more numerous
+    reg = sum(int(i.get("quantity") or 0) for i in items if (i.get("passenger_type") or "regular") == "regular")
+    dis = sum(int(i.get("quantity") or 0) for i in items if (i.get("passenger_type") or "regular") == "discount")
+    if reg == 0 and dis == 0:
+        return fallback
+    return "regular" if reg >= dis else "discount"
+
 @pao_bp.route("/tickets", methods=["POST"])
 @require_role("pao")
-def create_ticket():
+def pao_create_ticket():
     """
-    Create a ticket (solo or group).
-
-    Body accepts either legacy solo fields or:
-      {
-        "origin_stop_id": 1,
-        "destination_stop_id": 2,
-        "items": [{"passenger_type":"regular","quantity":2},{"passenger_type":"discount","quantity":1}],
-        "primary_type": "regular"|"discount",
-        "created_at": ISO8601,
-        "payment_method": "wallet"|"gcash",     # <- NEW (default "wallet")
-        "user_id": 123,                         # wallet owner to CHARGE (wallet mode only)
-        "wallet_token": "WLT-...",              # or rotating wallet token (wallet mode only)
-        "commuter_id": 456                      # who the receipt is for (both modes; falls back to wallet owner)
-      }
+    POST /pao/tickets
+    Body (JSON):
+      origin_stop_id: int
+      destination_stop_id: int
+      items: [{ passenger_type: 'regular'|'discount', quantity: int }, ...]
+      payment_method: 'wallet' | 'gcash'
+      commuter_id: int (optional; required for wallet, optional for gcash)
+      primary_type: 'regular'|'discount' (optional; used for solo label)
+      gcash_paid: bool (optional; defaults true if payment_method='gcash')
+      gcash_ref: str (recommended for gcash)
+    Returns:
+      • Solo:  { id, referenceNo, origin, destination, passengerType, fare, paid, commuter? }
+      • Group: { count, total_fare, items: [ { id, referenceNo, passengerType, fare, origin, destination } ] }
+      • 402 with { required_php } if wallet funds insufficient
     """
     data = request.get_json(silent=True) or {}
-    current_app.logger.debug(f"[PAO:/tickets] payload: {data}")
+
+    origin_stop_id      = int(data.get("origin_stop_id") or data.get("origin_stop_time_id") or 0)
+    destination_stop_id = int(data.get("destination_stop_id") or data.get("destination_stop_time_id") or 0)
+
+    # Normalize items
+    raw_items = data.get("items") or []
+    if not isinstance(raw_items, list):
+        raw_items = []
+    items = []
+    for raw in raw_items:
+        try:
+            pt = (raw.get("passenger_type") or raw.get("type") or "regular").strip().lower()
+            if pt not in {"regular", "discount"}:
+                pt = "regular"
+            qty = int(raw.get("quantity") or raw.get("qty") or 0)
+        except Exception:
+            continue
+        if qty > 0:
+            items.append({"passenger_type": pt, "quantity": qty})
+    if not items:
+        items = [{"passenger_type": (data.get("primary_type") or "regular"), "quantity": 1}]
+
+    payment_method = (data.get("payment_method") or "").strip().lower()
+    if payment_method not in {"wallet", "gcash"}:
+        return jsonify(error="unsupported payment_method"), 400
+
+    commuter_id = data.get("commuter_id")
+    try:
+        commuter_id = int(commuter_id) if commuter_id is not None else None
+    except Exception:
+        commuter_id = None
+
+    primary_type = (data.get("primary_type") or "").strip().lower() or _primary_type_from_items(items)
+    is_gcash = (payment_method == "gcash")
+    gcash_paid = bool(data.get("gcash_paid")) if "gcash_paid" in data else is_gcash
+    gcash_ref = (data.get("gcash_ref") or data.get("external_ref") or "").strip() or None
+
+    # Method-specific requirements
+    if payment_method == "wallet":
+        if not (commuter_id and commuter_id > 0):
+            return jsonify(error="commuter_id required for wallet payment"), 400
+    if payment_method == "gcash":
+        # If you require a PSP reference for gcash tickets, keep this guard:
+        if not gcash_ref:
+            return jsonify(error="gcash_ref required for GCash tickets"), 400
+        if "gcash_paid" in data and not bool(gcash_paid):
+            return jsonify(error="gcash tickets must be created as paid once PSP ref is present"), 400
+
+    if not (origin_stop_id and destination_stop_id):
+        return jsonify(error="origin_stop_id and destination_stop_id are required"), 400
+
+    totals = _compute_totals(origin_stop_id, destination_stop_id, items)
+    total_fare = int(totals["total_fare"] or 0)
+    reg_qty    = int(totals["reg_qty"] or 0)
+    dis_qty    = int(totals["dis_qty"] or 0)
+    total_qty  = int(totals["total_qty"] or 1)
+
+    if total_fare <= 0:
+        return jsonify(error="calculated fare is zero"), 400
+
+    pao_id  = _who_is_pao_user_id()
+    bus_id  = _bus_for_pao() or data.get("bus_id")
+    try:
+        bus_id = int(bus_id) if bus_id else None
+    except Exception:
+        bus_id = None
+
+    can_group = _has_column("ticket_sales", "is_group")
+    now = dt.datetime.utcnow()
 
     try:
-        # ---- Resolve O/D stops ------------------------------------------------
-        o_id = data.get("origin_stop_id") or data.get("origin_stop_time_id")
-        d_id = data.get("destination_stop_id") or data.get("destination_stop_time_id")
-        o = TicketStop.query.get(o_id)
-        d = TicketStop.query.get(d_id)
-        if not o or not d:
-            return jsonify(error="origin or destination not found"), 400
+        # Create the ticket
+        t = TicketSale()
+        t.user_id = int(commuter_id) if (commuter_id and commuter_id > 0) else None
+        t.bus_id  = int(bus_id) if bus_id else None
 
-        # ---- Parse passenger blocks (supports list or legacy single) ----------
-        items_spec = data.get("items")
-        n_regular = 0
-        n_discount = 0
-        if isinstance(items_spec, list):
-            for b in items_spec:
-                pt = (b or {}).get("passenger_type")
-                qty = int((b or {}).get("quantity") or 0)
-                if pt not in ("regular", "discount") or qty < 0:
-                    return jsonify(error="invalid passenger_type/quantity"), 400
-                if pt == "regular":
-                    n_regular += qty
-                else:
-                    n_discount += qty
-        else:
-            # legacy solo
-            pt = (data.get("passenger_type") or "").lower()
-            if pt not in ("regular", "discount"):
-                return jsonify(error="invalid passenger_type"), 400
-            qty = max(1, min(int(data.get("quantity") or 1), 20))
-            if pt == "regular":
-                n_regular = qty
-            else:
-                n_discount = qty
+        setattr(t, "origin_stop_time_id", int(origin_stop_id))
+        setattr(t, "destination_stop_time_id", int(destination_stop_id))
 
-        total_qty = int(n_regular + n_discount)
-        if total_qty <= 0:
-            return jsonify(error="no passengers"), 400
-        if total_qty > 20:
-            return jsonify(error="quantity exceeds limit (20)"), 400
+        t.passenger_type = (primary_type or "regular")
+        t.price = int(total_fare)
+        t.paid  = bool(gcash_paid or (payment_method == "wallet"))
 
-        # ---- Ticket timestamp --------------------------------------------------
-        client_ts = data.get("created_at")
-        try:
-            ticket_dt = dtparse.parse(client_ts) if client_ts else datetime.utcnow()
-        except Exception:
-            ticket_dt = datetime.utcnow()
+        if _has_column("ticket_sales", "payment_method"):
+            t.payment_method = payment_method
 
-        # ---- Primary type (stored for compatibility) --------------------------
-        primary_type = (data.get("primary_type") or ("regular" if n_regular >= n_discount else "discount")).lower()
-        if primary_type not in ("regular", "discount"):
-            primary_type = "regular"
+        if _has_column("ticket_sales", "issued_by"):
+            t.issued_by = int(pao_id) if pao_id else None
 
-        # ---- Bus context -------------------------------------------------------
-        bus_id = _current_bus_id()
-        if not bus_id:
-            return jsonify(error="PAO has no assigned bus"), 400
+        if can_group and total_qty > 1:
+            setattr(t, "is_group", True)
+            setattr(t, "group_regular", int(reg_qty))
+            setattr(t, "group_discount", int(dis_qty))
+        elif can_group:
+            setattr(t, "is_group", False)
+            setattr(t, "group_regular", None)
+            setattr(t, "group_discount", None)
 
-        # ---- Fare math (WHOLE PESOS) ------------------------------------------
-        def _fare_for_local(pt: str) -> int:
-            hops = abs(o.seq - d.seq)
-            base = 10 + max(hops - 1, 0) * 2
-            return round(base * 0.8) if pt == "discount" else base
+        if _has_column("ticket_sales", "reference_no"):
+            t.reference_no = f"T{int(now.timestamp()*1000)}"
 
-        total_pesos = int(round(
-            _fare_for_local("regular") * n_regular +
-            _fare_for_local("discount") * n_discount
-        ))
-
-        # ---- Payment method ----------------------------------------------------
-        pay_method = (data.get("payment_method") or data.get("pay_mode") or "wallet").strip().lower()
-        if pay_method not in ("wallet", "gcash"):
-            pay_method = "wallet"  # back-compat default
-
-        # Determine who the ticket is for (the name on receipt)
-        requested_commuter_id = data.get("commuter_id")
-
-        # ---- Resolve wallet owner iff WALLET mode ------------------------------
-        account_user_id: Optional[int] = None
-        if pay_method == "wallet":
-            wallet_token = (data.get("wallet_token") or "").strip()
-            wallet_user_id = data.get("user_id")
-
-            if wallet_token:
-                if verify_wallet_token is None:
-                    return jsonify(error="wallet token not supported"), 400
-                try:
-                    account_user_id = int(verify_wallet_token(wallet_token))
-                except Exception:
-                    return jsonify(error="invalid wallet token"), 400
-            elif wallet_user_id not in (None, "", 0):
-                account_user_id = int(wallet_user_id)
-
-            if not account_user_id:
-                return jsonify(error="missing wallet_token or user_id"), 400
-
-            # commuter (receipt owner) falls back to wallet owner
-            linked_user_id = int(requested_commuter_id or account_user_id)
-        else:
-            # GCash mode: commuter_id is required (we don't charge wallet)
-            if not requested_commuter_id:
-                return jsonify(error="commuter_id required for gcash payments"), 400
-            linked_user_id = int(requested_commuter_id)
-
-        # Validate linked commuter exists
-        user = User.query.get(linked_user_id)
-        if not user:
-            return jsonify(error="invalid commuter_id"), 400
-
-        # ===================== WALLET branch =====================
-        new_balance: Optional[int] = None
-        if pay_method == "wallet":
-            # Atomic pre-debit; if it fails, no ticket is created.
-            upd = db.session.execute(
-                text("""
-                    UPDATE wallet_accounts
-                    SET balance_pesos = balance_pesos - :amt
-                    WHERE user_id = :uid AND balance_pesos >= :amt
-                """),
-                {"uid": int(account_user_id), "amt": int(total_pesos)},
-            )
-            if upd.rowcount != 1:
-                return jsonify(
-                    error="insufficient balance",
-                    account_user_id=int(account_user_id),
-                    required_php=float(total_pesos),
-                ), 402
-
-        # ---- Create the ticket row (single row; supports group meta) ----------
-        t = TicketSale(
-            bus_id=bus_id,
-            user_id=user.id,
-            guest=False,
-            price=int(total_pesos),
-            passenger_type=primary_type,
-            reference_no="TEMP",
-            paid=True,                             # both modes produce a paid ticket
-            created_at=ticket_dt,
-            origin_stop_time_id=o.id,
-            destination_stop_time_id=d.id,
-            issued_by=g.user.id,
-            # group meta:
-            is_group=bool(total_qty > 1),
-            group_regular=int(n_regular),
-            group_discount=int(n_discount),
-        )
         db.session.add(t)
         db.session.flush()  # get t.id
-        t.reference_no = _gen_reference(bus_id, t.id)
 
-        # If we charged the wallet, write a ledger row and read the new balance.
-        if pay_method == "wallet":
-            new_balance = int(db.session.execute(
-                text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
-                {"uid": int(account_user_id)}
-            ).scalar() or 0)
-
-            db.session.execute(
-                text("""
-                    INSERT INTO wallet_ledger
-                        (account_id, direction, event, amount_pesos, running_balance_pesos,
-                         ref_table, ref_id, created_at)
-                    VALUES
-                        (:aid, 'debit', 'ride', :amt, :run, 'ticket_sale', :rid, NOW())
-                """),
-                {"aid": int(account_user_id), "amt": int(total_pesos), "run": int(new_balance), "rid": int(t.id)},
-            )
+        # Wallet charge (atomic) before commit
+        if payment_method == "wallet":
+            ok = _charge_wallet_pesos(int(commuter_id), int(total_fare), ref_ticket_id=int(t.id))
+            if not ok:
+                db.session.rollback()
+                return jsonify(error="insufficient_funds", required_php=int(total_fare)), 402
+            t.paid = True  # ensure true for wallet payments
 
         db.session.commit()
 
-        # ---- After-commit push/MQTT (best-effort) -----------------------------
-        app_obj = current_app._get_current_object()
-        Thread(
-            target=_post_commit_notify,
-            args=(app_obj, int(bus_id), int(user.id), [int(t.id)], o.stop_name, d.stop_name),
-            kwargs=dict(
-                new_balance_pesos=(int(new_balance) if new_balance is not None else None),
-                wallet_owner_id=(int(account_user_id) if account_user_id is not None else None),
-                total_pesos=int(total_pesos),
-                pao_id=int(g.user.id),
-            ),
-            daemon=True,
-        ).start()
+        # Push notify commuter (only if linked & paid)
+        if t.user_id and bool(t.paid):
+            try:
+                notify_commuter_ticket_received(int(t.id))
+            except Exception:
+                current_app.logger.exception("[push] ticket_received notify failed (ticket_id=%s)", t.id)
 
-        # ---- Response ----------------------------------------------------------
-        payload = _serialize_ticket_json(t, o.stop_name, d.stop_name)
-        payload["count"] = int(total_qty)
-        payload["group"] = {
-            "regular": int(n_regular),
-            "discount": int(n_discount),
-            "total": int(total_qty),
-        }
-        # Optional hint for clients (safe to ignore)
-        payload["payment_method"] = pay_method
-        return jsonify(payload), 201
+        origin_name = totals["origin_name"]
+        destination_name = totals["destination_name"]
+
+        if total_qty > 1:
+            head_item = {
+                "id": int(t.id),
+                "referenceNo": getattr(t, "reference_no", None) or f"{t.id}",
+                "origin": origin_name,
+                "destination": destination_name,
+                "passengerType": (primary_type or "regular"),
+                "fare": int(total_fare),
+                "paid": bool(t.paid),
+                "commuter": None,
+            }
+            try:
+                if t.user_id:
+                    u = User.query.get(int(t.user_id))
+                    if u:
+                        head_item["commuter"] = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or (u.username or f"User #{u.id}")
+            except Exception:
+                pass
+
+            return jsonify({
+                "count": int(total_qty),
+                "total_fare": int(total_fare),
+                "items": [head_item],
+            }), 201
+
+        commuter_name = None
+        if t.user_id:
+            try:
+                u = User.query.get(int(t.user_id))
+                if u:
+                    commuter_name = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or (u.username or f"User #{u.id}")
+            except Exception:
+                pass
+
+        return jsonify({
+            "id": int(t.id),
+            "referenceNo": getattr(t, "reference_no", None) or f"{t.id}",
+            "origin": origin_name,
+            "destination": destination_name,
+            "passengerType": (primary_type or "regular").lower(),
+            "fare": int(total_fare),
+            "paid": bool(t.paid),
+            "commuter": commuter_name or ("Guest" if not t.user_id else None),
+            "payment_method": payment_method,
+            # compat fields:
+            "qr": None,
+            "qr_link": None,
+            "qr_bg_url": None,
+        }), 201
 
     except Exception as e:
+        current_app.logger.exception("Failed to create ticket: %s", e)
         db.session.rollback()
-        current_app.logger.exception("create_ticket unexpected error")
-        return jsonify(error=str(e)), 500
-
-
+        return jsonify(error="failed to create ticket"), 500
 @pao_bp.route("/tickets/<int:ticket_id>/void", methods=["PATCH"])
 @require_role("pao")
 def void_ticket(ticket_id: int):
@@ -1641,9 +1795,10 @@ def void_ticket(ticket_id: int):
 
     Notes:
       - Locks the ticket row to prevent concurrent updates.
-      - If ticket was paid and has a user_id, credits the wallet back and writes a
+      - If ticket was paid and is a WALLET ticket with a user_id, credits the wallet back and writes a
         `wallet_ledger` credit (event='refund', ref_table='ticket_sale', ref_id=ticket_id).
-      - Publishes a best-effort wallet MQTT update to the commuter channel.
+      - GCash tickets NEVER touch the wallet here.
+      - Publishes a best-effort wallet MQTT update (when refunding).
       - Push-notifies the commuter (channelId=payments).
       - After commit, recalculates the device's "paid" count for today and publishes to MQTT.
       - Checks that the calling PAO is assigned to the same bus as the ticket.
@@ -1655,7 +1810,7 @@ def void_ticket(ticket_id: int):
         return jsonify(error="set voided=true to proceed"), 400
     if not reason:
         return jsonify(error="void reason is required"), 400
-    reason = reason[:200]  # keep short; aligns with UI expectations
+    reason = reason[:200]
 
     # Lock ticket row and fetch related user for push
     t = (
@@ -1679,8 +1834,12 @@ def void_ticket(ticket_id: int):
     amount_pesos = int(round(float(t.price or 0)))
     refunded = 0
 
-    # If paid and belongs to a commuter, credit their wallet back
-    if bool(t.paid) and t.user_id:
+    # Determine whether refund should go to wallet
+    meth = (getattr(t, "payment_method", None) or "wallet") if _has_column("ticket_sales", "payment_method") else "wallet"
+    refund_to_wallet = (bool(t.paid) and t.user_id and (meth == "wallet"))
+
+    # If paid and wallet ticket → credit commuter wallet
+    if refund_to_wallet:
         # Duplicate guard: ensure we haven't already written a refund for this ticket
         dup = db.session.execute(
             text("""
@@ -1711,7 +1870,7 @@ def void_ticket(ticket_id: int):
                 ).scalar() or 0
             )
 
-            # Ledger: refund credit (event='refund', ref_table='ticket_sale')
+            # Ledger: refund credit
             db.session.execute(
                 text("""
                     INSERT INTO wallet_ledger
@@ -1764,8 +1923,6 @@ def void_ticket(ticket_id: int):
     setattr(t, "void_reason", reason)
     setattr(t, "voided_at", _dt.utcnow())
     setattr(t, "voided_by", getattr(g.user, "id", None))
-
-    # If your table has a status column, keep it in sync
     try:
         if hasattr(TicketSale, "status"):
             setattr(t, "status", "voided")
@@ -1781,9 +1938,7 @@ def void_ticket(ticket_id: int):
         return jsonify(error="internal error"), 500
 
     # After-commit: publish updated "paid count" to the device for *today*
-    # (mirrors mark_ticket_paid behavior so hardware dashboards stay accurate)
     try:
-        from datetime import datetime as _dt
         start = _dt.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         end   = _dt.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)
         cnt = (
@@ -1798,7 +1953,10 @@ def void_ticket(ticket_id: int):
     except Exception:
         current_app.logger.exception("[void] failed publishing fare update")
 
+    # For GCash tickets, we still return refunded=0 (no wallet touch)
     return jsonify(id=t.id, voided=True, refunded_php=float(refunded), reason=reason), 200
+
+
 @pao_bp.route("/tickets/preview", methods=["POST"])
 @require_role("pao")
 def preview_ticket():
@@ -2030,11 +2188,16 @@ def get_ticket(ticket_id):
         resp["count"] = total
 
     return jsonify(resp), 200
-
-
 @pao_bp.route("/tickets/<int:ticket_id>", methods=["PATCH"])
 @require_role("pao")
 def mark_ticket_paid(ticket_id: int):
+    """
+    PATCH /pao/tickets/<ticket_id>
+    Body: { "paid": true|false }
+    Rules:
+      - Wallet tickets cannot be marked paid manually here; they must be paid via /pao/wallet/charge.
+      - GCash tickets can be toggled paid/unpaid (assuming PSP logic handled upstream).
+    """
     data = request.get_json(silent=True) or {}
     paid = bool(data.get("paid"))
 
@@ -2048,6 +2211,12 @@ def mark_ticket_paid(ticket_id: int):
 
     if bool(getattr(ticket, "voided", False)):
         return jsonify(error="cannot mark a voided ticket paid"), 409
+
+    # STRICT: wallet tickets become paid only via wallet flow
+    if _has_column("ticket_sales", "payment_method"):
+        meth = (getattr(ticket, "payment_method", None) or "wallet")
+        if meth == "wallet" and paid and not bool(ticket.paid):
+            return jsonify(error="wallet tickets can only be paid via wallet charge"), 409
 
     was_paid = bool(ticket.paid)
     ticket.paid = 1 if paid else 0
@@ -2069,7 +2238,7 @@ def mark_ticket_paid(ticket_id: int):
             publish(topic, {"paid": cnt})
             current_app.logger.info(f"MQTT fare update → {topic}: {cnt}")
 
-        # 🔔 Only push on the first transition to paid, and only for non-guest tickets
+        # Push only on first transition to paid, non-guest
         if (not was_paid) and bool(ticket.paid) and ticket.user_id:
             try:
                 import time
@@ -2095,6 +2264,7 @@ def mark_ticket_paid(ticket_id: int):
     except Exception as e:
         current_app.logger.exception("!! mark_ticket_paid commit failed")
         return jsonify(error=str(e)), 500
+
 
 
 @pao_bp.route("/tickets/<int:ticket_id>", methods=["PUT"])

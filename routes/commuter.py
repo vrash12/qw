@@ -9,7 +9,8 @@ from flask import (
 )
 from sqlalchemy import func, text, or_
 
-# routes/commuter.py
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
 from utils.notify_user import notify_user, notify_tellers 
 from sqlalchemy.orm import joinedload
 from models.wallet import WalletAccount, WalletLedger, TopUp
@@ -171,6 +172,37 @@ def _is_ticket_void(t) -> bool:
     except Exception:
         pass
     return False
+
+
+def _display_ticket_ref_for(
+    t: Optional[TicketSale] = None,
+    *,
+    reference_no: Optional[str] = None,
+    ticket_id: Optional[int] = None,
+    bus_identifier: Optional[str] = None,
+    bus_id: Optional[int] = None,
+) -> str:
+    """
+    Prefer BUS-style reference numbers like BUS2-0016.
+
+    Rules:
+      - If a ref already starts with "BUS", keep it.
+      - Otherwise, render "<bus_identifier>-<ticket_id:04d>".
+      - If bus_identifier is missing, use "BUS{bus_id}".
+    """
+    raw = (reference_no or (getattr(t, "reference_no", None) or "")).strip()
+    if raw.upper().startswith("BUS"):
+        return raw
+
+    tid = int(ticket_id or getattr(t, "id", 0) or 0)
+    # Try the Bus.identifier first; else synthesize BUS{bus_id}
+    bid_str = (
+        (bus_identifier or (getattr(getattr(t, "bus", None), "identifier", None) or "")).strip()
+        or f"BUS{int(bus_id or getattr(t, 'bus_id', 0) or 0)}"
+    )
+    return f"{bid_str}-{tid:04d}" if tid else (bid_str or raw or "BUS-0000")
+
+
 
 def _receipt_url_if_exists(tid: int) -> str | None:
     for ext in (".jpg", ".jpeg", ".png", ".webp"):
@@ -478,6 +510,32 @@ def commuter_notify_test():
     )
     return jsonify(ok=ok), (200 if ok else 202)
 
+
+def _payment_method_for_ticket(t) -> str:
+    """
+    Return 'wallet' or 'gcash' when available.
+    Tries common columns first; falls back to a best-effort guess.
+    """
+    val = (
+        (getattr(t, "payment_method", None) or "")
+        or (getattr(t, "method", None) or "")
+        or (getattr(t, "pay_method", None) or "")
+    ).strip().lower()
+
+    if val in {"wallet", "gcash"}:
+        return val
+
+    # Fallback heuristic (your PAO flow only uses wallet/gcash):
+    # If it’s paid and has a user, assume wallet; otherwise assume gcash.
+    try:
+        if bool(getattr(t, "paid", False)) and getattr(t, "user_id", None):
+            return "wallet"
+    except Exception:
+        pass
+    return "gcash"
+
+
+
 @commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
 def commuter_ticket_image(ticket_id: int):
     """
@@ -726,7 +784,9 @@ def commuter_ticket_image(ticket_id: int):
     yR = y
     passenger_name = f"{t.user.first_name} {t.user.last_name}" if t.user else "—"
     # Left/Right columns
-    yL = field(L, yL, "Reference No.", t.reference_no or "—")
+    display_ref = _display_ticket_ref_for(t=t)
+    yL = field(L, yL, "Reference No.", display_ref or "—")
+
     yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—")
 
     date_str = t.created_at.strftime('%B %d, %Y')
@@ -927,7 +987,7 @@ def commuter_ticket_image(ticket_id: int):
             bio,
             mimetype="image/jpeg",
             as_attachment=as_download,
-            download_name=f"receipt_{t.reference_no}.jpg",
+            download_name=f"receipt_{display_ref}.jpg",
         )
     )
     try:
@@ -1199,7 +1259,6 @@ def _as_time(v: Any) -> Optional[dt.time]:
                 pass
     return None
 
-# routes/commuter.py (or similar)
 @commuter_bp.route("/device-token", methods=["POST"])
 @require_role("commuter")
 def register_commuter_device_token():
@@ -1208,14 +1267,39 @@ def register_commuter_device_token():
     platform = (data.get("platform") or "unknown").strip()
     if not token:
         return jsonify(error="token required"), 400
-    row = DeviceToken.query.filter_by(user_id=g.user.id, token=token).first()
-    if not row:
-        row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
-        db.session.add(row)
-    else:
-        row.platform = platform
-    db.session.commit()
-    return jsonify(ok=True), 200
+
+    uid = int(g.user.id)
+
+    # ✅ Atomic upsert keyed by UNIQUE(token)
+    try:
+        db.session.execute(
+            text("""
+                INSERT INTO device_tokens (user_id, token, platform)
+                VALUES (:uid, :tok, :plat)
+                ON DUPLICATE KEY UPDATE
+                  user_id = VALUES(user_id),
+                  platform = VALUES(platform),
+                  updated_at = NOW()
+            """),
+            {"uid": uid, "tok": token, "plat": platform}
+        )
+        db.session.commit()
+        return jsonify(ok=True), 200
+    except Exception:
+        # Portable fallback if not on MySQL or in case of driver quirks
+        db.session.rollback()
+        row = DeviceToken.query.filter_by(token=token).first()
+        if row:
+            row.user_id = uid
+            row.platform = platform
+        else:
+            db.session.add(DeviceToken(user_id=uid, token=token, platform=platform))
+        try:
+            db.session.commit()
+            return jsonify(ok=True), 200
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify(error="could not register token"), 409
 
 @commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
 def qr_image_for_ticket(ticket_id: int):
@@ -1344,7 +1428,7 @@ def commuter_get_ticket(ticket_id: int):
 
     out = {
         "id": t.id,
-        "referenceNo": t.reference_no,
+        "referenceNo": _display_ticket_ref_for(t=t),
         "date": t.created_at.strftime("%B %d, %Y"),
         "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
         "origin": origin_name,
@@ -1807,7 +1891,7 @@ def my_receipts():
 
             base = {
                 "id": t.id,
-                "referenceNo": t.reference_no,
+                "referenceNo": _display_ticket_ref_for(t=t),
                 "date": t.created_at.strftime("%B %d, %Y"),
                 "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
                 "origin": origin_name,
@@ -2016,7 +2100,7 @@ def commuter_get_ticket_batch(ticket_id: int):
         return jsonify({
             "batch_id": int(getattr(t, "batch_id", None) or t.id),
             "head_ticket_id": int(t.id),
-            "referenceNo": t.reference_no,
+            "referenceNo": _display_ticket_ref_for(t=t),  # or head, depending on the branch
             "date": t.created_at.strftime("%B %d, %Y"),
             "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
             "origin": origin,
