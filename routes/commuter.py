@@ -198,7 +198,7 @@ def _display_ticket_ref_for(
         (bus_identifier or (getattr(getattr(t, "bus", None), "identifier", None) or "")).strip()
         or f"BUS{int(bus_id or getattr(t, 'bus_id', 0) or 0)}"
     )
-    return f"{bid_str}-{tid:04d}" if tid else (bid_str or raw or "BUS-0000")
+    return f"{bid_str}_{tid:04d}" if tid else (bid_str or raw or "BUS_0000")
 
 
 
@@ -686,8 +686,10 @@ def commuter_ticket_image(ticket_id: int):
 
     yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—")
 
-    date_str = t.created_at.strftime('%B %d, %Y')
-    time_str = t.created_at.strftime('%I:%M %p').lstrip('0').lower()
+    ldt = _as_local(t.created_at)
+    date_str = ldt.strftime('%B %d, %Y')
+    time_str = ldt.strftime('%I:%M %p').lstrip('0').lower()
+
     if ft_label:
         draw.text((L, yL), "DATE & TIME", fill=TEXT_MUTED, font=ft_label)
     y_value = yL + 54
@@ -869,10 +871,10 @@ def commuter_ticket_image(ticket_id: int):
     # Footer
     footer_y = max(y + 36, H - M - 72)
     if ft_small:
-        from datetime import datetime as _dt
+        now_local = dt.datetime.now(LOCAL_TZ)
         link_display = (img_link[:80] + "…") if len(img_link) > 80 else img_link
         draw.text((L, footer_y), link_display, fill=TEXT_MUTED, font=ft_small)
-        draw.text((L, footer_y + 36), _dt.now().strftime("Generated on %B %d, %Y at %I:%M %p"), fill=TEXT_MUTED, font=ft_small)
+        draw.text((L, footer_y + 36), now_local.strftime("Generated on %B %d, %Y at %I:%M %p"), fill=TEXT_MUTED, font=ft_small)
 
     bio = BytesIO()
     bg.save(bio, format="JPEG", quality=95, optimize=True)
@@ -1169,6 +1171,7 @@ def qr_image_for_ticket(ticket_id: int):
     filename = f"{prefix}_{amount}.jpg"
     return redirect(url_for("static", filename=f"qr/{filename}", _external=True), code=302)
 
+
 @commuter_bp.route("/tickets/<int:ticket_id>/view", methods=["GET"])
 def commuter_ticket_view(ticket_id: int):
     img_url = url_for("commuter.commuter_ticket_image", ticket_id=ticket_id, _external=True)
@@ -1205,6 +1208,7 @@ def commuter_ticket_view(ticket_id: int):
         200,
         {"Content-Type": "text/html; charset=utf-8"},
     )
+
 
 @commuter_bp.route("/tickets/<int:ticket_id>", methods=["GET"])
 @require_role("commuter")
@@ -1748,6 +1752,7 @@ def my_receipts():
 
             is_void = _is_ticket_void(t)
             fare = int(round(float(t.price or 0)))
+            _ldt = _as_local(t.created_at)
 
             base = {
                 "id": t.id,
@@ -1760,7 +1765,9 @@ def my_receipts():
                 "paid": bool(t.paid) and not is_void,  # never mark paid when voided
                 "voided": bool(is_void),
                 "state": "voided" if is_void else ("paid" if bool(t.paid) else "unpaid"),
-                "created_at": t.created_at.isoformat(),  # helps the app group by day
+                "date": _ldt.strftime("%B %d, %Y"),
+                "time": _ldt.strftime("%I:%M %p").lstrip("0").lower(),
+                "created_at": _ldt.isoformat(),
                 "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
                 "view_url": url_for("commuter.commuter_ticket_view", ticket_id=t.id, _external=True),
             }
@@ -1956,13 +1963,14 @@ def commuter_get_ticket_batch(ticket_id: int):
         breakdown = []
         if g_reg: breakdown.append({"passenger_type": "regular", "quantity": g_reg})
         if g_dis: breakdown.append({"passenger_type": "discount", "quantity": g_dis})
+        _ldt = _as_local(t.created_at)
 
         return jsonify({
             "batch_id": int(getattr(t, "batch_id", None) or t.id),
             "head_ticket_id": int(t.id),
             "referenceNo": _display_ticket_ref_for(t=t),  # or head, depending on the branch
-            "date": t.created_at.strftime("%B %d, %Y"),
-            "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+            "date": _ldt.strftime("%B %d, %Y"),
+            "time": _ldt.strftime("%I:%M %p").lstrip("0").lower(),
             "origin": origin,
             "destination": destination,
             "passengers": passengers,

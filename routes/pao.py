@@ -2,7 +2,7 @@
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from flask import Blueprint, request, jsonify, g, current_app, url_for
+from flask import Blueprint, request, jsonify, g, current_app, url_for, redirect
 
 from dateutil import parser as dtparse
 from sqlalchemy import func
@@ -32,12 +32,17 @@ from sqlalchemy.exc import IntegrityError
 
 # make sure we actually have these in this file:
 from models.wallet import WalletAccount, WalletLedger, TopUp
+# helpers.py (or inside pao route file)
+import datetime as dt
+def now_utc_naive() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
 # wallet token verifier (opaque WLT-* or similar)
 try:
     from utils.wallet_qr import verify_wallet_token
 except Exception:
     verify_wallet_token = None
+
 
 
 def _debug_enabled() -> bool:
@@ -153,158 +158,25 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
     except Exception:
         current_app.logger.exception("[mqtt] user-wallet publish failed")
 
-def _publish_user_event(uid: int, payload: dict) -> bool:
-    # Use the already-imported `publish` (best-effort).
-    try:
-        if "sentAt" not in payload:
-            payload = {**payload, "sentAt": int(_time.time() * 1000)}
-        publish(f"user/{int(uid)}/events", payload)
-        return True
-    except Exception:
-        current_app.logger.exception("[mqtt] user event publish failed uid=%s", uid)
-        return False
 
-
-def _post_commit_notify(
-    app,
-    bus_id: int,
-    user_id: int | None,
-    items_ids: list[int],
-    o_name: str,
-    d_name: str,
-    *,
-    new_balance_pesos: int | None = None,
-    wallet_owner_id: int | None = None,
-    total_pesos: int | None = None,
-    pao_id: int | None = None,
-):
-    """
-    Background notifier to run *after* a successful DB commit.
-
-    Args:
-        app: The real Flask app object (pass current_app._get_current_object()).
-        bus_id: The bus related to the transaction/operation.
-        user_id: The commuter (or actor) id that initiated the action.
-        items_ids: Related DB row ids (e.g., tickets) for context/telemetry.
-        o_name: Origin name (for user-facing push content).
-        d_name: Destination name (for user-facing push content).
-        new_balance_pesos: If provided, publish a wallet balance update (PHP).
-        wallet_owner_id: The wallet owner to notify/publish balance for (defaults to user_id if omitted).
-        total_pesos: Optional total amount for context in payloads and pushes.
-        pao_id: PAO user id (kept for parity, unused here).
-    """
-    import logging
-    import time as _time
-
-    # Defensive copy / normalization
-    try:
-        items_ids = list(items_ids or [])
-    except Exception:
-        items_ids = []
-
-    try:
-        with app.app_context():
-            # ------------------------------
-            # 1) MQTT: wallet update (if any)
-            # ------------------------------
-            try:
-                # Prefer explicit wallet_owner_id; fall back to user_id
-                wallet_uid = wallet_owner_id or user_id
-                if wallet_uid is not None and new_balance_pesos is not None:
-                    _publish_user_wallet(
-                        int(wallet_uid),
-                        new_balance_pesos=int(new_balance_pesos),
-                        event="wallet_update",
-                        bus_id=bus_id,
-                        related_items=items_ids,
-                    )
-            except Exception:
-                try:
-                    current_app.logger.exception("[mqtt] wallet publish failed")
-                except Exception:
-                    logging.exception("[mqtt] wallet publish failed (no app logger)")
-
-            # ---------------------------------------------------
-            # 2) Optional: ticket/payment push (NOT announcements)
-            # ---------------------------------------------------
-            # We intentionally DO NOT create Announcement rows or emit_announcement here.
-            # Only push a user-facing notification (if we can identify a recipient).
-            try:
-                push_uid = user_id or wallet_owner_id
-                if push_uid:
-                    # Build a concise push message; keep it short & localized-friendly.
-                    title = "Ticket processed"
-                    body = f"{o_name} → {d_name}"
-                    if total_pesos is not None:
-                        try:
-                            body = f"{body} • ₱{float(total_pesos):.2f}"
-                        except Exception:
-                            pass
-
-                    # Add structured data for client-side handling (optional)
-                    data = {
-                        "type": "ticket",
-                        "bus_id": int(bus_id) if bus_id is not None else None,
-                        "items": items_ids,
-                        "origin": o_name,
-                        "destination": d_name,
-                        "total_php": float(total_pesos) if total_pesos is not None else None,
-                        "sentAt": int(_epoch_ms() * 1000),
-                    }
-
-                    # Fire-and-forget push
-                    try:
-                        # use the same signature you use everywhere else
-                        push_to_user(
-                            db, DeviceToken, int(push_uid),
-                            title, body, data,
-                            channelId="payments", priority="high", ttl=600
-                        )
-                    except Exception:
-                        current_app.logger.exception("[push] push_to_user failed")
-            except Exception:
-                try:
-                    current_app.logger.exception("[push] block crashed")
-                except Exception:
-                    logging.exception("[push] block crashed (no app logger)")
-
-            # ---------------------------------------------------
-            # 3) (Intentionally removed) Ticket Announcements
-            # ---------------------------------------------------
-            # NOTE:
-            # Previously this function persisted an Announcement and emitted it
-            # ~2 seconds after commit:
-            #   - created an Announcement("Ticket issued • {o_name} → {d_name} …")
-            #   - emit_announcement(payload, bus_id=bus_id)
-            #
-            # Per request, that behavior has been removed so ticket-create events
-            # will NOT appear in the Announcements feed anymore.
-
-    except Exception:
-        # Top-level guard: never let this background worker crash the caller.
-        try:
-            current_app.logger.exception("[post-commit] worker crashed")
-        except Exception:
-            logging.exception("[post-commit] worker crashed (no app logger)")
-
-
-
-# ---- Time helpers (UTC canonical; Manila convenience) ----
 from datetime import timezone as _tz, timedelta as _td
 _MNL = _tz(_td(hours=8))
 
 def _as_utc(x):
     if x is None:
         return None
-    # If naive → assume it's UTC; else convert to UTC
-    return (x.replace(tzinfo=_tz.utc) if x.tzinfo is None else x.astimezone(_tz.utc))
+    # Naive datetimes from DB are Manila-local; attach MNL first, then convert to UTC
+    if x.tzinfo is None:
+        return x.replace(tzinfo=_MNL).astimezone(_tz.utc)
+    return x.astimezone(_tz.utc)
 
 def _as_mnl(x):
     return _as_utc(x).astimezone(_MNL)
 
 def _iso_utc(x):
     u = _as_utc(x)
-    return u.strftime('%Y-%m-%dT%H:%M:%SZ')  # explicit 'Z'
+    return u.strftime('%Y-%m-%dT%H:%M:%SZ')
+
 
 pao_bp = Blueprint("pao", __name__, url_prefix="/pao")
 
@@ -1230,8 +1102,6 @@ def pao_stop_times():
             for st in sts
         ]
     ), 200
-
-
 @pao_bp.route("/wallet/topups", methods=["POST"])
 @require_role("pao")
 def pao_cash_topup():
@@ -1305,8 +1175,6 @@ def pao_cash_topup():
         current_app.logger.warning("[PAO:topup][%s] reject: missing wallet_token or user_id", rid)
         return jsonify(error="missing wallet_token or user_id"), 400
 
-
-
     # ---- perform top-up via services ----
     try:
         amount_pesos = int(round(amount_php))  
@@ -1379,14 +1247,12 @@ def pao_cash_topup():
     except Exception:
         current_app.logger.exception("[PAO:topup][%s] push notify failed", rid)
 
-
     return jsonify(
         topup_id=int(topup_id),
         user_id=int(user_id),
         new_balance_php=float(round(new_balance_php, 2)),
         request_id=rid,
     ), 201
-
 
 def _fare_for(o, d, passenger_type: str) -> int:
     hops = abs(o.seq - d.seq)
@@ -1586,6 +1452,7 @@ def _primary_type_from_items(items: List[Dict[str, Any]], fallback: str = "regul
         return fallback
     return "regular" if reg >= dis else "discount"
 
+
 @pao_bp.route("/tickets", methods=["POST"])
 @require_role("pao")
 def pao_create_ticket():
@@ -1599,11 +1466,7 @@ def pao_create_ticket():
       commuter_id: int (optional; required for wallet, optional for gcash)
       primary_type: 'regular'|'discount' (optional; used for solo label)
       gcash_paid: bool (optional; defaults true if payment_method='gcash')
-      gcash_ref: str (recommended for gcash)
-    Returns:
-      • Solo:  { id, referenceNo, origin, destination, passengerType, fare, paid, commuter? }
-      • Group: { count, total_fare, items: [ { id, referenceNo, passengerType, fare, origin, destination } ] }
-      • 402 with { required_php } if wallet funds insufficient
+      gcash_ref | external_ref: str (required for gcash)
     """
     data = request.get_json(silent=True) or {}
 
@@ -1648,9 +1511,8 @@ def pao_create_ticket():
         if not (commuter_id and commuter_id > 0):
             return jsonify(error="commuter_id required for wallet payment"), 400
     if payment_method == "gcash":
-        # If you require a PSP reference for gcash tickets, keep this guard:
         if not gcash_ref:
-            return jsonify(error="gcash_ref required for GCash tickets"), 400
+            return jsonify(error="gcash_ref (or external_ref) required for GCash tickets"), 400
         if "gcash_paid" in data and not bool(gcash_paid):
             return jsonify(error="gcash tickets must be created as paid once PSP ref is present"), 400
 
@@ -1674,10 +1536,9 @@ def pao_create_ticket():
         bus_id = None
 
     can_group = _has_column("ticket_sales", "is_group")
-    now = dt.datetime.utcnow()
 
     try:
-        # Create the ticket
+        # Build the ticket row (but DO NOT flush yet)
         t = TicketSale()
         t.user_id = int(commuter_id) if (commuter_id and commuter_id > 0) else None
         t.bus_id  = int(bus_id) if bus_id else None
@@ -1692,6 +1553,9 @@ def pao_create_ticket():
         if _has_column("ticket_sales", "payment_method"):
             t.payment_method = payment_method
 
+        if payment_method == "gcash" and gcash_ref and _has_column("ticket_sales", "external_ref"):
+            setattr(t, "external_ref", gcash_ref)
+
         if _has_column("ticket_sales", "issued_by"):
             t.issued_by = int(pao_id) if pao_id else None
 
@@ -1704,11 +1568,20 @@ def pao_create_ticket():
             setattr(t, "group_regular", None)
             setattr(t, "group_discount", None)
 
-        if _has_column("ticket_sales", "reference_no"):
-            t.reference_no = f"T{int(now.timestamp()*1000)}"
+        # ✅ Seed a NON-NULL placeholder reference BEFORE the first flush
+        if _has_column("ticket_sales", "reference_no") and not getattr(t, "reference_no", None):
+            t.reference_no = _temp_reference(bus_id)  # e.g., BUS1_TMP_a1b2c3d4
 
+        t.issued_by = int(pao_id) if pao_id else None
         db.session.add(t)
         db.session.flush()  # get t.id
+
+        # 🎯 Finalize BUS-style reference using the row id
+        if _has_column("ticket_sales", "reference_no"):
+            try:
+                t.reference_no = _gen_reference(bus_id, t.id)  # e.g., BUS1_0001
+            except Exception:
+                t.reference_no = f"BUS{int(bus_id or 0)}_{int(t.id):04d}"
 
         # Wallet charge (atomic) before commit
         if payment_method == "wallet":
@@ -1720,11 +1593,10 @@ def pao_create_ticket():
 
         db.session.commit()
 
- 
-
         origin_name = totals["origin_name"]
         destination_name = totals["destination_name"]
 
+        # Group response (single head item for now)
         if total_qty > 1:
             head_item = {
                 "id": int(t.id),
@@ -1750,6 +1622,7 @@ def pao_create_ticket():
                 "items": [head_item],
             }), 201
 
+        # Solo ticket response
         commuter_name = None
         if t.user_id:
             try:
@@ -1779,6 +1652,8 @@ def pao_create_ticket():
         current_app.logger.exception("Failed to create ticket: %s", e)
         db.session.rollback()
         return jsonify(error="failed to create ticket"), 500
+
+
 @pao_bp.route("/tickets/<int:ticket_id>/void", methods=["PATCH"])
 @require_role("pao")
 def void_ticket(ticket_id: int):
@@ -2091,8 +1966,8 @@ def list_tickets():
             "id": head.id,                                 # use head-id as the row id
             "referenceNo": head.reference_no,
             "commuter": _commuter_label(head),
-            "date": head.created_at.strftime("%B %d, %Y"),
-            "time": head.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+            "time": _as_mnl(head.created_at).strftime("%I:%M %p").lstrip("0").lower(),
+            "date": _as_mnl(head.created_at).strftime("%B %d, %Y"),
             "origin": origin_name,
             "destination": destination_name,
             "fare": f"{float(r['total_pesos'] or 0):.2f}", # TOTAL for the batch
@@ -2157,8 +2032,8 @@ def get_ticket(ticket_id):
     resp = {
         "id": t.id,
         "referenceNo": t.reference_no,
-        "date": t.created_at.strftime("%B %d, %Y"),
-        "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+        "time": _as_mnl(t.created_at).strftime("%I:%M %p").lstrip("0").lower(),
+        "date": _as_mnl(t.created_at).strftime("%B %d, %Y"),
         "origin": origin_name,
         "destination": destination_name,
         "commuter": ("Guest" if getattr(t, "guest", False)
@@ -2402,18 +2277,25 @@ def list_broadcasts():
     return jsonify(anns), 200
 
 
-@pao_bp.route("/validate-fare", methods=["POST"])
-@require_role("pao")
-def validate_fare():
-    data = request.get_json() or {}
-    user_id = data.get("user_id")
-    fare_amt = data.get("fare_amount")
-    valid = True
-    return jsonify({"user_id": user_id, "fare_amount": fare_amt, "valid": valid}), 200
+def _bus_identifier_str(bus_id: Optional[int]) -> str:
+    if not bus_id:
+        return "BUS"
+    try:
+        bus_row = Bus.query.get(bus_id)
+        ident = (getattr(bus_row, "identifier", None) or "").strip()
+        return ident or f"BUS{int(bus_id)}"
+    except Exception:
+        return f"BUS{int(bus_id)}"
+
+# put near _gen_reference
+from secrets import token_hex as _tokhex
+
+def _temp_reference(bus_id: Optional[int]) -> str:
+    # short, unique, and clearly temporary
+    return f"{_bus_identifier_str(bus_id)}_TMP_{_tokhex(4)}"  # e.g., BUS1_TMP_a1b2c3d4
 
 
-def _gen_reference(bus_id: int, row_id: int) -> str:
-    # Row-safe, no race: use the id we just flushed
-    return f"BUS{bus_id}-{row_id:04d}"
-
+def _gen_reference(bus_id: Optional[int], row_id: int) -> str:
+    prefix = _bus_identifier_str(bus_id)
+    return f"{prefix}_{int(row_id):04d}"
 
