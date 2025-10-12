@@ -48,18 +48,31 @@ except Exception:
 def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
+from datetime import timezone as _tz, timedelta as _td
+_MNL = _tz(_td(hours=8))
+
 def _as_utc(x):
     if x is None:
         return None
-    # If naive → assume it's UTC; else convert to UTC
-    return (x.replace(tzinfo=_tz.utc) if x.tzinfo is None else x.astimezone(_tz.utc))
+    # ❗️Naive timestamps are UTC (not Manila)
+    return x.replace(tzinfo=_tz.utc) if x.tzinfo is None else x.astimezone(_tz.utc)
 
 def _as_mnl(x):
-    return _as_utc(x).astimezone(_MNL)
+    u = _as_utc(x)
+    return u.astimezone(_MNL) if u else None
 
 def _iso_utc(x):
     u = _as_utc(x)
-    return u.strftime('%Y-%m-%dT%H:%M:%SZ')  # explicit 'Z'
+    return u.strftime('%Y-%m-%dT%H:%M:%SZ') if u else None
+
+def _local_day_bounds_utc(day):
+    start_local = dt.datetime.combine(day, dt.time(0, 0, 0), tzinfo=_MNL)
+    end_local   = start_local + dt.timedelta(days=1)
+    # Return naive UTC for DB comparisons
+    return (
+        start_local.astimezone(_tz.utc).replace(tzinfo=None),
+        end_local.astimezone(_tz.utc).replace(tzinfo=None),
+    )
 
 
 from threading import Thread
@@ -159,23 +172,7 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
         current_app.logger.exception("[mqtt] user-wallet publish failed")
 
 
-from datetime import timezone as _tz, timedelta as _td
-_MNL = _tz(_td(hours=8))
 
-def _as_utc(x):
-    if x is None:
-        return None
-    # Naive datetimes from DB are Manila-local; attach MNL first, then convert to UTC
-    if x.tzinfo is None:
-        return x.replace(tzinfo=_MNL).astimezone(_tz.utc)
-    return x.astimezone(_tz.utc)
-
-def _as_mnl(x):
-    return _as_utc(x).astimezone(_MNL)
-
-def _iso_utc(x):
-    u = _as_utc(x)
-    return u.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 pao_bp = Blueprint("pao", __name__, url_prefix="/pao")
@@ -691,31 +688,32 @@ def wallet_overview(user_id: int):
     start_dt = dt.datetime.combine(day, dt.time.min)
     end_dt = dt.datetime.combine(day, dt.time.max)
 
+
+    day_local = dt.datetime.now(_MNL).date()
+    start_dt, end_dt = _local_day_bounds_utc(day_local)
+
     used_sum = db.session.execute(
-        text(
-            """
+        text("""
             SELECT COALESCE(SUM(amount_pesos), 0)
             FROM wallet_topups
             WHERE pao_id = :pid
-              AND status = 'succeeded'
-              AND created_at BETWEEN :s AND :e
-            """
-        ),
+            AND status = 'succeeded'
+            AND created_at >= :s AND created_at < :e
+        """),
         {"pid": g.user.id, "s": start_dt, "e": end_dt},
     ).scalar() or 0
 
     used_count = db.session.execute(
-        text(
-            """
+        text("""
             SELECT COUNT(*)
             FROM wallet_topups
             WHERE pao_id = :pid
-              AND status = 'succeeded'
-              AND created_at BETWEEN :s AND :e
-            """
-        ),
+            AND status = 'succeeded'
+            AND created_at >= :s AND created_at < :e
+        """),
         {"pid": g.user.id, "s": start_dt, "e": end_dt},
     ).scalar() or 0
+
 
     return jsonify(
         user_id=user_id,
@@ -769,29 +767,6 @@ def _commuter_label(ticket: TicketSale) -> str:
         return f"{u.first_name} {u.last_name}"
     return "Guest"
 
-
-@pao_bp.route("/device-token", methods=["POST"])
-@require_role("pao")
-def save_pao_device_token():
-    data = request.get_json(silent=True) or {}
-    token = (data.get("token") or "").strip()
-    platform = (data.get("platform") or "").strip() or None
-    if not token:
-        return jsonify(error="token required"), 400
-
-    created = False
-    row = DeviceToken.query.filter_by(token=token).first()
-    if not row:
-        row = DeviceToken(user_id=g.user.id, token=token, platform=platform)
-        db.session.add(row)
-        created = True
-    else:
-        row.user_id = g.user.id
-        row.platform = platform or row.platform
-
-    db.session.commit()
-    current_app.logger.info(f"[push] saved PAO token token={token[:12]}… uid={g.user.id} created={created} platform={row.platform}")
-    return jsonify(ok=True, created=created), (201 if created else 200)
 
 
 # --- helper (place near other helpers) ---
@@ -895,40 +870,46 @@ def pao_summary():
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
 
+    try:
+        day_local = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else (datetime.now(_MNL).date())
+    except ValueError:
+        return jsonify(error="invalid date"), 400
+
+    start_dt, end_dt = _local_day_bounds_utc(day_local)
+
     total = (
         db.session.query(func.count(TicketSale.id))
         .filter(
             TicketSale.bus_id == bus_id,
-            TicketSale.created_at.between(start_dt, end_dt),
-       
+            TicketSale.created_at >= start_dt,
+            TicketSale.created_at <  end_dt,
         )
-        .scalar()
-        or 0
+        .scalar() or 0
     )
 
     paid_count = (
         db.session.query(func.count(TicketSale.id))
         .filter(
             TicketSale.bus_id == bus_id,
-            TicketSale.created_at.between(start_dt, end_dt),
+            TicketSale.created_at >= start_dt,
+            TicketSale.created_at <  end_dt,
             TicketSale.paid.is_(True),
-      
         )
-        .scalar()
-        or 0
+        .scalar() or 0
     )
 
     revenue_total = (
         db.session.query(func.coalesce(func.sum(TicketSale.price), 0.0))
         .filter(
             TicketSale.bus_id == bus_id,
-            TicketSale.created_at.between(start_dt, end_dt),
+            TicketSale.created_at >= start_dt,
+            TicketSale.created_at <  end_dt,
             TicketSale.paid.is_(True),
-          
         )
-        .scalar()
-        or 0.0
+        .scalar() or 0.0
     )
+
+
 
     last_row = (
         db.session.query(Announcement, User.first_name, User.last_name)

@@ -23,6 +23,15 @@ UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 manager_bp = Blueprint("manager", __name__)
+from datetime import datetime, timedelta, timezone  # ← add timezone
+from utils.push import push_to_user                 # ← push (best-effort)
+from models.wallet import WalletAccount, WalletLedger, TopUp  # ← wallet models
+
+# Optional realtime publish (best-effort / no-op if module missing)
+try:
+    from mqtt_ingest import publish as mqtt_publish
+except Exception:
+    mqtt_publish = None  # type: ignore[assignment]
 
 
 def _active_trip_for(bus_id: int, ts: datetime):
@@ -42,7 +51,149 @@ def _active_trip_for(bus_id: int, ts: datetime):
         if start <= ts < end:
             return t
     return None
+# Manila time & void window
+MNL_TZ = timezone(timedelta(hours=8))
+VOID_WINDOW_HOURS = 24
 
+def _as_php(x) -> int:
+    try:
+        return int(x or 0)
+    except Exception:
+        return 0
+
+def _topup_reason_path(tid: int) -> str:
+    # mirror teller: static/topup_receipts/{id}.reject.txt
+    return os.path.join(current_app.root_path, "static", "topup_receipts", f"{tid}.reject.txt")
+
+def _save_topup_void_reason(tid: int, text: str | None) -> None:
+    if not (text and text.strip()):
+        return
+    try:
+        p = _topup_reason_path(tid)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text.strip())
+    except Exception:
+        current_app.logger.exception("[manager] write topup void reason failed tid=%s", tid)
+
+def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extra) -> bool:
+    """Best-effort realtime wallet update for commuter device(s)."""
+    if not mqtt_publish:
+        current_app.logger.warning("[mqtt] disabled: mqtt_ingest.publish not available (wallet)")
+        return False
+    payload = {
+        "type": "wallet_update",
+        "event": event,
+        "new_balance_php": int(new_balance_pesos),
+        "sentAt": int(datetime.utcnow().timestamp() * 1000),
+        **extra,
+    }
+    ok = True
+    for root in ("user", "users"):
+        topic = f"{root}/{int(uid)}/wallet"
+        ok = mqtt_publish(topic, payload) and ok
+        current_app.logger.info("[mqtt] wallet → %s ok=%s", topic, ok)
+    return ok
+
+@manager_bp.route("/topups/<int:tid>/void", methods=["POST"])
+@require_role("manager")
+def manager_void_topup(tid: int):
+    """
+    Void a cash top-up within 24h (manager action).
+
+    Body: { "reason": "<optional text>" }
+
+    Rules:
+      - only status='succeeded' & method='cash'
+      - created_at <= 24h ago (Manila time)
+      - wallet must still have enough balance to reverse
+    """
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+
+    t = TopUp.query.get(tid)
+    if not t:
+        return jsonify(error="top-up not found"), 404
+
+    if (t.status or "").lower() != "succeeded":
+        return jsonify(error="only succeeded top-ups can be voided"), 400
+
+    if (t.method or "").lower() != "cash":
+        return jsonify(error="unsupported method for void: cash only"), 400
+
+    # 24h window check
+    created = getattr(t, "created_at", None)
+    if created:
+        created_mnl = (created.astimezone(MNL_TZ) if created.tzinfo
+                       else created.replace(tzinfo=timezone.utc).astimezone(MNL_TZ))
+        age_hours = (datetime.now(MNL_TZ) - created_mnl).total_seconds() / 3600.0
+        if age_hours > VOID_WINDOW_HOURS:
+            return jsonify(error="void window elapsed (over 24 hours)"), 400
+
+    # Ensure wallet & balance
+    acct = WalletAccount.query.get(t.account_id)
+    if not acct:
+        acct = WalletAccount(user_id=t.account_id, balance_pesos=0)
+        db.session.add(acct)
+        db.session.flush()
+
+    amt = _as_php(getattr(t, "amount_pesos", 0))
+    cur = _as_php(getattr(acct, "balance_pesos", 0))
+    if cur < amt:
+        return jsonify(error="insufficient wallet balance to reverse (funds already spent)"), 400
+
+    new_bal = cur - amt
+    try:
+        # atomic
+        acct.balance_pesos = int(new_bal)
+
+        led = WalletLedger(
+            account_id=t.account_id,
+            direction="debit",
+            event="topup_void",
+            amount_pesos=int(amt),
+            running_balance_pesos=int(new_bal),
+            ref_table="wallet_topups",
+            ref_id=int(t.id),
+        )
+        db.session.add(led)
+
+        t.status = "cancelled"
+        if reason:
+            _save_topup_void_reason(t.id, reason)
+
+        db.session.commit()
+
+        # Realtime + push (best-effort)
+        _publish_user_wallet(
+            t.account_id,
+            new_balance_pesos=int(new_bal),
+            event="wallet_topup_void",
+            topup_id=int(t.id),
+            method="cash",
+            amount_php=int(amt),
+        )
+        try:
+            push_to_user(
+                t.account_id,
+                title="Top-up Reversed",
+                body=f"₱{amt} was reversed. New balance: ₱{new_bal}",
+                data={"type": "wallet_topup_void", "topup_id": int(t.id)},
+            )
+        except Exception:
+            current_app.logger.info("[push] void notify skipped/failed uid=%s", t.account_id)
+
+        return jsonify(
+            ok=True,
+            topup_id=int(t.id),
+            ledger_id=int(led.id),
+            new_balance_php=int(new_bal),
+        ), 200
+
+    except Exception as e:
+        current_app.logger.exception("[manager] void_topup failed")
+        db.session.rollback()
+        return jsonify(error=str(e)), 500
 
 # --- helper: does a column exist? ---
 def table_has_column(table: str, column: str) -> bool:

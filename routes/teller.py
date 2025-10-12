@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 from flask import Blueprint, request, jsonify, current_app, url_for, g
 from sqlalchemy.orm import aliased
 from sqlalchemy import func
-
+from sqlalchemy.exc import SQLAlchemyError
 from db import db
 from models.user import User
 from models.wallet import WalletAccount, WalletLedger, TopUp
@@ -73,6 +73,29 @@ def _as_php(x: Optional[int]) -> int:
     except Exception:
         return 0
 
+def _save_reject_reason(tid: int, text: str) -> None:
+    try:
+        p = _reject_reason_path(tid)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write((text or "").strip())
+    except Exception:
+        current_app.logger.exception("[teller] write reject/void reason failed tid=%s", tid)
+
+VOID_WINDOW_HOURS = 24
+
+def _save_reason(tid: int, text: Optional[str]) -> None:
+    if not text:
+        return
+    try:
+        p = _reject_reason_path(tid)  # reuse same file path
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write((text or "").strip() + "\n")
+    except Exception:
+        current_app.logger.exception("[teller] save reason failed tid=%s", tid)
+
+
 def _user_name(u: Optional[User]) -> str:
     if not u:
         return ""
@@ -95,7 +118,117 @@ def _unsign_user_qr(token: str, *, max_age_sec: int = 7 * 24 * 3600) -> Optional
     except Exception:
         return None
 
-# Rotating wallet QR (minute bucket)
+@teller_bp.route("/wallet/topups/<int:tid>/void", methods=["POST"])
+@require_role("teller")
+def void_topup(tid: int):
+    """
+    Reverse a succeeded cash top-up:
+      - guard: succeeded status, method=cash, <=24h old
+      - guard: wallet has sufficient balance (no overdraft)
+      - effect: debit wallet, add ledger row, mark TopUp as 'cancelled'
+    """
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+
+    # Fetch the top-up
+    t = TopUp.query.get(tid)
+    if not t:
+        return jsonify(error="top-up not found"), 404
+
+    if (t.status or "").lower() != "succeeded":
+        return jsonify(error="only succeeded top-ups can be voided"), 400
+
+    if (t.method or "").lower() != "cash":
+        # Your UI is cash-only; keep the guard here for legacy records
+        return jsonify(error="unsupported method for void: cash only"), 400
+
+    # 24h reversal window
+    created = getattr(t, "created_at", None)
+    if created:
+        # normalize to aware datetime in Manila tz
+        created_mnl = (created.astimezone(MNL_TZ) if created.tzinfo
+                       else created.replace(tzinfo=timezone.utc).astimezone(MNL_TZ))
+        age_hours = (_now_mnl() - created_mnl).total_seconds() / 3600.0
+        if age_hours > 24.0:
+            return jsonify(error="void window elapsed (over 24 hours)"), 400
+
+    # Ensure wallet exists & check balance
+    acct = WalletAccount.query.get(t.account_id)
+    if not acct:
+        # should not happen if create_topup ensured the row, but be safe
+        acct = WalletAccount(user_id=t.account_id, balance_pesos=0)
+        db.session.add(acct)
+        db.session.flush()
+
+    amt = _as_php(getattr(t, "amount_pesos", 0))
+    cur = _as_php(getattr(acct, "balance_pesos", 0))
+    if cur < amt:
+        return jsonify(error="insufficient wallet balance to reverse (funds already spent)"), 400
+
+    new_bal = cur - amt
+
+    try:
+        # 1) Update wallet balance
+        acct.balance_pesos = int(new_bal)
+
+        # 2) Ledger entry (debit)
+        led = WalletLedger(
+            account_id=t.account_id,
+            direction="debit",
+            event="topup_void",
+            amount_pesos=int(amt),
+            running_balance_pesos=int(new_bal),
+            ref_table="wallet_topups",
+            ref_id=int(t.id),
+        )
+        db.session.add(led)
+
+        # 3) Mark original top-up as cancelled
+        t.status = "cancelled"
+
+        # 4) Optional: save reason text alongside other reasons
+        if reason:
+            _save_reject_reason(t.id, reason)
+
+        db.session.commit()
+
+        # Realtime publish (best-effort)
+        _publish_user_wallet(
+            t.account_id,
+            new_balance_pesos=int(new_bal),
+            event="wallet_topup_void",
+            topup_id=int(t.id),
+            method="cash",
+            amount_php=int(amt),
+        )
+
+        # Optional push (best-effort)
+        try:
+            push_to_user(
+                t.account_id,
+                title="Top-up Reversed",
+                body=f"₱{amt} was reversed. New balance: ₱{new_bal}",
+                data={"type": "wallet_topup_void", "topup_id": int(t.id)},
+            )
+        except Exception:
+            current_app.logger.info("[push] void notify skipped/failed uid=%s", t.account_id)
+
+        return jsonify(
+            ok=True,
+            topup_id=int(t.id),
+            ledger_id=int(led.id),
+            new_balance_php=int(new_bal),
+        ), 200
+
+    except SQLAlchemyError as e:
+        current_app.logger.exception("[teller] void_topup DB error")
+        db.session.rollback()
+        return jsonify(error="database error"), 500
+    except Exception as e:
+        current_app.logger.exception("[teller] void_topup failed")
+        db.session.rollback()
+        return jsonify(error=str(e)), 400
+
 def _unsign_wallet_qr(token: str, *, leeway_buckets: int = 2) -> Optional[int]:
     """
     Accepts rotating wallet QR tokens from /commuter/wallet/qrcode.
@@ -131,7 +264,7 @@ def _reject_reason_if_exists(tid: int) -> Optional[str]:
 def _receipt_url_if_exists(tid: int) -> Optional[str]:
     """
     If a commuter uploaded a receipt, return its public static URL.
-    Tries jpg/png/jpeg under /static/topup_receipts/{tid}.<ext>.
+    Tries jpg/png/jpeg/webp under /static/topup_receipts/{tid}.<ext>.
     """
     static_root = os.path.join(current_app.root_path, "static", RECEIPTS_DIR)
     for ext in ("jpg", "png", "jpeg", "webp"):
@@ -298,9 +431,11 @@ def list_topup_requests():
     U = aliased(User)
     q = (
         db.session.query(TopUp, U)
-        .join(U, U.id == TopUp.account_id)
-        .filter(TopUp.status == status)
+        .outerjoin(U, U.id == TopUp.account_id)  # ← don’t drop rows if user is absent
     )
+    # NEW: status=any → no filter; else filter equality
+    if status != "any":
+        q = q.filter(TopUp.status == status)
 
     if dt_from:
         q = q.filter(TopUp.created_at >= dt_from)
@@ -549,7 +684,7 @@ def create_topup():
             amount_php=int(amount_pesos),
         )
 
-        # Optional: push notification (if you still use FCM in production)
+        # Optional: push notification
         try:
             push_to_user(
                 account_user_id,

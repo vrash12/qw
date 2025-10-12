@@ -9,8 +9,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from models.user          import User
 from models.bus           import Bus
 from models.ticket_sale   import TicketSale
-from models.device_token  import DeviceToken   # keep even if you move to topics
-# import your blueprints
+
 from routes.auth          import auth_bp
 from routes.commuter      import commuter_bp
 from routes.pao           import pao_bp
@@ -45,7 +44,7 @@ def create_app():
             finally:
                 cur.close()
 
-        _ = (User, Bus, TicketSale, DeviceToken)
+        _ = (User, Bus, TicketSale)
 
         # 🚫 Do NOT auto-start MQTT in web workers
         # start_in_background()

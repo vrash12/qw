@@ -432,7 +432,6 @@ def _payment_method_for_ticket(t) -> str:
     return "gcash"
 
 
-
 @commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
 def commuter_ticket_image(ticket_id: int):
     """
@@ -442,7 +441,7 @@ def commuter_ticket_image(ticket_id: int):
       • legacy "batch" (multiple TicketSale rows tied by batch_id), and
       • single-row "group" tickets with is_group/group_* columns.
 
-    Also renders VOIDED tickets (refunded to wallet).
+    Also renders VOIDED tickets (refunded to wallet) and shows payment method (Wallet / GCash).
     """
     t = (
         TicketSale.query.options(
@@ -483,10 +482,12 @@ def commuter_ticket_image(ticket_id: int):
 
     # Who issued (for right-panel info)
     issuer_via_field = getattr(t, "issued_by", None)
-    issuer_via_bus = db.session.query(User.id) \
-        .filter(User.assigned_bus_id == t.bus_id, User.role == "pao") \
-        .order_by(User.id.desc()) \
+    issuer_via_bus = (
+        db.session.query(User.id)
+        .filter(User.assigned_bus_id == t.bus_id, User.role == "pao")
+        .order_by(User.id.desc())
         .scalar()
+    )
     issuer_id = issuer_via_field or issuer_via_bus
 
     # Group-aware details (single-row model)
@@ -521,13 +522,13 @@ def commuter_ticket_image(ticket_id: int):
             breakdown["regular"] = {
                 "qty": g_reg,
                 "total": (g_reg * reg_each) if reg_each is not None else None,
-                "each": reg_each
+                "each": reg_each,
             }
         if g_dis > 0:
             breakdown["discount"] = {
                 "qty": g_dis,
                 "total": (g_dis * dis_each) if dis_each is not None else None,
-                "each": dis_each
+                "each": dis_each,
             }
 
         # Line items text (compact)
@@ -550,10 +551,9 @@ def commuter_ticket_image(ticket_id: int):
                 TicketSale.id,
                 TicketSale.reference_no,
                 TicketSale.passenger_type,
-                TicketSale.price
+                TicketSale.price,
             )
-            .filter(func.coalesce(TicketSale.batch_id, TicketSale.id) == bid,
-                    TicketSale.paid.is_(True))
+            .filter(func.coalesce(TicketSale.batch_id, TicketSale.id) == bid, TicketSale.paid.is_(True))
             .order_by(TicketSale.id.asc())
             .all()
         )
@@ -578,7 +578,8 @@ def commuter_ticket_image(ticket_id: int):
             ("group" if (is_group and group_qty > 1) else "batch/solo"),
             (batch_qty if (is_group and group_qty > 1) else (batch_qty if 'batch_qty' in locals() else 1)),
             (batch_total if 'batch_total' in locals() else total_pesos),
-            g_reg, g_dis
+            g_reg,
+            g_dis,
         )
     except Exception:
         pass
@@ -593,41 +594,32 @@ def commuter_ticket_image(ticket_id: int):
     # ─── Drawing ────────────────────────────────────────────────────────────
     W, H = 1440, 2200
     M = 80
-    DARK_GREEN    = (21, 87, 36)
-    LIGHT_GREEN   = (236, 248, 239)
-    ACCENT_GREEN  = (34, 139, 58)
-    TEXT_DARK     = (33, 37, 41)
-    TEXT_MEDIUM   = (73, 80, 87)
-    TEXT_MUTED    = (108, 117, 125)
-    BORDER_LIGHT  = (222, 226, 230)
-    WHITE         = (255, 255, 255)
-    BG_PAPER      = (250, 251, 252)
-    SUCCESS_BG    = (212, 237, 218)
-    SUCCESS_TEXT  = (21, 87, 36)
-    WARN_BG       = (255, 243, 205)
-    WARN_TEXT     = (133, 100, 4)
-    DANGER_BG     = (248, 215, 218)
-    DANGER_TEXT   = (114, 28, 36)
+    DARK_GREEN = (21, 87, 36)
+    LIGHT_GREEN = (236, 248, 239)
+    ACCENT_GREEN = (34, 139, 58)
+    TEXT_DARK = (33, 37, 41)
+    TEXT_MEDIUM = (73, 80, 87)
+    TEXT_MUTED = (108, 117, 125)
+    BORDER_LIGHT = (222, 226, 230)
+    WHITE = (255, 255, 255)
+    BG_PAPER = (250, 251, 252)
+    SUCCESS_BG = (212, 237, 218)
+    SUCCESS_TEXT = (21, 87, 36)
+    WARN_BG = (255, 243, 205)
+    WARN_TEXT = (133, 100, 4)
+    DANGER_BG = (248, 215, 218)
+    DANGER_TEXT = (114, 28, 36)
 
     bg = Image.new("RGB", (W, H), BG_PAPER)
     draw = ImageDraw.Draw(bg)
 
-    def _safe_font(candidates, size):
-        for candidate in candidates:
-            try:
-                return ImageFont.truetype(candidate, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
-
-    ft_title   = _load_font(80,  "Inter-ExtraBold.ttf", "NotoSans-Bold.ttf")
-    ft_header  = _load_font(60,  "Inter-Bold.ttf",      "NotoSans-Bold.ttf")
-    ft_label   = _load_font(40,  "Inter-Regular.ttf",   "NotoSans.ttf")
-    ft_value   = _load_font(52,  "Inter-SemiBold.ttf",  "NotoSans-Bold.ttf")
-    ft_big     = _load_font(96,  "Inter-Black.ttf",     "NotoSans-Bold.ttf")
-    ft_medium  = _load_font(44,  "Inter-Regular.ttf",   "NotoSans.ttf")
-    ft_small   = _load_font(34,  "Inter-Regular.ttf",   "NotoSans.ttf")
-
+    ft_title = _load_font(80, "Inter-ExtraBold.ttf", "NotoSans-Bold.ttf")
+    ft_header = _load_font(60, "Inter-Bold.ttf", "NotoSans-Bold.ttf")
+    ft_label = _load_font(40, "Inter-Regular.ttf", "NotoSans.ttf")
+    ft_value = _load_font(52, "Inter-SemiBold.ttf", "NotoSans-Bold.ttf")
+    ft_big = _load_font(96, "Inter-Black.ttf", "NotoSans-Bold.ttf")
+    ft_medium = _load_font(44, "Inter-Regular.ttf", "NotoSans.ttf")
+    ft_small = _load_font(34, "Inter-Regular.ttf", "NotoSans.ttf")
 
     def tw(text, font):
         if not font or not text:
@@ -680,15 +672,15 @@ def commuter_ticket_image(ticket_id: int):
     yL = y
     yR = y
     passenger_name = f"{t.user.first_name} {t.user.last_name}" if t.user else "—"
+
     # Left/Right columns
     display_ref = _display_ticket_ref_for(t=t)
     yL = field(L, yL, "Reference No.", display_ref or "—")
-
     yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—")
 
     ldt = _as_local(t.created_at)
-    date_str = ldt.strftime('%B %d, %Y')
-    time_str = ldt.strftime('%I:%M %p').lstrip('0').lower()
+    date_str = ldt.strftime("%B %d, %Y")
+    time_str = ldt.strftime("%I:%M %p").lstrip("0").lower()
 
     if ft_label:
         draw.text((L, yL), "DATE & TIME", fill=TEXT_MUTED, font=ft_label)
@@ -699,7 +691,9 @@ def commuter_ticket_image(ticket_id: int):
     yL = y_value + 52 + 60
 
     # Passenger field: show group hint when applicable
-    right_passenger_value = passenger_name if not (is_group and group_qty > 1) else f"{passenger_name}  (Group of {group_qty})"
+    right_passenger_value = (
+        passenger_name if not (is_group and group_qty > 1) else f"{passenger_name}  (Group of {group_qty})"
+    )
     yR = field(L + COL_W + COL_GAP, yR, "Passenger", right_passenger_value)
     yL = field(L, yL, "Origin", origin_name or "—")
     yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
@@ -747,15 +741,22 @@ def commuter_ticket_image(ticket_id: int):
         text_y = pill_y1 + (pill_h - 60) // 2
         draw.text((text_x, text_y), state_txt, fill=pill_fg, font=ft_header)
 
-    # Add a small hint below amount when voided
+    # Determine payment method (Wallet or GCash)
+    try:
+        method_raw = _payment_method_for_ticket(t)
+    except Exception:
+        method_raw = (
+            (getattr(t, "payment_method", None) or "") or (getattr(t, "method", None) or "")
+        ).strip().lower()
+    method_display = "Wallet" if method_raw == "wallet" else "GCash"
+
+    # Small hint below amount
     if is_void and ft_medium:
         draw.text((L, amount_y + 44 + 96), "Refunded to wallet", fill=TEXT_MEDIUM, font=ft_medium)
+    elif bool(t.paid) and ft_medium:
+        draw.text((L, amount_y + 44 + 96), f"Paid via {method_display}", fill=TEXT_MEDIUM, font=ft_medium)
 
-        # Add a small hint below amount when voided
-    if is_void and ft_medium:
-        draw.text((L, amount_y + 44 + 96), "Refunded to wallet", fill=TEXT_MEDIUM, font=ft_medium)
-
-    # ✅ NEW: print the void reason (multi-line) under the amount/pill
+    # ✅ Print the void reason (multi-line) under the amount/pill
     void_reason_text = (getattr(t, "void_reason", None) or "").strip()
     if is_void and void_reason_text:
         # Title
@@ -765,8 +766,8 @@ def commuter_ticket_image(ticket_id: int):
         # Wrapped lines
         if ft_medium:
             from textwrap import wrap
+
             max_px = R - L
-            # rough chars-per-line estimate for current font size
             chars = max(24, min(80, max_px // 12))
             y_line = amount_y + 44 + 96 + 44 + 44
             for line in wrap(void_reason_text, width=chars):
@@ -775,7 +776,6 @@ def commuter_ticket_image(ticket_id: int):
 
             # Make sure following sections don’t overlap the reason block
             y = max(y, y_line + 12)
-
 
     y += 170
 
@@ -789,7 +789,7 @@ def commuter_ticket_image(ticket_id: int):
     draw.rectangle((L, y, L + panel_w, y + panel_h), fill=qr_section_bg, outline=BORDER_LIGHT, width=2)
     bg.paste(qr_img.resize((qr_size, qr_size)), (L + qr_padding, y + qr_padding))
     if ft_medium:
-        draw.text((L + qr_padding, y + qr_padding + qr_size + 24), "Scan to view/download receipt", fill=TEXT_MEDIUM, font=ft_medium)
+        draw.text((L + qr_padding, y + qr_padding + qr_size + 24), "Scan to view", fill=TEXT_MEDIUM, font=ft_medium)
 
     # Right panel: Payment + Group/Batch Summary
     right_x = L + panel_w + 56
@@ -803,6 +803,7 @@ def commuter_ticket_image(ticket_id: int):
 
     info_y = right_y + 140
     info_items = [
+        ("Payment Method", method_display),
         ("Bus ID", str(getattr(t, "bus_id", "") or "—")),
         ("Issued By (PAO ID)", str(issuer_id or "—")),
     ]
@@ -817,7 +818,12 @@ def commuter_ticket_image(ticket_id: int):
     if (is_group and group_qty > 1) or ("batch_total" in locals() and batch_qty > 1):
         section_y = info_y + 12
         if ft_label:
-            draw.text((right_x, section_y), "GROUP SUMMARY" if (is_group and group_qty > 1) else "BATCH SUMMARY", fill=TEXT_MUTED, font=ft_label)
+            draw.text(
+                (right_x, section_y),
+                "GROUP SUMMARY" if (is_group and group_qty > 1) else "BATCH SUMMARY",
+                fill=TEXT_MUTED,
+                font=ft_label,
+            )
         section_y += 52
         if ft_value:
             draw.text((right_x, section_y), f"Passengers: {batch_qty}", fill=TEXT_DARK, font=ft_value)
@@ -848,16 +854,26 @@ def commuter_ticket_image(ticket_id: int):
     # Ticket line items (for legacy multi-row batches) or synthesized lines for group
     if (is_group and group_qty > 1) or ("line_items" in locals() and len(line_items) > 0):
         if ft_header:
-            draw.text((L, y), "Tickets in this group" if (is_group and group_qty > 1) else "Tickets in this batch", fill=TEXT_DARK, font=ft_header)
+            draw.text(
+                (L, y),
+                "Tickets in this group" if (is_group and group_qty > 1) else "Tickets in this batch",
+                fill=TEXT_DARK,
+                font=ft_header,
+            )
         y += 64
         draw.rectangle((L, y, R, y + 4), fill=BORDER_LIGHT)
         y += 24
 
-        lines = (line_items if (is_group and group_qty > 1) else line_items)
+        lines = line_items
         top_n = 15
         for idx, txt in enumerate(lines[:top_n], start=1):
             if ft_medium:
-                draw.text((L + 12, y), (txt if (is_group and group_qty > 1) else f"{idx:>2}.  {txt}"), fill=TEXT_MEDIUM, font=ft_medium)
+                draw.text(
+                    (L + 12, y),
+                    (txt if (is_group and group_qty > 1) else f"{idx:>2}.  {txt}"),
+                    fill=TEXT_MEDIUM,
+                    font=ft_medium,
+                )
             y += 50
         if len(lines) > top_n:
             if ft_medium:
@@ -874,7 +890,12 @@ def commuter_ticket_image(ticket_id: int):
         now_local = dt.datetime.now(LOCAL_TZ)
         link_display = (img_link[:80] + "…") if len(img_link) > 80 else img_link
         draw.text((L, footer_y), link_display, fill=TEXT_MUTED, font=ft_small)
-        draw.text((L, footer_y + 36), now_local.strftime("Generated on %B %d, %Y at %I:%M %p"), fill=TEXT_MUTED, font=ft_small)
+        draw.text(
+            (L, footer_y + 36),
+            now_local.strftime("Generated on %B %d, %Y at %I:%M %p"),
+            fill=TEXT_MUTED,
+            font=ft_small,
+        )
 
     bio = BytesIO()
     bg.save(bio, format="JPEG", quality=95, optimize=True)
@@ -894,13 +915,14 @@ def commuter_ticket_image(ticket_id: int):
         resp.headers["X-Debug-Group-Regular"] = str(g_reg)
         resp.headers["X-Debug-Group-Discount"] = str(g_dis)
         resp.headers["X-Debug-Group-Qty"] = str(group_qty)
-        # surface state in headers too
         resp.headers["X-Debug-State"] = ("voided" if is_void else ("paid" if bool(t.paid) else "unpaid"))
+        resp.headers["X-Debug-Method"] = method_display
     except Exception:
         pass
-    resp.headers["Cache-Control"] = "public, max-age=86400"
+    resp.headers["Cache-Control"] = "public, max-age=60, must-revalidate"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
+
 
 def _is_unknown_col(err: Exception) -> bool:
     # MySQL error code for "Unknown column": 1054
@@ -1120,48 +1142,6 @@ def _as_time(v: Any) -> Optional[dt.time]:
             except ValueError:
                 pass
     return None
-
-@commuter_bp.route("/device-token", methods=["POST"])
-@require_role("commuter")
-def register_commuter_device_token():
-    data = request.get_json(silent=True) or {}
-    token = (data.get("token") or "").strip()
-    platform = (data.get("platform") or "unknown").strip()
-    if not token:
-        return jsonify(error="token required"), 400
-
-    uid = int(g.user.id)
-
-    # ✅ Atomic upsert keyed by UNIQUE(token)
-    try:
-        db.session.execute(
-            text("""
-                INSERT INTO device_tokens (user_id, token, platform)
-                VALUES (:uid, :tok, :plat)
-                ON DUPLICATE KEY UPDATE
-                  user_id = VALUES(user_id),
-                  platform = VALUES(platform),
-                  updated_at = NOW()
-            """),
-            {"uid": uid, "tok": token, "plat": platform}
-        )
-        db.session.commit()
-        return jsonify(ok=True), 200
-    except Exception:
-        # Portable fallback if not on MySQL or in case of driver quirks
-        db.session.rollback()
-        row = DeviceToken.query.filter_by(token=token).first()
-        if row:
-            row.user_id = uid
-            row.platform = platform
-        else:
-            db.session.add(DeviceToken(user_id=uid, token=token, platform=platform))
-        try:
-            db.session.commit()
-            return jsonify(ok=True), 200
-        except IntegrityError:
-            db.session.rollback()
-            return jsonify(error="could not register token"), 409
 
 @commuter_bp.route("/qr/ticket/<int:ticket_id>.jpg", methods=["GET"])
 def qr_image_for_ticket(ticket_id: int):
@@ -1641,6 +1621,8 @@ def commuter_bus_trips():
         for t in trips
     ]), 200
 
+from sqlalchemy.exc import ProgrammingError, OperationalError
+
 @commuter_bp.route("/stop-times", methods=["GET"])
 @require_role("commuter")
 def commuter_stop_times():
@@ -1648,7 +1630,23 @@ def commuter_stop_times():
     if not trip_id:
         return jsonify(error="trip_id is required"), 400
 
-    sts = StopTime.query.filter_by(trip_id=trip_id).order_by(StopTime.seq.asc()).all()
+    try:
+        sts = (StopTime.query
+               .filter_by(trip_id=trip_id)
+               .order_by(StopTime.seq.asc())
+               .all())
+    except (ProgrammingError, OperationalError) as e:
+        # MySQL error code 1146 = table doesn't exist
+        code = None
+        try:
+            code = getattr(getattr(e, "orig", None), "args", [None])[0]
+        except Exception:
+            pass
+        if code == 1146:
+            current_app.logger.error("stop_times table missing; returning empty list for trip_id=%s", trip_id)
+            return jsonify([]), 200
+        raise  # other DB errors: re-raise
+
     return jsonify([
         {
             "stop_name": st.stop_name,
@@ -1657,6 +1655,7 @@ def commuter_stop_times():
         }
         for st in sts
     ]), 200
+
 
 @commuter_bp.route("/location", methods=["GET"])
 @require_role("commuter")
