@@ -798,14 +798,13 @@ def commuter_topups(user_id: int):
     except Exception:
         current_app.logger.exception("ERROR in commuter_topups")
         return jsonify(error="Failed to load top-ups"), 500
-
-
+    
 @manager_bp.route("/topups", methods=["GET"])
 @require_role("manager")
 def manager_topups():
     from datetime import datetime as _dt
 
-    # window
+    # Window parsing (date or start/end)
     date_str = (request.args.get("date") or "").strip()
     start_str = (request.args.get("start") or "").strip()
     end_str = (request.args.get("end") or "").strip()
@@ -831,10 +830,13 @@ def manager_topups():
     method = (request.args.get("method") or "").strip().lower() or None
     teller_id = request.args.get("teller_id", type=int) or request.args.get("pao_id", type=int)  # legacy
 
+    # NEW: include voided/cancelled rows when requested
+    include_voided = (request.args.get("include_voided", "false").strip().lower() in {"1", "true", "yes"})
+
     has_teller = table_has_column("wallet_topups", "teller_id")
     params = {"s": start_dt, "e": end_dt}
 
-    # two safe variants
+    # Two schema-safe variants (with or without teller_id column)
     if has_teller:
         sql = """
             SELECT
@@ -852,8 +854,7 @@ def manager_topups():
             FROM wallet_topups t
             LEFT JOIN users cu ON cu.id = t.account_id
             LEFT JOIN users au ON au.id = COALESCE(t.teller_id, t.pao_id)
-            WHERE t.status = 'succeeded'
-              AND t.created_at BETWEEN :s AND :e
+            WHERE t.created_at BETWEEN :s AND :e
         """
     else:
         sql = """
@@ -872,10 +873,16 @@ def manager_topups():
             FROM wallet_topups t
             LEFT JOIN users cu ON cu.id = t.account_id
             LEFT JOIN users au ON au.id = t.pao_id
-            WHERE t.status = 'succeeded'
-              AND t.created_at BETWEEN :s AND :e
+            WHERE t.created_at BETWEEN :s AND :e
         """
 
+    # Status filter
+    if include_voided:
+        sql += " AND t.status IN ('succeeded','cancelled')"
+    else:
+        sql += " AND t.status = 'succeeded'"
+
+    # Optional filters
     if method in ("cash", "gcash"):
         sql += " AND t.method = :m"
         params["m"] = method
@@ -888,7 +895,7 @@ def manager_topups():
     rows = db.session.execute(text(sql), params).mappings().all()
 
     items = []
-    total_php = 0.0
+    total_php = 0.0  # total across returned rows (note: frontend will exclude cancelled for its summary)
     for r in rows:
         commuter_name = f"{(r['commuter_first'] or '').strip()} {(r['commuter_last'] or '').strip()}".strip() or None
         teller_name = f"{(r['teller_first'] or '').strip()} {(r['teller_last'] or '').strip()}".strip() or None
@@ -909,6 +916,7 @@ def manager_topups():
         )
 
     return jsonify(items=items, count=len(items), total_php=float(total_php)), 200
+
 
 
 @manager_bp.route("/revenue-breakdown", methods=["GET"])
