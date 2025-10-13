@@ -1856,7 +1856,6 @@ def preview_ticket():
         current_app.logger.exception("preview_ticket failed")
         return jsonify(error=str(e)), 500
 
-
 @pao_bp.route("/tickets", methods=["GET"])
 @require_role("pao")
 def list_tickets():
@@ -1864,46 +1863,50 @@ def list_tickets():
     scope = (request.args.get("scope") or "mine").lower()
     only_mine = scope not in ("bus", "all")
 
+    # Manila-local date parsing
     date_str = request.args.get("date")
     try:
-        day = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else datetime.utcnow().date()
+        day_local = (
+            datetime.strptime(date_str, "%Y-%m-%d").date()
+            if date_str else
+            datetime.now(_MNL).date()
+        )
     except ValueError:
         return jsonify(error="invalid date"), 400
 
-    start_dt = datetime.combine(day, datetime.min.time())
-    end_dt   = datetime.combine(day, datetime.max.time())
+    # Convert Manila-local day bounds to naive UTC for DB comparisons
+    start_dt, end_dt = _local_day_bounds_utc(day_local)
 
     bus_id = _current_bus_id()
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
 
-    # ---- GROUP HEADS ---------------------------------------------------------
-    # We scope by bus AND (optionally) by issued_by = current PAO.
     where_extra = " AND issued_by = :pao " if only_mine else " "
+
     groups = db.session.execute(
         text(f"""
             SELECT
-            MIN(id)  AS head_id,
-            COUNT(*) AS qty,
-            SUM(CAST(price AS SIGNED)) AS total_pesos
+              MIN(id)  AS head_id,
+              COUNT(*) AS qty,
+              SUM(CAST(price AS SIGNED)) AS total_pesos
             FROM ticket_sales
             WHERE bus_id = :bus
-            AND created_at BETWEEN :s AND :e
-            AND (paid = 1 OR COALESCE(voided, 0) = 1)
-            {where_extra}
+              AND created_at >= :s AND created_at < :e
+              AND (paid = 1 OR COALESCE(voided, 0) = 1)
+              {where_extra}
             GROUP BY
-            COALESCE(
+              COALESCE(
                 CAST(batch_id AS CHAR),
                 CONCAT(
-                issued_by,'|',
-                IFNULL(origin_stop_time_id,0),'|',
-                IFNULL(destination_stop_time_id,0),'|',
-                DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')
+                  issued_by,'|',
+                  IFNULL(origin_stop_time_id,0),'|',
+                  IFNULL(destination_stop_time_id,0),'|',
+                  DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')
                 )
-            )
+              )
             ORDER BY head_id DESC
         """),
-        {"bus": bus_id, "s": start_dt, "e": end_dt, "pao": int(g.user.id)},
+        {"bus": bus_id, "s": start_dt, "e": end_dt, "pao": int(g.user.id)}
     ).mappings().all()
 
     if not groups:
@@ -1911,7 +1914,6 @@ def list_tickets():
 
     head_ids = [int(r["head_id"]) for r in groups]
 
-    # ---- LOAD HEAD ROWS ------------------------------------------------------
     heads = (
         TicketSale.query.options(
             joinedload(TicketSale.user),
@@ -1944,14 +1946,14 @@ def list_tickets():
 
         is_void = bool(getattr(head, "voided", False))
         out.append({
-            "id": head.id,                                 # use head-id as the row id
+            "id": head.id,  # use head-id as the row id
             "referenceNo": head.reference_no,
             "commuter": _commuter_label(head),
             "time": _as_mnl(head.created_at).strftime("%I:%M %p").lstrip("0").lower(),
             "date": _as_mnl(head.created_at).strftime("%B %d, %Y"),
             "origin": origin_name,
             "destination": destination_name,
-            "fare": f"{float(r['total_pesos'] or 0):.2f}", # TOTAL for the batch
+            "fare": f"{float(r['total_pesos'] or 0):.2f}",  # TOTAL for the batch
             "paid": (bool(getattr(head, "paid", True)) and not is_void),
             "passengers": int(r["qty"] or 0),
             "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=head.id, _external=True),
