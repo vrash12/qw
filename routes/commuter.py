@@ -431,7 +431,6 @@ def _payment_method_for_ticket(t) -> str:
         pass
     return "gcash"
 
-
 @commuter_bp.route("/tickets/<int:ticket_id>/image.jpg", methods=["GET"])
 def commuter_ticket_image(ticket_id: int):
     """
@@ -442,6 +441,8 @@ def commuter_ticket_image(ticket_id: int):
       • single-row "group" tickets with is_group/group_* columns.
 
     Also renders VOIDED tickets (refunded to wallet) and shows payment method (Wallet / GCash).
+
+    Layout guard: ensures "Refunded to wallet" and/or void reason block never get overlapped by the QR panel.
     """
     t = (
         TicketSale.query.options(
@@ -497,7 +498,7 @@ def commuter_ticket_image(ticket_id: int):
     group_qty = g_reg + g_dis if is_group else 1
     total_pesos = int(round(float(t.price or 0)))
 
-    # Fare math (only if we can infer hops). Same formula used in PAO create flow.
+    # Fare math (only if we can infer hops)
     def _fare_for_each(pt: str) -> Optional[int]:
         if o_seq is None or d_seq is None:
             return None
@@ -544,7 +545,7 @@ def commuter_ticket_image(ticket_id: int):
             else:
                 line_items.append(f"Discount × {g_dis}")
     else:
-        # Legacy batch path (multiple rows tied together) — keep working if present
+        # Legacy batch path (multiple rows tied together)
         bid = getattr(t, "batch_id", None) or t.id
         rows = (
             db.session.query(
@@ -569,20 +570,6 @@ def commuter_ticket_image(ticket_id: int):
             f"{(r.reference_no or str(r.id))}  ·  {(r.passenger_type or 'regular').title()}  ·  ₱{int(round(float(r.price or 0)))}"
             for r in rows
         ]
-
-    # Log for debugging
-    try:
-        current_app.logger.info(
-            "[receipt:image] ticket_id=%s model=%s qty=%s total=%s reg=%s dis=%s",
-            t.id,
-            ("group" if (is_group and group_qty > 1) else "batch/solo"),
-            (batch_qty if (is_group and group_qty > 1) else (batch_qty if 'batch_qty' in locals() else 1)),
-            (batch_total if 'batch_total' in locals() else total_pesos),
-            g_reg,
-            g_dis,
-        )
-    except Exception:
-        pass
 
     # QR that points back to THIS image URL
     img_link = url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True)
@@ -629,6 +616,13 @@ def commuter_ticket_image(ticket_id: int):
         except Exception:
             return len(text) * 10
 
+    def text_bbox_height(x: int, y: int, txt: str, font) -> int:
+        try:
+            l, t, r, b = draw.textbbox((x, y), txt, font=font)
+            return max(0, b - t)
+        except Exception:
+            return int((font.size if hasattr(font, "size") else 40) * 1.2)
+
     def ellipsize(s: str, max_chars: int) -> str:
         if len(s) <= max_chars:
             return s
@@ -667,7 +661,7 @@ def commuter_ticket_image(ticket_id: int):
         display_value = value if tw(value, ft_value) <= COL_W else ellipsize(value, 36)
         if ft_value:
             draw.text((x, y2), display_value, fill=color, font=ft_value)
-        return y2 + 58 + 28
+        return y2 + 58 + 28  # next baseline
 
     yL = y
     yR = y
@@ -690,32 +684,56 @@ def commuter_ticket_image(ticket_id: int):
         draw.text((L, y_value + 52), time_str, fill=TEXT_DARK, font=ft_value)
     yL = y_value + 52 + 60
 
-    # Passenger field: show group hint when applicable
+    # Passenger name (with group hint)
     right_passenger_value = (
         passenger_name if not (is_group and group_qty > 1) else f"{passenger_name}  (Group of {group_qty})"
     )
     yR = field(L + COL_W + COL_GAP, yR, "Passenger", right_passenger_value)
     yL = field(L, yL, "Origin", origin_name or "—")
-    yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", (t.passenger_type or "").title() or "—")
+
+    if not (is_group and group_qty > 1):
+        passenger_type_display = (t.passenger_type or "").strip().title()
+        if not passenger_type_display:
+            try:
+                # Treat missing user or explicit guest role as "Guest"
+                if (t.user is None) or ((getattr(t.user, "role", None) or "").strip().lower() == "guest"):
+                    passenger_type_display = "Guest"
+            except Exception:
+                passenger_type_display = "Guest" if t.user is None else ""
+        yR = field(L + COL_W + COL_GAP, yR, "Passenger Type", passenger_type_display or "—")
 
     y = max(yL, yR) + 20
     draw.rectangle((L, y, R, y + 4), fill=BORDER_LIGHT)
     y += 48
 
-    # Robust "voided" check (use module helper if present)
+    # Robust "voided" check
     try:
-        is_void = _is_ticket_void(t)  # type: ignore[name-defined]
+        is_void = _is_ticket_void(t)
     except NameError:
         st = (getattr(t, "status", None) or "").strip().lower()
         is_void = bool(getattr(t, "voided", False)) or st in {"void", "voided", "refunded", "cancelled"}
 
-    # amount + pill (NO CENTS)
+    # ── Amount & Pill ──────────────────────────────────────────────────────
     amount_y = y
     if ft_label:
         draw.text((L, amount_y), "TOTAL AMOUNT", fill=TEXT_MUTED, font=ft_label)
     if ft_big:
         fare_pesos = total_pesos
         draw.text((L, amount_y + 44), f"₱{fare_pesos}", fill=ACCENT_GREEN, font=ft_big)
+
+    # Initialize the amount block bottom right after the big amount
+    amount_block_bottom = amount_y + 44 + (ft_big.size if hasattr(ft_big, "size") else 96)
+
+    # Determine payment method BEFORE building the pill text
+    try:
+        method_raw = _payment_method_for_ticket(t)
+    except Exception:
+        method_raw = (
+            (getattr(t, "payment_method", None) or "")
+            or (getattr(t, "method", None) or "")
+            or (getattr(t, "pay_method", None) or "")
+        ).strip().lower()
+    method_display = "Wallet" if method_raw == "wallet" else "GCash"
 
     # State pill (PAID / UNPAID / VOIDED)
     state_txt = "PAID"
@@ -729,6 +747,8 @@ def commuter_ticket_image(ticket_id: int):
         state_txt = "VOIDED"
         pill_bg = DANGER_BG
         pill_fg = DANGER_TEXT
+    if state_txt == "PAID":
+        state_txt = f"PAID VIA {method_display.upper()}"
 
     if ft_header:
         pill_w = int(tw(state_txt, ft_header) + 64)
@@ -740,44 +760,34 @@ def commuter_ticket_image(ticket_id: int):
         text_x = pill_x1 + (pill_w - tw(state_txt, ft_header)) // 2
         text_y = pill_y1 + (pill_h - 60) // 2
         draw.text((text_x, text_y), state_txt, fill=pill_fg, font=ft_header)
+        amount_block_bottom = max(amount_block_bottom, pill_y1 + pill_h + 16)
 
-    # Determine payment method (Wallet or GCash)
-    try:
-        method_raw = _payment_method_for_ticket(t)
-    except Exception:
-        method_raw = (
-            (getattr(t, "payment_method", None) or "") or (getattr(t, "method", None) or "")
-        ).strip().lower()
-    method_display = "Wallet" if method_raw == "wallet" else "GCash"
-
-    # Small hint below amount
+    # Voided hint and reason
     if is_void and ft_medium:
-        draw.text((L, amount_y + 44 + 96), "Refunded to wallet", fill=TEXT_MEDIUM, font=ft_medium)
-    elif bool(t.paid) and ft_medium:
-        draw.text((L, amount_y + 44 + 96), f"Paid via {method_display}", fill=TEXT_MEDIUM, font=ft_medium)
+        txt = "Refunded to wallet"
+        hint_y = amount_block_bottom
+        draw.text((L, hint_y), txt, fill=TEXT_MEDIUM, font=ft_medium)
+        amount_block_bottom = hint_y + text_bbox_height(L, hint_y, txt, ft_medium) + 8
 
-    # ✅ Print the void reason (multi-line) under the amount/pill
     void_reason_text = (getattr(t, "void_reason", None) or "").strip()
     if is_void and void_reason_text:
-        # Title
         if ft_label:
-            draw.text((L, amount_y + 44 + 96 + 44), "VOID REASON", fill=DANGER_TEXT, font=ft_label)
+            title_y = amount_block_bottom + 8
+            draw.text((L, title_y), "VOID REASON", fill=DANGER_TEXT, font=ft_label)
+            amount_block_bottom = title_y + text_bbox_height(L, title_y, "VOID REASON", ft_label) + 8
 
-        # Wrapped lines
         if ft_medium:
             from textwrap import wrap
-
             max_px = R - L
             chars = max(24, min(80, max_px // 12))
-            y_line = amount_y + 44 + 96 + 44 + 44
+            y_line = amount_block_bottom
             for line in wrap(void_reason_text, width=chars):
                 draw.text((L, y_line), line, fill=DANGER_TEXT, font=ft_medium)
-                y_line += 46
+                y_line += text_bbox_height(L, y_line, line, ft_medium) + 2
+            amount_block_bottom = y_line + 6
 
-            # Make sure following sections don’t overlap the reason block
-            y = max(y, y_line + 12)
-
-    y += 170
+    # Ensure y moves below everything in the amount block before we place the QR panel
+    y = max(y, amount_block_bottom) + 40
 
     # QR panel (left)
     qr_section_bg = (247, 251, 247)
@@ -791,17 +801,11 @@ def commuter_ticket_image(ticket_id: int):
     if ft_medium:
         draw.text((L + qr_padding, y + qr_padding + qr_size + 24), "Scan to view", fill=TEXT_MEDIUM, font=ft_medium)
 
-    # Right panel: Payment + Group/Batch Summary
+    # Right panel: (Payment Status REMOVED) → start directly with details
     right_x = L + panel_w + 56
     right_y = y + 24
-    if ft_label:
-        draw.text((right_x, right_y), "PAYMENT STATUS", fill=TEXT_MUTED, font=ft_label)
+    info_y = right_y
 
-    right_status_color = pill_fg  # mirror pill color
-    if ft_header:
-        draw.text((right_x, right_y + 44), state_txt, fill=right_status_color, font=ft_header)
-
-    info_y = right_y + 140
     info_items = [
         ("Payment Method", method_display),
         ("Bus ID", str(getattr(t, "bus_id", "") or "—")),
@@ -831,27 +835,9 @@ def commuter_ticket_image(ticket_id: int):
             draw.text((right_x, section_y), f"Total Fare: ₱{batch_total}", fill=ACCENT_GREEN, font=ft_value)
             section_y += 64
 
-        if ft_label:
-            draw.text((right_x, section_y), "Breakdown", fill=TEXT_MUTED, font=ft_label)
-        section_y += 44
-
-        # group-aware breakdown printing
-        for ptype in ("regular", "discount"):
-            if ptype in breakdown:
-                data = breakdown[ptype]
-                if isinstance(data.get("total"), int) and isinstance(data.get("each"), int):
-                    line = f"{ptype.title()}: {data['qty']}  ·  ₱{data['each']} each  ·  ₱{data['total']}"
-                elif isinstance(data.get("total"), int):
-                    line = f"{ptype.title()}: {data['qty']}  ·  ₱{data['total']}"
-                else:
-                    line = f"{ptype.title()}: {data['qty']}"
-                if ft_medium:
-                    draw.text((right_x, section_y), line, fill=TEXT_MEDIUM, font=ft_medium)
-                section_y += 44
-
     y = y + panel_h + 48
 
-    # Ticket line items (for legacy multi-row batches) or synthesized lines for group
+    # Ticket line items
     if (is_group and group_qty > 1) or ("line_items" in locals() and len(line_items) > 0):
         if ft_header:
             draw.text(
@@ -887,9 +873,9 @@ def commuter_ticket_image(ticket_id: int):
     # Footer
     footer_y = max(y + 36, H - M - 72)
     if ft_small:
-        now_local = dt.datetime.now(LOCAL_TZ)
         link_display = (img_link[:80] + "…") if len(img_link) > 80 else img_link
         draw.text((L, footer_y), link_display, fill=TEXT_MUTED, font=ft_small)
+        now_local = dt.datetime.now(LOCAL_TZ)
         draw.text(
             (L, footer_y + 36),
             now_local.strftime("Generated on %B %d, %Y at %I:%M %p"),
@@ -919,7 +905,8 @@ def commuter_ticket_image(ticket_id: int):
         resp.headers["X-Debug-Method"] = method_display
     except Exception:
         pass
-    resp.headers["Cache-Control"] = "public, max-age=60, must-revalidate"
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
@@ -983,7 +970,7 @@ def wallet_me():
     acct = _get_or_create_wallet_account(g.user.id)
     bal = int(getattr(acct, "balance_pesos", 0) or 0)
     return jsonify(balance_pesos=bal, balance_php=bal), 200
-    
+
 @commuter_bp.route("/wallet/ledger", methods=["GET"])
 @require_role("commuter")
 def wallet_ledger():
@@ -1019,31 +1006,59 @@ def wallet_ledger():
         {"aid": aid, "lim": page_size, "off": offset},
     ).mappings().all()
 
+    # ——— Gather TopUp meta for the rows that reference wallet_topups
     topup_ref_ids = [
         int(r["ref_id"]) for r in rows
         if r.get("ref_table") == "wallet_topups" and r.get("ref_id")
            and (r.get("event") or "").startswith("topup")
     ]
-    methods_by_topup_id = {}
+    topup_meta: dict[int, dict] = {}
     if topup_ref_ids:
-        for tid, method in db.session.query(TopUp.id, TopUp.method).filter(TopUp.id.in_(topup_ref_ids)).all():
-            methods_by_topup_id[int(tid)] = (method or "cash")
+        for tup in (
+            db.session.query(TopUp)
+            .filter(TopUp.id.in_(topup_ref_ids))
+            .all()
+        ):
+            topup_meta[int(tup.id)] = {
+                "method": getattr(tup, "method", "cash") or "cash",
+                "status": getattr(tup, "status", "pending"),
+                "reject_reason": getattr(tup, "reject_reason", None),
+                "receipt_url": getattr(tup, "receipt_url", None),
+            }
 
     items = []
     for r in rows:
-        items.append({
+        ref_table = r.get("ref_table")
+        ref_id = int(r["ref_id"]) if r.get("ref_id") is not None else None
+
+        base = {
             "id": int(r["id"]),
             "direction": r["direction"],
             "event": r["event"],
             "amount_pesos": int(r["amount_val"] or 0),
             "running_balance_pesos": int(r["running_val"] or 0),
             "created_at": (r["created_at"].isoformat() if r.get("created_at") else None),
-            "method": (
-                methods_by_topup_id.get(int(r["ref_id"]))
-                if (r.get("ref_table") == "wallet_topups" and r.get("ref_id"))
-                else None
-            ),
-        })
+            # 👇 new, for deep-linking on the client
+            "ref_table": ref_table,
+            "ref_id": ref_id,
+        }
+
+        # Add friendly per-type extras
+        if ref_table == "wallet_topups" and ref_id:
+            m = topup_meta.get(ref_id, {})
+            base.update({
+                "method": m.get("method") or "cash",
+                "topup_status": m.get("status"),
+                "topup_reject_reason": m.get("reject_reason"),
+                "topup_receipt_url": m.get("receipt_url"),
+            })
+        elif ref_table == "ticket_sales" and ref_id:
+            base.update({
+                "ticket_view_url": url_for("commuter.commuter_ticket_view", ticket_id=ref_id, _external=True),
+                "ticket_receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=ref_id, _external=True),
+            })
+
+        items.append(base)
 
     return jsonify(
         items=items,
@@ -1052,6 +1067,7 @@ def wallet_ledger():
         total=total,
         has_more=(page * page_size) < total,
     ), 200
+
 
 @commuter_bp.route("/wallet/qrcode", methods=["GET"])
 @require_role("commuter")
@@ -1188,8 +1204,6 @@ def commuter_ticket_view(ticket_id: int):
         200,
         {"Content-Type": "text/html; charset=utf-8"},
     )
-
-
 @commuter_bp.route("/tickets/<int:ticket_id>", methods=["GET"])
 @require_role("commuter")
 def commuter_get_ticket(ticket_id: int):
@@ -1206,52 +1220,38 @@ def commuter_get_ticket(ticket_id: int):
     if not t:
         return jsonify(error="ticket not found"), 404
 
-    # Resolve stop names + (optional) seq (for per-type fare estimates)
+    # Resolve stop names (with TicketStop fallback)
     if t.origin_stop_time:
         origin_name = t.origin_stop_time.stop_name
-        o_seq = getattr(t.origin_stop_time, "seq", None)
     else:
         ts = TicketStop.query.get(getattr(t, "origin_stop_time_id", None))
         origin_name = ts.stop_name if ts else ""
-        o_seq = getattr(ts, "seq", None)
 
     if t.destination_stop_time:
         destination_name = t.destination_stop_time.stop_name
-        d_seq = getattr(t.destination_stop_time, "seq", None)
     else:
         tsd = TicketStop.query.get(getattr(t, "destination_stop_time_id", None))
         destination_name = tsd.stop_name if tsd else ""
-        d_seq = getattr(tsd, "seq", None)
 
-    # Group meta
+    # Group meta (batch-style tickets use the new group* fields)
     is_group = bool(getattr(t, "is_group", False))
     g_reg = int(getattr(t, "group_regular", 0) or 0)
     g_dis = int(getattr(t, "group_discount", 0) or 0)
     group_qty = g_reg + g_dis if is_group else 1
+
     total_pesos = int(round(float(t.price or 0)))
 
-    # Per-type each (best-effort)
-    def _fare_for_each(pt: str):
-        try:
-            if o_seq is None or d_seq is None:
-                return None
-            hops = abs(int(o_seq) - int(d_seq))
-            base = 10 + max(hops - 1, 0) * 2
-            return int(round(base * 0.8)) if pt == "discount" else int(base)
-        except Exception:
-            return None
+    # Voided?
+    try:
+        is_void = _is_ticket_void(t)  # defined above
+    except NameError:
+        st = (getattr(t, "status", None) or "").strip().lower()
+        is_void = bool(getattr(t, "voided", False)) or st in {"void", "voided", "refunded", "cancelled", "canceled"}
 
-    reg_each = _fare_for_each("regular")
-    dis_each = _fare_for_each("discount")
-
-    breakdown = []
-    if is_group and group_qty > 1:
-        if g_reg:
-            subtotal = (g_reg * reg_each) if reg_each is not None else None
-            breakdown.append({"passenger_type": "regular", "quantity": g_reg, "fare_each": reg_each, "subtotal": subtotal})
-        if g_dis:
-            subtotal = (g_dis * dis_each) if dis_each is not None else None
-            breakdown.append({"passenger_type": "discount", "quantity": g_dis, "fare_each": dis_each, "subtotal": subtotal})
+    # Manila-local date/time (fixes 10:55 PM vs 6:55 PM)
+    ldt = _as_local(t.created_at)
+    date_str = ldt.strftime("%B %d, %Y")
+    time_str = ldt.strftime("%I:%M %p").lstrip("0").lower()
 
     # QR helpers
     amount = total_pesos
@@ -1263,40 +1263,33 @@ def commuter_get_ticket(ticket_id: int):
 
     issuer_id = getattr(t, "issued_by", None) or getattr(g, "user", None).id
 
-    # Robust "voided" check (use module helper if present)
-    try:
-        is_void = _is_ticket_void(t)  # type: ignore[name-defined]
-    except NameError:
-        st = (getattr(t, "status", None) or "").strip().lower()
-        is_void = bool(getattr(t, "voided", False)) or st in {"void", "voided", "refunded", "cancelled"}
-
     out = {
         "id": t.id,
         "referenceNo": _display_ticket_ref_for(t=t),
-        "date": t.created_at.strftime("%B %d, %Y"),
-        "time": t.created_at.strftime("%I:%M %p").lstrip("0").lower(),
+        "date": date_str,
+        "time": time_str,
+        "created_at": ldt.isoformat(),                 # helpful for clients
         "origin": origin_name,
         "destination": destination_name,
-        "passengerType": (t.passenger_type or "").title(),
+        # Only include passengerType for single-ticket purchases
+        **({ "passengerType": (t.passenger_type or "").title() } if group_qty <= 1 else {}),
         "commuter": f"{t.user.first_name} {t.user.last_name}" if t.user else "Guest",
         "fare": total_pesos,
-        "paid": bool(t.paid) and not is_void,           # never show paid=true when voided
+        "paid": bool(t.paid) and not is_void,          # never mark paid when voided
         "voided": bool(is_void),
         "state": ("voided" if is_void else ("paid" if bool(t.paid) else "unpaid")),
-        "void_reason": getattr(t, "void_reason", None),  # 👈 add this line
+        "void_reason": getattr(t, "void_reason", None),
         "qr": payload,
         "qr_link": qr_link,
         "qr_url": qr_url,
         "receipt_image": url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True),
         "paoId": issuer_id,
-        # Group-aware extras:
+        # Group summary for UI (present only when group)
         "is_group": is_group,
         "group": {
             "regular": g_reg,
             "discount": g_dis,
             "total": group_qty,
-            "breakdown": breakdown,
-            "total_fare": total_pesos,
         } if is_group else None,
     }
     return jsonify(out), 200
@@ -1526,7 +1519,6 @@ def dashboard():
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp, 200
-
 @commuter_bp.route("/trips", methods=["GET"])
 def list_all_trips():
     date_str = request.args.get("date")
@@ -1537,6 +1529,33 @@ def list_all_trips():
     except ValueError:
         return jsonify(error="Invalid date format. Use YYYY-MM-DD."), 400
 
+    # 🚧 If stop_times table (or its columns) doesn't exist, fall back gracefully
+    if not _has_column("stop_times", "trip_id"):
+        current_app.logger.error(
+            "stop_times table missing; falling back to trips-only list for %s",
+            svc_date,
+        )
+        trips_only = (
+            db.session.query(Trip, Bus.identifier)
+            .join(Bus, Trip.bus_id == Bus.id)
+            .filter(Trip.service_date == svc_date)
+            .order_by(Trip.start_time.asc())
+            .all()
+        )
+        result = [
+            {
+                "id": trip.id,
+                "bus_identifier": identifier,
+                "start_time": _as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
+                "end_time": _as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
+                "origin": "N/A",
+                "destination": "N/A",
+            }
+            for trip, identifier in trips_only
+        ]
+        return jsonify(result), 200
+
+    # ✅ Normal path (when stop_times exists): derive origin/destination via subqueries
     first_stop_sq = (
         db.session.query(StopTime.trip_id, func.min(StopTime.seq).label("min_seq"))
         .group_by(StopTime.trip_id)
@@ -1544,7 +1563,11 @@ def list_all_trips():
     )
     first_stop_name_sq = (
         db.session.query(StopTime.trip_id, StopTime.stop_name.label("origin"))
-        .join(first_stop_sq, (StopTime.trip_id == first_stop_sq.c.trip_id) & (StopTime.seq == first_stop_sq.c.min_seq))
+        .join(
+            first_stop_sq,
+            (StopTime.trip_id == first_stop_sq.c.trip_id)
+            & (StopTime.seq == first_stop_sq.c.min_seq),
+        )
         .subquery()
     )
     last_stop_sq = (
@@ -1554,7 +1577,11 @@ def list_all_trips():
     )
     last_stop_name_sq = (
         db.session.query(StopTime.trip_id, StopTime.stop_name.label("destination"))
-        .join(last_stop_sq, (StopTime.trip_id == last_stop_sq.c.trip_id) & (StopTime.seq == last_stop_sq.c.max_seq))
+        .join(
+            last_stop_sq,
+            (StopTime.trip_id == last_stop_sq.c.trip_id)
+            & (StopTime.seq == last_stop_sq.c.max_seq),
+        )
         .subquery()
     )
 
