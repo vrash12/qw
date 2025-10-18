@@ -615,6 +615,39 @@ def commuter_ticket_image(ticket_id: int):
             return draw.textlength(text, font=font)
         except Exception:
             return len(text) * 10
+    
+    def wrap_text(text: str, font, max_width: int, max_lines: int = 2) -> list[str]:
+        """Word-wrap to max_width using draw.textlength; clamp to max_lines with ellipsis."""
+        s = (text or "").strip()
+        if not s:
+            return ["—"]
+        words = s.split()
+        lines, cur = [], ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            if tw(test, font) <= max_width:
+                cur = test
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+                if len(lines) == max_lines - 1 and tw(cur, font) > max_width:
+                    while cur and tw(cur + "…", font) > max_width:
+                        cur = cur[:-1]
+                    lines.append((cur + "…") if cur else "…")
+                    return lines
+        if cur:
+            lines.append(cur)
+        if len(lines) > max_lines:
+            keep = lines[: max_lines - 1]
+            last = " ".join(lines[max_lines - 1 :])
+            while last and tw(last + "…", font) > max_width:
+                last = last[:-1]
+            keep.append((last + "…") if last else "…")
+            return keep
+        return lines
+
+
 
     def text_bbox_height(x: int, y: int, txt: str, font) -> int:
         try:
@@ -654,23 +687,38 @@ def commuter_ticket_image(ticket_id: int):
     COL_GAP = 60
     COL_W = (R - L - COL_GAP) // 2
 
-    def field(x, y, label, value, color=TEXT_DARK):
+    def field(x, y, label, value, color=TEXT_DARK, wrap_max_lines: int = 1):
         if ft_label:
             draw.text((x, y), label.upper(), fill=TEXT_MUTED, font=ft_label)
         y2 = y + 54
-        display_value = value if tw(value, ft_value) <= COL_W else ellipsize(value, 36)
         if ft_value:
-            draw.text((x, y2), display_value, fill=color, font=ft_value)
-        return y2 + 58 + 28  # next baseline
+            if wrap_max_lines > 1:
+                lines = wrap_text(value, ft_value, COL_W, wrap_max_lines)
+                lh = text_bbox_height(x, y2, "Ag", ft_value) or 52
+                for i, ln in enumerate(lines):
+                    draw.text((x, y2 + i * lh), ln, fill=color, font=ft_value)
+                return y2 + len(lines) * lh + 28
+            else:
+                display_value = value if tw(value, ft_value) <= COL_W else ellipsize(value, 36)
+                draw.text((x, y2), display_value, fill=color, font=ft_value)
+                return y2 + 58 + 28
+        return y2 + 58 + 28
+
 
     yL = y
     yR = y
-    passenger_name = f"{t.user.first_name} {t.user.last_name}" if t.user else "—"
+
+    if t.user:
+        fn = (getattr(t.user, "first_name", "") or "").strip()
+        ln = (getattr(t.user, "last_name", "") or "").strip()
+        passenger_name = (f"{fn} {ln}").strip() or "Guest"
+    else:
+        passenger_name = "Guest"
 
     # Left/Right columns
     display_ref = _display_ticket_ref_for(t=t)
     yL = field(L, yL, "Reference No.", display_ref or "—")
-    yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—")
+    yR = field(L + COL_W + COL_GAP, yR, "Destination", destination_name or "—", wrap_max_lines=2)
 
     ldt = _as_local(t.created_at)
     date_str = ldt.strftime("%B %d, %Y")
@@ -688,8 +736,8 @@ def commuter_ticket_image(ticket_id: int):
     right_passenger_value = (
         passenger_name if not (is_group and group_qty > 1) else f"{passenger_name}  (Group of {group_qty})"
     )
-    yR = field(L + COL_W + COL_GAP, yR, "Passenger", right_passenger_value)
-    yL = field(L, yL, "Origin", origin_name or "—")
+    yR = field(L + COL_W + COL_GAP, yR, "Passenger", right_passenger_value, wrap_max_lines=2)
+    yL = field(L, yL, "Origin", origin_name or "—", wrap_max_lines=2)
 
     if not (is_group and group_qty > 1):
         passenger_type_display = (t.passenger_type or "").strip().title()

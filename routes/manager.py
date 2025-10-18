@@ -1191,6 +1191,8 @@ def tickets_for_day():
 
     for r in rows:
         full_name = ("{} {}".format((r.first_name or "").strip(), (r.last_name or "").strip()).strip() or None)
+        is_guest = not bool(full_name)
+        commuter_display = full_name or "Guest"
         is_void = _is_voided(r)
         fare_str = _fmt_price(r.price)
 
@@ -1212,7 +1214,8 @@ def tickets_for_day():
                 "status": getattr(r, "status", None) or ("voided" if is_void else ("paid" if getattr(r, "paid", False) else "unpaid")),
                 "voided": is_void,
                 "passenger_type": (r.passenger_type or "regular"),
-                "commuter": full_name,
+                "commuter": commuter_display,
+                "is_guest": bool(is_guest),
                 "bus_id": r.bus_id,
                 "bus": r.bus,
                 "origin": r.origin or "",
