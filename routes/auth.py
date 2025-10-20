@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import load_only
 import jwt, os, time
+import re 
+
 
 auth_bp = Blueprint('auth', __name__, url_prefix='/auth')
 
@@ -64,8 +66,15 @@ def signup():
     if not all(k in data and str(data[k]).strip() for k in required):
         return jsonify(error='Missing fields'), 400
 
+    # Normalize & validate phone number: must be 11 digits, start with 09 (e.g., 09123456789)
+    raw_phone = str(data.get('phoneNumber', ''))
+    digits = re.sub(r'\D', '', raw_phone)
+    if not re.fullmatch(r'09\d{9}', digits):
+        return jsonify(error='phoneNumber must start with 09 and be 11 digits (e.g., 09123456789)'), 400
+
+    # Uniqueness checks use the normalized digits
     existing = User.query.filter(
-        (User.username == data['username']) | (User.phone_number == data['phoneNumber'])
+        (User.username == data['username'].strip()) | (User.phone_number == digits)
     ).first()
     if existing:
         return jsonify(error='Username or phone number already exists'), 409
@@ -74,7 +83,7 @@ def signup():
         first_name=data['firstName'].strip(),
         last_name=data['lastName'].strip(),
         username=data['username'].strip(),
-        phone_number=data['phoneNumber'].strip(),
+        phone_number=digits,
         role='commuter',
     )
     user.set_password(data['password'])
