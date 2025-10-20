@@ -401,6 +401,20 @@ def pao_wallet_charge():
         db.session.rollback()
         return jsonify(error="internal error"), 500
 
+# NEW
+def _socketio():
+    # flask-socketio registered as an extension
+    return current_app.extensions.get("socketio")
+
+def _emit_announcement(evt: str, payload: dict):
+    sio = _socketio()
+    if not sio:
+        return
+    try:
+        # namespace must match the client ("/rt")
+        sio.emit(evt, payload, namespace="/rt", broadcast=True)
+    except Exception:
+        current_app.logger.exception("[socketio] emit failed: %s", evt)
 
 @pao_bp.route("/wallet/resolve", methods=["POST", "GET"])
 @require_role("pao")
@@ -808,10 +822,14 @@ def update_broadcast(ann_id: int):
         return jsonify(error=str(e)), 500
 
 
-# --- DELETE an announcement (author-only) ---
 @pao_bp.route("/broadcast/<int:ann_id>", methods=["DELETE"])
 @require_role("pao")
 def delete_broadcast(ann_id: int):
+    """
+    Delete an announcement (author-only).
+    Emits a realtime event on Socket.IO namespace "/rt":
+      - "announcement:deleted" with payload {"id": <ann_id>}
+    """
     ann = Announcement.query.get(ann_id)
     if not ann:
         return jsonify(error="announcement not found"), 404
@@ -821,11 +839,22 @@ def delete_broadcast(ann_id: int):
     try:
         db.session.delete(ann)
         db.session.commit()
+
+        # Realtime broadcast (best effort)
+        try:
+            _emit_announcement("announcement:deleted", {"id": ann_id})
+        except Exception:
+            current_app.logger.exception("[socketio] failed to emit announcement:deleted")
+
         return jsonify(id=ann_id, deleted=True), 200
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("delete_broadcast failed")
         return jsonify(error=str(e)), 500
+
+
+
+
 
 
 @pao_bp.route("/reset-live-stats", methods=["POST"])
@@ -2176,14 +2205,16 @@ def list_commuters():
 @pao_bp.route("/broadcast", methods=["POST"])
 @require_role("pao")
 def broadcast():
+    """
+    Create a new announcement authored by the current PAO.
+    Emits a realtime event on Socket.IO namespace "/rt":
+      - "announcement:new" (and "announcement:created" for legacy clients)
+    """
     bus_id = _current_bus_id()
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
 
-    bus_row = Bus.query.get(bus_id)
-    bus_identifier = (bus_row.identifier or f"bus-{bus_id:02d}") if bus_row else f"bus-{bus_id:02d}"
-
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     message = (data.get("message") or "").strip()
     if not message:
         return jsonify(error="message is required"), 400
@@ -2193,28 +2224,23 @@ def broadcast():
         db.session.add(ann)
         db.session.commit()
 
-        payload = {
-            "id": ann.id,
-            "message": ann.message,
-            "timestamp": _iso_utc(ann.timestamp),
-            "bus_identifier": bus_identifier,
-        }
-   
+        # Build canonical payload (matches list_broadcasts shape)
+        out = _ann_json(ann)
 
-        return jsonify({
-            "id": ann.id,
-            "message": ann.message,
-            "timestamp": payload["timestamp"],
-            "created_by": ann.created_by,
-            "author_name": f"{g.user.first_name} {g.user.last_name}",
-            "bus": bus_identifier,
-        }), 201
+        # Realtime broadcast (best effort)
+        try:
+            _emit_announcement("announcement:new", out)
+            _emit_announcement("announcement:created", out)  # alias for older clients
+        except Exception:
+            current_app.logger.exception("[socketio] failed to emit announcement:new/created")
+
+        return jsonify(out), 201
 
     except Exception:
         db.session.rollback()
         current_app.logger.exception("broadcast failed")
         return jsonify(error="internal server error"), 500
-
+    
 
 @pao_bp.route("/broadcast", methods=["GET"])
 @require_role("pao")

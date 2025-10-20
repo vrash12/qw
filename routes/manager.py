@@ -19,6 +19,18 @@ from models.user import User
 from models.ticket_stop import TicketStop
 from models.trip_metric import TripMetric
 
+from datetime import timezone, timedelta
+MNL_TZ = timezone(timedelta(hours=8))
+
+def _to_utc_z(dt):
+    if not dt:
+        return None
+    # If DB stores naive Manila time, attach MNL then convert to UTC.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=MNL_TZ)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -704,27 +716,42 @@ def commuter_tickets(user_id: int):
 @manager_bp.route("/commuters/<int:user_id>/topups", methods=["GET"])
 @require_role("manager")
 def commuter_topups(user_id: int):
+    """
+    List a commuter's wallet top-ups (paginated), optionally including voided/cancelled.
+
+    Query params:
+      from: YYYY-MM-DD   (default: 30 days before 'to')
+      to:   YYYY-MM-DD   (default: today)
+      page: number       (default: 1)
+      page_size: number  (default: 25, max 100)
+      include_voided: 1|true|yes to include rows with status != 'succeeded' (e.g., 'cancelled')
+    """
     try:
         to_str = request.args.get("to")
         from_str = request.args.get("from")
-        page = request.args.get("page", type=int, default=1)
+        page = request.args.get("page", type=int, default=1) or 1
         size = min(max(request.args.get("page_size", type=int, default=25), 1), 100)
+
+        include_voided = (request.args.get("include_voided", "false").strip().lower() in {"1", "true", "yes"})
 
         to_dt = datetime.strptime(to_str, "%Y-%m-%d") if to_str else datetime.utcnow()
         fr_dt = datetime.strptime(from_str, "%Y-%m-%d") if from_str else (to_dt - timedelta(days=30))
+
         offset = (page - 1) * size
 
+        # Status condition (schema uses t.status with values like 'succeeded','cancelled')
+        status_cond = "AND t.status IN ('succeeded','cancelled')" if include_voided else "AND t.status = 'succeeded'"
+
+        # COUNT(*) for pagination
         total_row = db.session.execute(
-            text(
-                """
+            text(f"""
                 SELECT COUNT(*) AS c
                 FROM wallet_topups t
                 WHERE t.account_id = :uid
-                  AND t.status = 'succeeded'
+                  {status_cond}
                   AND t.created_at >= :fr
                   AND t.created_at <  :to_plus
-            """
-            ),
+            """),
             {"uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1)},
         ).mappings().first() or {}
         total = int(total_row.get("c", 0))
@@ -732,12 +759,13 @@ def commuter_topups(user_id: int):
         has_teller = table_has_column("wallet_topups", "teller_id")
 
         if has_teller:
-            sql = """
+            sql = f"""
                 SELECT 
                     t.id,
                     t.created_at,
                     t.amount_pesos,
                     COALESCE(t.method, 'cash') AS method,
+                    t.status,
                     COALESCE(t.teller_id, t.pao_id) AS teller_id,
                     COALESCE(tu.first_name, pu.first_name) AS teller_first,
                     COALESCE(tu.last_name,  pu.last_name)  AS teller_last
@@ -745,26 +773,27 @@ def commuter_topups(user_id: int):
                 LEFT JOIN users tu ON tu.id = t.teller_id
                 LEFT JOIN users pu ON pu.id = t.pao_id
                 WHERE t.account_id = :uid
-                  AND t.status = 'succeeded'
+                  {status_cond}
                   AND t.created_at >= :fr
                   AND t.created_at <  :to_plus
                 ORDER BY t.created_at DESC
                 LIMIT :lim OFFSET :off
             """
         else:
-            sql = """
+            sql = f"""
                 SELECT 
                     t.id,
                     t.created_at,
                     t.amount_pesos,
                     COALESCE(t.method, 'cash') AS method,
+                    t.status,
                     t.pao_id AS teller_id,
                     pu.first_name AS teller_first,
                     pu.last_name  AS teller_last
                 FROM wallet_topups t
                 LEFT JOIN users pu ON pu.id = t.pao_id
                 WHERE t.account_id = :uid
-                  AND t.status = 'succeeded'
+                  {status_cond}
                   AND t.created_at >= :fr
                   AND t.created_at <  :to_plus
                 ORDER BY t.created_at DESC
@@ -773,7 +802,13 @@ def commuter_topups(user_id: int):
 
         rows = db.session.execute(
             text(sql),
-            {"uid": user_id, "fr": fr_dt, "to_plus": to_dt + timedelta(days=1), "lim": size, "off": offset},
+            {
+                "uid": user_id,
+                "fr": fr_dt,
+                "to_plus": to_dt + timedelta(days=1),
+                "lim": size,
+                "off": offset,
+            },
         ).mappings().all()
 
         items = [
@@ -782,6 +817,7 @@ def commuter_topups(user_id: int):
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                 "amount_php": float(r["amount_pesos"] or 0.0),
                 "method": r["method"],
+                "status": r["status"],  # expose status so client can show VOIDED vs SUCCEEDED
                 "teller_id": r["teller_id"],
                 "teller_name": ("{} {}".format(r.get("teller_first") or "", r.get("teller_last") or "").strip() or None),
             }
@@ -798,114 +834,135 @@ def commuter_topups(user_id: int):
     except Exception:
         current_app.logger.exception("ERROR in commuter_topups")
         return jsonify(error="Failed to load top-ups"), 500
-    
+
 @manager_bp.route("/topups", methods=["GET"])
 @require_role("manager")
 def manager_topups():
     from datetime import datetime as _dt
 
-    # Window parsing (date or start/end)
-    date_str = (request.args.get("date") or "").strip()
+    # Helper: UTC ISO with Z
+    def _to_utc_z(dt):
+        if not dt:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MNL_TZ)
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # ---- window parsing (date or start/end) ---------------------------------
+    date_str  = (request.args.get("date")  or "").strip()
     start_str = (request.args.get("start") or "").strip()
-    end_str = (request.args.get("end") or "").strip()
+    end_str   = (request.args.get("end")   or "").strip()
+
     try:
         if date_str:
             day = _dt.strptime(date_str, "%Y-%m-%d").date()
             start_dt = _dt.combine(day, _dt.min.time())
-            end_dt = _dt.combine(day, _dt.max.time())
+            end_dt   = _dt.combine(day, _dt.max.time())
         elif start_str and end_str:
             sd = _dt.strptime(start_str, "%Y-%m-%d").date()
-            ed = _dt.strptime(end_str, "%Y-%m-%d").date()
+            ed = _dt.strptime(end_str,   "%Y-%m-%d").date()
             if ed < sd:
                 return jsonify(error="end must be >= start"), 400
             start_dt = _dt.combine(sd, _dt.min.time())
-            end_dt = _dt.combine(ed, _dt.max.time())
+            end_dt   = _dt.combine(ed, _dt.max.time())
         else:
             day = _dt.utcnow().date()
             start_dt = _dt.combine(day, _dt.min.time())
-            end_dt = _dt.combine(day, _dt.max.time())
+            end_dt   = _dt.combine(day, _dt.max.time())
     except ValueError:
         return jsonify(error="invalid date format (use YYYY-MM-DD)"), 400
 
-    method = (request.args.get("method") or "").strip().lower() or None
-    teller_id = request.args.get("teller_id", type=int) or request.args.get("pao_id", type=int)  # legacy
-
-    # NEW: include voided/cancelled rows when requested
-    include_voided = (request.args.get("include_voided", "false").strip().lower() in {"1", "true", "yes"})
+    method    = (request.args.get("method") or "").strip().lower() or None
+    teller_id = request.args.get("teller_id", type=int) or request.args.get("pao_id", type=int)
+    include_voided = (request.args.get("include_voided", "false").strip().lower() in {"1","true","yes"})
+    limit     = request.args.get("limit", type=int)
+    if limit is not None:
+        limit = max(1, min(limit, 100))  # keep it reasonable
 
     has_teller = table_has_column("wallet_topups", "teller_id")
+
+    # ---- shared filters ------------------------------------------------------
+    status_cond = "t.status IN ('succeeded','cancelled')" if include_voided else "t.status = 'succeeded'"
     params = {"s": start_dt, "e": end_dt}
 
-    # Two schema-safe variants (with or without teller_id column)
+    # Optional filters added to both queries
+    where_extra = []
+    if method in ("cash", "gcash"):
+        where_extra.append("t.method = :m")
+        params["m"] = method
+    if teller_id:
+        if has_teller:
+            where_extra.append("COALESCE(t.teller_id, t.pao_id) = :tid")
+        else:
+            where_extra.append("t.pao_id = :tid")
+        params["tid"] = teller_id
+
+    extra_sql = (" AND " + " AND ".join(where_extra)) if where_extra else ""
+
+    # ---- aggregate for TRUE totals (unaffected by limit) ---------------------
+    agg_sql = f"""
+        SELECT COUNT(*) AS cnt,
+               COALESCE(SUM(t.amount_pesos), 0) AS sum_php
+        FROM wallet_topups t
+        WHERE t.created_at BETWEEN :s AND :e
+          AND {status_cond}
+          {extra_sql}
+    """
+    agg = db.session.execute(text(agg_sql), params).mappings().first() or {"cnt": 0, "sum_php": 0}
+    count_all = int(agg["cnt"] or 0)
+    total_all = float(agg["sum_php"] or 0.0)
+
+    # ---- rows query (optionally limited) ------------------------------------
     if has_teller:
-        sql = """
+        base_sql = f"""
             SELECT
-                t.id,
-                t.account_id,
+                t.id, t.account_id,
                 COALESCE(t.teller_id, t.pao_id) AS teller_id,
                 COALESCE(t.method, 'cash')      AS method,
-                t.amount_pesos,
-                t.status,
-                t.created_at,
-                cu.first_name  AS commuter_first,
-                cu.last_name   AS commuter_last,
-                au.first_name  AS teller_first,
-                au.last_name   AS teller_last
+                t.amount_pesos, t.status, t.created_at,
+                cu.first_name AS commuter_first, cu.last_name AS commuter_last,
+                au.first_name AS teller_first,   au.last_name AS teller_last
             FROM wallet_topups t
             LEFT JOIN users cu ON cu.id = t.account_id
             LEFT JOIN users au ON au.id = COALESCE(t.teller_id, t.pao_id)
             WHERE t.created_at BETWEEN :s AND :e
+              AND {status_cond}
+              {extra_sql}
+            ORDER BY t.id DESC
         """
     else:
-        sql = """
+        base_sql = f"""
             SELECT
-                t.id,
-                t.account_id,
-                t.pao_id                         AS teller_id,
-                COALESCE(t.method, 'cash')       AS method,
-                t.amount_pesos,
-                t.status,
-                t.created_at,
-                cu.first_name  AS commuter_first,
-                cu.last_name   AS commuter_last,
-                au.first_name  AS teller_first,
-                au.last_name   AS teller_last
+                t.id, t.account_id,
+                t.pao_id AS teller_id,
+                COALESCE(t.method, 'cash') AS method,
+                t.amount_pesos, t.status, t.created_at,
+                cu.first_name AS commuter_first, cu.last_name AS commuter_last,
+                au.first_name AS teller_first,   au.last_name AS teller_last
             FROM wallet_topups t
             LEFT JOIN users cu ON cu.id = t.account_id
             LEFT JOIN users au ON au.id = t.pao_id
             WHERE t.created_at BETWEEN :s AND :e
+              AND {status_cond}
+              {extra_sql}
+            ORDER BY t.id DESC
         """
 
-    # Status filter
-    if include_voided:
-        sql += " AND t.status IN ('succeeded','cancelled')"
-    else:
-        sql += " AND t.status = 'succeeded'"
+    if limit is not None:
+        base_sql += " LIMIT :lim"
+        params["lim"] = int(limit)
 
-    # Optional filters
-    if method in ("cash", "gcash"):
-        sql += " AND t.method = :m"
-        params["m"] = method
-    if teller_id:
-        sql += " AND " + ("COALESCE(t.teller_id, t.pao_id)" if has_teller else "t.pao_id") + " = :tid"
-        params["tid"] = teller_id
-
-    sql += " ORDER BY t.id DESC"
-
-    rows = db.session.execute(text(sql), params).mappings().all()
+    rows = db.session.execute(text(base_sql), params).mappings().all()
 
     items = []
-    total_php = 0.0  # total across returned rows (note: frontend will exclude cancelled for its summary)
     for r in rows:
         commuter_name = f"{(r['commuter_first'] or '').strip()} {(r['commuter_last'] or '').strip()}".strip() or None
-        teller_name = f"{(r['teller_first'] or '').strip()} {(r['teller_last'] or '').strip()}".strip() or None
-        amt = float(r["amount_pesos"] or 0.0)
-        total_php += amt
+        teller_name   = f"{(r['teller_first']   or '').strip()} {(r['teller_last']   or '').strip()}".strip() or None
         items.append(
             {
                 "id": int(r["id"]),
-                "created_at": r["created_at"].strftime("%Y-%m-%dT%H:%M:%SZ") if r["created_at"] else None,
-                "amount_php": amt,
+                "created_at": _to_utc_z(r["created_at"]),
+                "amount_php": float(r["amount_pesos"] or 0.0),
                 "method": r["method"] or "cash",
                 "status": r["status"],
                 "commuter_id": int(r["account_id"]) if r["account_id"] is not None else None,
@@ -915,8 +972,8 @@ def manager_topups():
             }
         )
 
-    return jsonify(items=items, count=len(items), total_php=float(total_php)), 200
-
+    # count/total reflect the WHOLE filtered window (not just limited items)
+    return jsonify(items=items, count=count_all, total_php=total_all), 200
 
 
 @manager_bp.route("/revenue-breakdown", methods=["GET"])
