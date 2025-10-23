@@ -67,6 +67,13 @@ def create_app() -> Flask:
     @app.route("/")
     def health_check():
         return jsonify(status="ok"), 200
+    
+    from flask import request, jsonify
+
+    @app.errorhandler(404)
+    def handle_404(e):
+        return jsonify(error="Not Found", path=request.path), 404
+
 
     # Global error handler (keep routes free from giant try/except blocks)
     @app.errorhandler(Exception)
@@ -75,12 +82,36 @@ def create_app() -> Flask:
             return jsonify(error=e.description), e.code
         # Don’t leak internals in prod; this mirrors your earlier behavior
         return jsonify(error=str(e)), 500
+    
+    
+    # --- Debug: list routes ---
+    @app.route("/__routes")
+    def __routes():
+        # Import here to avoid circulars in some setups
+        from flask import Response
+        lines = []
+        for rule in app.url_map.iter_rules():
+            methods = ",".join(sorted(m for m in rule.methods if m not in {"HEAD", "OPTIONS"}))
+            lines.append(f"{methods:10s} {rule.rule}")
+        lines.sort()
+        return Response("\n".join(lines), mimetype="text/plain")
+    
+    @app.route("/__whoami")
+    def __whoami():
+        import os, time
+        return jsonify(
+            name="pgt-backup backend",
+            pid=os.getpid(),
+            started_at=int(time.time())
+        )
+
+
 
     # Register blueprints
     app.register_blueprint(auth_bp)
     app.register_blueprint(commuter_bp, url_prefix="/commuter")
     app.register_blueprint(pao_bp,      url_prefix="/pao")
-    app.register_blueprint(manager_bp,  url_prefix="/manager")
+    app.register_blueprint(manager_bp)
     app.register_blueprint(tickets_bp,  url_prefix="/tickets")
     app.register_blueprint(teller_bp,   url_prefix="/teller")
 

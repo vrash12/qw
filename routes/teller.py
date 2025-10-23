@@ -148,9 +148,9 @@ def void_topup(tid: int):
         # normalize to aware datetime in Manila tz
         created_mnl = (created.astimezone(MNL_TZ) if created.tzinfo
                        else created.replace(tzinfo=timezone.utc).astimezone(MNL_TZ))
-        age_hours = (_now_mnl() - created_mnl).total_seconds() / 3600.0
-        if age_hours > 24.0:
-            return jsonify(error="void window elapsed (over 24 hours)"), 400
+        age_seconds = (_now_mnl() - created_mnl).total_seconds()
+        if age_seconds > 5 * 60:
+            return jsonify(error="void window elapsed (over 5 minutes)"), 400
 
     # Ensure wallet exists & check balance
     acct = WalletAccount.query.get(t.account_id)

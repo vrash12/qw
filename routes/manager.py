@@ -1,14 +1,24 @@
 # backend/routes/manager.py
-from flask import Blueprint, request, jsonify, send_from_directory, current_app, g
+from __future__ import annotations
+
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from werkzeug.utils import secure_filename
-from sqlalchemy import func, text, literal
+from flask import Blueprint, request, jsonify, send_from_directory, current_app, g
+
+# ✅ add or_ (and and_ if you ever need it)
+from sqlalchemy import func, text, literal, or_
 from sqlalchemy.orm import aliased
 
 from db import db
-from routes.auth import require_role
+# ❌ remove this if you’re moving the guard into auth_guard
+# from routes.auth import require_role
+# ✅ use the standalone guard (as shown in my last message)
+from auth_guard import require_role
+
+from utils.push import push_to_user
+
 from models.bus import Bus
 from models.schedule import Trip
 from models.qr_template import QRTemplate
@@ -18,33 +28,33 @@ from models.ticket_sale import TicketSale
 from models.user import User
 from models.ticket_stop import TicketStop
 from models.trip_metric import TripMetric
+from models.wallet import WalletAccount, WalletLedger, TopUp
 
-from datetime import timezone, timedelta
+# --- Staff creation (PAO / Driver) ---
+from werkzeug.security import generate_password_hash
+
+
+
 MNL_TZ = timezone(timedelta(hours=8))
+VOID_WINDOW_HOURS = 24
 
 def _to_utc_z(dt):
     if not dt:
         return None
-    # If DB stores naive Manila time, attach MNL then convert to UTC.
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=MNL_TZ)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-manager_bp = Blueprint("manager", __name__)
-from datetime import datetime, timedelta, timezone  # ← add timezone
-from utils.push import push_to_user                 # ← push (best-effort)
-from models.wallet import WalletAccount, WalletLedger, TopUp  # ← wallet models
+manager_bp = Blueprint("manager", __name__, url_prefix="/manager")
 
 # Optional realtime publish (best-effort / no-op if module missing)
 try:
     from mqtt_ingest import publish as mqtt_publish
 except Exception:
     mqtt_publish = None  # type: ignore[assignment]
-
 
 def _active_trip_for(bus_id: int, ts: datetime):
     """Find the trip whose time window contains ts (handles past-midnight windows)."""
@@ -63,9 +73,6 @@ def _active_trip_for(bus_id: int, ts: datetime):
         if start <= ts < end:
             return t
     return None
-# Manila time & void window
-MNL_TZ = timezone(timedelta(hours=8))
-VOID_WINDOW_HOURS = 24
 
 def _as_php(x) -> int:
     try:
@@ -77,14 +84,14 @@ def _topup_reason_path(tid: int) -> str:
     # mirror teller: static/topup_receipts/{id}.reject.txt
     return os.path.join(current_app.root_path, "static", "topup_receipts", f"{tid}.reject.txt")
 
-def _save_topup_void_reason(tid: int, text: str | None) -> None:
-    if not (text and text.strip()):
+def _save_topup_void_reason(tid: int, text_: str | None) -> None:
+    if not (text_ and text_.strip()):
         return
     try:
         p = _topup_reason_path(tid)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
-            f.write(text.strip())
+            f.write(text_.strip())
     except Exception:
         current_app.logger.exception("[manager] write topup void reason failed tid=%s", tid)
 
@@ -107,14 +114,291 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
         current_app.logger.info("[mqtt] wallet → %s ok=%s", topic, ok)
     return ok
 
+@manager_bp.route("/staff", methods=["GET"])
+@require_role("manager")
+def list_staff():
+    """
+    List staff. Optional query:
+      - role=pao|driver
+      - q=<search>
+    Returns: [ { id, name, username, role } ]
+    """
+    role = (request.args.get("role") or "").strip().lower()
+    q = (request.args.get("q") or "").strip()
+    valid = {"pao", "driver"}
+
+    base = User.query
+    if role:
+        if role not in valid:
+            return jsonify(error="invalid role"), 400
+        base = base.filter(User.role == role)
+    else:
+        base = base.filter(User.role.in_(valid))
+
+    if q:
+        like = f"%{q}%"
+        base = base.filter(
+            or_(
+                User.first_name.ilike(like),
+                User.last_name.ilike(like),
+                User.username.ilike(like),
+                User.phone_number.ilike(like),
+            )
+        )
+
+    rows = base.order_by(User.last_name.asc(), User.first_name.asc()).all()
+    out = [
+        {
+            "id": u.id,
+            "name": f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or u.username,
+            "username": u.username,
+            "role": u.role,
+        }
+        for u in rows
+    ]
+    return jsonify(out), 200
+
+
+@manager_bp.route("/staff", methods=["POST"])
+@require_role("manager")
+def create_staff():
+    """
+    Create one or more staff users (roles: 'pao' or 'driver').
+
+    Single:
+      {
+        "role": "pao" | "driver",
+        "first_name": "...", "last_name": "...",
+        "username": "...", "phone_number": "...", "password": "..."
+      }
+
+    Bulk:
+      { "users": [ {..}, {..} ] }
+    """
+    data = request.get_json(silent=True) or {}
+    items = data.get("users") or [data]
+
+    allowed_roles = {"pao", "driver"}
+    created, errors = [], []
+
+    def _set_password(u, raw: str | None):
+        if not raw:
+            return
+        if hasattr(u, "set_password") and callable(getattr(u, "set_password")):
+            u.set_password(raw)  # type: ignore[attr-defined]
+        elif hasattr(u, "password_hash"):
+            setattr(u, "password_hash", generate_password_hash(raw))
+
+    try:
+        with db.session.begin():
+            for i, payload in enumerate(items):
+                role = (payload.get("role") or "").strip().lower()
+                fn   = (payload.get("first_name") or "").strip()
+                ln   = (payload.get("last_name") or "").strip()
+                un   = (payload.get("username") or "").strip()
+                ph   = (payload.get("phone_number") or "").strip()
+                pw   = (payload.get("password") or "").strip()
+
+                if role not in allowed_roles:
+                    errors.append({"index": i, "error": "invalid role"})
+                    continue
+                if not fn or not ln or not un:
+                    errors.append({"index": i, "error": "first_name, last_name, username are required"})
+                    continue
+
+                # basic uniqueness guard
+                q = User.query.filter(User.username == un)
+                if ph:
+                    q = q.union(User.query.filter(User.phone_number == ph))
+                if q.first():
+                    errors.append({"index": i, "error": "username/phone already in use"})
+                    continue
+
+                u = User(
+                    first_name=fn,
+                    last_name=ln,
+                    username=un,
+                    phone_number=ph or None,
+                    role=role,
+                )
+                _set_password(u, pw or None)
+
+                db.session.add(u)
+                db.session.flush()
+
+                created.append({
+                    "id": int(u.id),
+                    "role": role,
+                    "name": f"{u.first_name} {u.last_name}".strip(),
+                    "username": u.username,
+                })
+
+        status = 201 if created and not errors else (207 if created and errors else 400)
+        return jsonify(created=created, errors=errors, count=len(created)), status
+    except Exception as e:
+        current_app.logger.exception("[manager] create_staff failed")
+        return jsonify(error=str(e)), 500
+    
+def table_has_column(table: str, column: str) -> bool:
+    row = db.session.execute(
+        text(
+            """
+            SELECT COUNT(*) AS c
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name   = :t
+              AND column_name  = :c
+        """
+        ),
+        {"t": table, "c": column},
+    ).mappings().first()
+    return bool(row and int(row["c"]) > 0)
+
+def _is_ticket_void_row(row) -> bool:
+    """Determine if a ticket row is voided, supporting both schemas."""
+    try:
+        if bool(getattr(row, "voided")):
+            return True
+    except Exception:
+        pass
+    try:
+        st = (getattr(row, "status", None) or "").strip().lower()
+        if st in {"void", "voided", "refunded", "cancelled", "canceled"}:
+            return True
+    except Exception:
+        pass
+    return False
+
+def _amount_pesos_from_price(price) -> int:
+    try:
+        return int(round(float(price or 0)))
+    except Exception:
+        return 0
+
+def _ensure_wallet_account(user_id: int):
+    """Create wallet_accounts row if missing (pesos schema)."""
+    db.session.execute(
+        text(
+            """
+            INSERT INTO wallet_accounts (user_id, balance_pesos)
+            VALUES (:uid, 0)
+            ON DUPLICATE KEY UPDATE user_id = user_id
+        """
+        ),
+        {"uid": user_id},
+    )
+
+def _wallet_tables_exist() -> bool:
+    return table_has_column("wallet_accounts", "balance_pesos") and table_has_column(
+        "wallet_ledger", "amount_pesos"
+    )
+
+def _write_void_reason(ticket_table: str, ticket_id: int, reason: str):
+    """
+    Persist void reason if a suitable column exists. Priority:
+    - void_reason
+    - reason
+    - note / remarks
+    No-op if none exist.
+    """
+    candidates = []
+    for col in ("void_reason", "reason", "note", "remarks"):
+        if table_has_column(ticket_table, col):
+            candidates.append(col)
+            break
+    if not candidates:
+        return
+    col = candidates[0]
+    db.session.execute(
+        text(
+            f"UPDATE {ticket_table} SET {col} = :r WHERE id = :tid"
+        ),
+        {"r": reason, "tid": ticket_id},
+    )
+
+def _mark_ticket_void(ticket: TicketSale, reason: str | None):
+    """
+    Mark a TicketSale row voided across schemas:
+      - if column 'voided' exists: set voided=1
+      - else if 'status' exists: set status='voided'
+      - always set paid=0 (if exists) for clarity on state
+      - optionally persist reason into void_reason/reason/note/remarks when present
+    """
+    if table_has_column("ticket_sales", "paid"):
+        ticket.paid = False  # type: ignore[attr-defined]
+    if table_has_column("ticket_sales", "voided"):
+        ticket.voided = True  # type: ignore[attr-defined]
+    elif table_has_column("ticket_sales", "status"):
+        setattr(ticket, "status", "voided")
+    if reason:
+        _write_void_reason("ticket_sales", ticket.id, reason)
+
+def _refund_paid_ticket(ticket: TicketSale, actor_id: int | None) -> dict:
+    """
+    Refund a paid ticket into the user's wallet if wallet tables exist.
+    Returns a dict summary {refunded: bool, balance: int|None}.
+    """
+    if not _wallet_tables_exist():
+        return {"refunded": False, "balance": None, "note": "wallet tables missing"}
+    if not ticket.user_id:
+        return {"refunded": False, "balance": None, "note": "no user to refund"}
+
+    amount_pesos = _amount_pesos_from_price(ticket.price)
+    if amount_pesos <= 0:
+        return {"refunded": False, "balance": None, "note": "zero-amount ticket"}
+
+    _ensure_wallet_account(int(ticket.user_id))
+
+    bal_row = db.session.execute(
+        text(
+            """
+            SELECT balance_pesos AS bal
+            FROM wallet_accounts
+            WHERE user_id = :uid
+        """
+        ),
+        {"uid": ticket.user_id},
+    ).mappings().first()
+    cur_bal = int(bal_row["bal"] or 0) if bal_row else 0
+    new_bal = cur_bal + amount_pesos
+
+    db.session.execute(
+        text(
+            """
+            UPDATE wallet_accounts
+            SET balance_pesos = :b
+            WHERE user_id = :uid
+        """
+        ),
+        {"b": new_bal, "uid": ticket.user_id},
+    )
+    db.session.execute(
+        text(
+            """
+            INSERT INTO wallet_ledger
+            (account_id, direction, event, amount_pesos, running_balance_pesos, ref_table, ref_id, created_at)
+            VALUES (:uid, 'in', 'refund_ticket', :amt, :run, 'ticket_sales', :tid, :ts)
+        """
+        ),
+        {
+            "uid": ticket.user_id,
+            "amt": amount_pesos,
+            "run": new_bal,
+            "tid": ticket.id,
+            "ts": datetime.utcnow(),
+        },
+    )
+    return {"refunded": True, "balance": new_bal, "note": None}
+
+# ─────────────────────────────────────────────
+# Wallet Top-up: Void (manager)
+# ─────────────────────────────────────────────
 @manager_bp.route("/topups/<int:tid>/void", methods=["POST"])
 @require_role("manager")
 def manager_void_topup(tid: int):
     """
     Void a cash top-up within 24h (manager action).
-
     Body: { "reason": "<optional text>" }
-
     Rules:
       - only status='succeeded' & method='cash'
       - created_at <= 24h ago (Manila time)
@@ -126,14 +410,11 @@ def manager_void_topup(tid: int):
     t = TopUp.query.get(tid)
     if not t:
         return jsonify(error="top-up not found"), 404
-
     if (t.status or "").lower() != "succeeded":
         return jsonify(error="only succeeded top-ups can be voided"), 400
-
     if (t.method or "").lower() != "cash":
         return jsonify(error="unsupported method for void: cash only"), 400
 
-    # 24h window check
     created = getattr(t, "created_at", None)
     if created:
         created_mnl = (created.astimezone(MNL_TZ) if created.tzinfo
@@ -142,7 +423,6 @@ def manager_void_topup(tid: int):
         if age_hours > VOID_WINDOW_HOURS:
             return jsonify(error="void window elapsed (over 24 hours)"), 400
 
-    # Ensure wallet & balance
     acct = WalletAccount.query.get(t.account_id)
     if not acct:
         acct = WalletAccount(user_id=t.account_id, balance_pesos=0)
@@ -156,9 +436,7 @@ def manager_void_topup(tid: int):
 
     new_bal = cur - amt
     try:
-        # atomic
         acct.balance_pesos = int(new_bal)
-
         led = WalletLedger(
             account_id=t.account_id,
             direction="debit",
@@ -169,14 +447,12 @@ def manager_void_topup(tid: int):
             ref_id=int(t.id),
         )
         db.session.add(led)
-
         t.status = "cancelled"
         if reason:
             _save_topup_void_reason(t.id, reason)
 
         db.session.commit()
 
-        # Realtime + push (best-effort)
         _publish_user_wallet(
             t.account_id,
             new_balance_pesos=int(new_bal),
@@ -207,192 +483,15 @@ def manager_void_topup(tid: int):
         db.session.rollback()
         return jsonify(error=str(e)), 500
 
-# --- helper: does a column exist? ---
-def table_has_column(table: str, column: str) -> bool:
-    row = db.session.execute(
-        text(
-            """
-            SELECT COUNT(*) AS c
-            FROM information_schema.columns
-            WHERE table_schema = DATABASE()
-              AND table_name   = :t
-              AND column_name  = :c
-        """
-        ),
-        {"t": table, "c": column},
-    ).mappings().first()
-    return bool(row and int(row["c"]) > 0)
-
-
-def _is_ticket_void_row(row) -> bool:
-    """Determine if a ticket row is voided, supporting both schemas."""
-    try:
-        if bool(getattr(row, "voided")):
-            return True
-    except Exception:
-        pass
-    try:
-        st = (getattr(row, "status", None) or "").strip().lower()
-        if st in {"void", "voided", "refunded", "cancelled", "canceled"}:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _amount_pesos_from_price(price) -> int:
-    try:
-        return int(round(float(price or 0)))
-    except Exception:
-        return 0
-
-
-def _ensure_wallet_account(user_id: int):
-    """Create wallet_accounts row if missing (pesos schema)."""
-    db.session.execute(
-        text(
-            """
-            INSERT INTO wallet_accounts (user_id, balance_pesos)
-            VALUES (:uid, 0)
-            ON DUPLICATE KEY UPDATE user_id = user_id
-        """
-        ),
-        {"uid": user_id},
-    )
-
-
-def _wallet_tables_exist() -> bool:
-    return table_has_column("wallet_accounts", "balance_pesos") and table_has_column(
-        "wallet_ledger", "amount_pesos"
-    )
-
-
-def _write_void_reason(ticket_table: str, ticket_id: int, reason: str):
-    """
-    Persist void reason if a suitable column exists. Priority:
-    - void_reason
-    - reason
-    - note / remarks
-    No-op if none exist.
-    """
-    candidates = []
-    for col in ("void_reason", "reason", "note", "remarks"):
-        if table_has_column(ticket_table, col):
-            candidates.append(col)
-            break
-    if not candidates:
-        return
-    col = candidates[0]
-    db.session.execute(
-        text(
-            f"UPDATE {ticket_table} SET {col} = :r WHERE id = :tid"
-        ),
-        {"r": reason, "tid": ticket_id},
-    )
-
-
-def _mark_ticket_void(ticket: TicketSale, reason: str | None):
-    """
-    Mark a TicketSale row voided across schemas:
-      - if column 'voided' exists: set voided=1
-      - else if 'status' exists: set status='voided'
-      - always set paid=0 (if exists) for clarity on state
-      - optionally persist reason into void_reason/reason/note/remarks when present
-    """
-    # set paid -> false if column exists
-    if table_has_column("ticket_sales", "paid"):
-        ticket.paid = False  # type: ignore[attr-defined]
-
-    # set void marker
-    if table_has_column("ticket_sales", "voided"):
-        ticket.voided = True  # type: ignore[attr-defined]
-    elif table_has_column("ticket_sales", "status"):
-        setattr(ticket, "status", "voided")
-
-    # persist reason via SQL (handles flexible column name)
-    if reason:
-        _write_void_reason("ticket_sales", ticket.id, reason)
-
-
-def _refund_paid_ticket(ticket: TicketSale, actor_id: int | None) -> dict:
-    """
-    Refund a paid ticket into the user's wallet if wallet tables exist.
-    Returns a dict summary {refunded: bool, balance: int|None}.
-    """
-    if not _wallet_tables_exist():
-        return {"refunded": False, "balance": None, "note": "wallet tables missing"}
-
-    if not ticket.user_id:
-        return {"refunded": False, "balance": None, "note": "no user to refund"}
-
-    amount_pesos = _amount_pesos_from_price(ticket.price)
-    if amount_pesos <= 0:
-        return {"refunded": False, "balance": None, "note": "zero-amount ticket"}
-
-    # ensure account
-    _ensure_wallet_account(int(ticket.user_id))
-
-    # fetch current balance
-    bal_row = db.session.execute(
-        text(
-            """
-            SELECT balance_pesos AS bal
-            FROM wallet_accounts
-            WHERE user_id = :uid
-        """
-        ),
-        {"uid": ticket.user_id},
-    ).mappings().first()
-    cur_bal = int(bal_row["bal"] or 0) if bal_row else 0
-    new_bal = cur_bal + amount_pesos
-
-    # update balance
-    db.session.execute(
-        text(
-            """
-            UPDATE wallet_accounts
-            SET balance_pesos = :b
-            WHERE user_id = :uid
-        """
-        ),
-        {"b": new_bal, "uid": ticket.user_id},
-    )
-
-    # write ledger
-    db.session.execute(
-        text(
-            """
-            INSERT INTO wallet_ledger
-            (account_id, direction, event, amount_pesos, running_balance_pesos, ref_table, ref_id, created_at)
-            VALUES (:uid, 'in', 'refund_ticket', :amt, :run, 'ticket_sales', :tid, :ts)
-        """
-        ),
-        {
-            "uid": ticket.user_id,
-            "amt": amount_pesos,
-            "run": new_bal,
-            "tid": ticket.id,
-            "ts": datetime.utcnow(),
-        },
-    )
-
-    return {"refunded": True, "balance": new_bal, "note": None}
-
-
+# ─────────────────────────────────────────────
+# Ticket void / refund
+# ─────────────────────────────────────────────
 @manager_bp.route("/tickets/<int:ticket_id>/void", methods=["PATCH"])
 @require_role("manager")
 def manager_void_ticket(ticket_id: int):
     """
-    Void a ticket (manager action) with a reason and refund wallet if needed.
-
-    Body:
-      { "voided": true|false, "reason": "<required when voided=true>" }
-
-    Notes:
-      - Idempotent for void=true: if already voided, no duplicate refund occurs.
-      - If ticket was paid and becomes voided now, wallet is credited with the full fare.
-      - Works on schemas with either `voided` (bool) or `status` (str).
-      - Persists reason to `void_reason`/`reason`/`note`/`remarks` if available.
+    Body: { "voided": true|false, "reason": "<required when voided=true>" }
+    Idempotent when already voided (no double refund).
     """
     data = request.get_json(silent=True) or {}
     want_void = bool(data.get("voided", True))
@@ -410,7 +509,6 @@ def manager_void_ticket(ticket_id: int):
 
     if want_void:
         if already_void:
-            # idempotent: do NOT refund again
             return jsonify(
                 ok=True,
                 ticket_id=ticket.id,
@@ -423,10 +521,8 @@ def manager_void_ticket(ticket_id: int):
             ), 200
 
         try:
-            # perform state change + optional refund in one transaction
             with db.session.begin():
                 _mark_ticket_void(ticket, reason)
-                # do refund if it had been paid
                 refund_summary = {"refunded": False, "balance": None, "note": None}
                 if was_paid:
                     refund_summary = _refund_paid_ticket(ticket, actor_id=getattr(g, "user", None) and g.user.id)
@@ -446,17 +542,15 @@ def manager_void_ticket(ticket_id: int):
             db.session.rollback()
             return jsonify(error=str(e)), 500
 
-    # Un-void (rare): support only when schema has boolean 'voided'; otherwise set status='paid' if it existed
+    # Un-void (rare)
     try:
         with db.session.begin():
             if table_has_column("ticket_sales", "voided"):
                 setattr(ticket, "voided", False)
             if table_has_column("ticket_sales", "status"):
-                # best-effort: restore to 'paid' if it had been paid; else 'unpaid'
                 setattr(ticket, "status", "paid" if was_paid else "unpaid")
             if table_has_column("ticket_sales", "paid"):
                 setattr(ticket, "paid", was_paid)
-            # clear reason if a reason column exists
             for col in ("void_reason", "reason", "note", "remarks"):
                 if table_has_column("ticket_sales", col):
                     db.session.execute(
@@ -479,17 +573,12 @@ def manager_void_ticket(ticket_id: int):
         db.session.rollback()
         return jsonify(error=str(e)), 500
 
-
+# ─────────────────────────────────────────────
+# Commuters (lists & stats)
+# ─────────────────────────────────────────────
 @manager_bp.route("/commuters", methods=["GET"])
 @require_role("manager")
 def list_commuters():
-    """
-    List commuters with basic profile info, ticket stats, search and pagination.
-    Query params:
-      q: optional search across first_name, last_name, username, phone_number
-      page: 1-based page index (default 1)
-      page_size: items per page (default 25, max 100)
-    """
     from sqlalchemy import or_
 
     q = (request.args.get("q") or "").strip()
@@ -563,7 +652,6 @@ def list_commuters():
         200,
     )
 
-
 @manager_bp.route("/commuters/<int:user_id>", methods=["GET"])
 @require_role("manager")
 def commuter_detail(user_id: int):
@@ -573,7 +661,6 @@ def commuter_detail(user_id: int):
     if not u:
         return jsonify(error="commuter not found"), 404
 
-    # Tickets stats (exclude voided from revenue)
     t_stats = (
         db.session.query(
             F.count(TicketSale.id),
@@ -587,7 +674,6 @@ def commuter_detail(user_id: int):
     last_ticket_at = t_stats[1].isoformat() if t_stats[1] else None
     tickets_revenue = float(t_stats[2] or 0.0)
 
-    # Top-ups stats — pesos only
     topup_stats = db.session.execute(
         text(
             """
@@ -650,7 +736,7 @@ def commuter_tickets(user_id: int):
 
         fields = [
             TicketSale.id,
-            TicketSale.reference_no,  # ← include reference number
+            TicketSale.reference_no,
             TicketSale.created_at,
             TicketSale.price,
             TicketSale.passenger_type,
@@ -712,19 +798,11 @@ def commuter_tickets(user_id: int):
         current_app.logger.exception("ERROR in commuter_tickets")
         return jsonify(error="Failed to load tickets"), 500
 
-
 @manager_bp.route("/commuters/<int:user_id>/topups", methods=["GET"])
 @require_role("manager")
 def commuter_topups(user_id: int):
     """
-    List a commuter's wallet top-ups (paginated), optionally including voided/cancelled.
-
-    Query params:
-      from: YYYY-MM-DD   (default: 30 days before 'to')
-      to:   YYYY-MM-DD   (default: today)
-      page: number       (default: 1)
-      page_size: number  (default: 25, max 100)
-      include_voided: 1|true|yes to include rows with status != 'succeeded' (e.g., 'cancelled')
+    List a commuter's wallet top-ups (paginated), optionally including voided/cancelled).
     """
     try:
         to_str = request.args.get("to")
@@ -739,10 +817,8 @@ def commuter_topups(user_id: int):
 
         offset = (page - 1) * size
 
-        # Status condition (schema uses t.status with values like 'succeeded','cancelled')
         status_cond = "AND t.status IN ('succeeded','cancelled')" if include_voided else "AND t.status = 'succeeded'"
 
-        # COUNT(*) for pagination
         total_row = db.session.execute(
             text(f"""
                 SELECT COUNT(*) AS c
@@ -817,7 +893,7 @@ def commuter_topups(user_id: int):
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                 "amount_php": float(r["amount_pesos"] or 0.0),
                 "method": r["method"],
-                "status": r["status"],  # expose status so client can show VOIDED vs SUCCEEDED
+                "status": r["status"],
                 "teller_id": r["teller_id"],
                 "teller_name": ("{} {}".format(r.get("teller_first") or "", r.get("teller_last") or "").strip() or None),
             }
@@ -835,20 +911,14 @@ def commuter_topups(user_id: int):
         current_app.logger.exception("ERROR in commuter_topups")
         return jsonify(error="Failed to load top-ups"), 500
 
+# ─────────────────────────────────────────────
+# Manager Topups Summary
+# ─────────────────────────────────────────────
 @manager_bp.route("/topups", methods=["GET"])
 @require_role("manager")
 def manager_topups():
     from datetime import datetime as _dt
 
-    # Helper: UTC ISO with Z
-    def _to_utc_z(dt):
-        if not dt:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=MNL_TZ)
-        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-    # ---- window parsing (date or start/end) ---------------------------------
     date_str  = (request.args.get("date")  or "").strip()
     start_str = (request.args.get("start") or "").strip()
     end_str   = (request.args.get("end")   or "").strip()
@@ -877,15 +947,12 @@ def manager_topups():
     include_voided = (request.args.get("include_voided", "false").strip().lower() in {"1","true","yes"})
     limit     = request.args.get("limit", type=int)
     if limit is not None:
-        limit = max(1, min(limit, 100))  # keep it reasonable
+        limit = max(1, min(limit, 100))
 
     has_teller = table_has_column("wallet_topups", "teller_id")
-
-    # ---- shared filters ------------------------------------------------------
     status_cond = "t.status IN ('succeeded','cancelled')" if include_voided else "t.status = 'succeeded'"
     params = {"s": start_dt, "e": end_dt}
 
-    # Optional filters added to both queries
     where_extra = []
     if method in ("cash", "gcash"):
         where_extra.append("t.method = :m")
@@ -899,7 +966,6 @@ def manager_topups():
 
     extra_sql = (" AND " + " AND ".join(where_extra)) if where_extra else ""
 
-    # ---- aggregate for TRUE totals (unaffected by limit) ---------------------
     agg_sql = f"""
         SELECT COUNT(*) AS cnt,
                COALESCE(SUM(t.amount_pesos), 0) AS sum_php
@@ -912,7 +978,6 @@ def manager_topups():
     count_all = int(agg["cnt"] or 0)
     total_all = float(agg["sum_php"] or 0.0)
 
-    # ---- rows query (optionally limited) ------------------------------------
     if has_teller:
         base_sql = f"""
             SELECT
@@ -972,9 +1037,65 @@ def manager_topups():
             }
         )
 
-    # count/total reflect the WHOLE filtered window (not just limited items)
     return jsonify(items=items, count=count_all, total_php=total_all), 200
 
+@manager_bp.route("/paos", methods=["GET"])
+@require_role("manager", "pao")  # allow PAO & Manager to call
+def list_paos():
+    """Basic list of PAO users to populate a dropdown."""
+    rows = (
+        User.query.filter(User.role == "pao")
+        .order_by(User.last_name.asc(), User.first_name.asc())
+        .all()
+    )
+    return jsonify(
+        [
+            {
+                "id": u.id,
+                "name": f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or u.username,
+            }
+            for u in rows
+        ]
+    ), 200
+
+@manager_bp.route("/pao-assignments", methods=["GET"])
+@require_role("manager")
+def roster_for_day():
+    """
+    GET /manager/pao-assignments?date=YYYY-MM-DD
+    Returns the PAO assigned per bus for the given date.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    MNL = _tz(_td(hours=8))
+    date_str = (request.args.get("date") or _dt.now(MNL).date().isoformat()).strip()
+    try:
+        day = _dt.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify(error="invalid date format"), 400
+
+    sql = text("""
+        SELECT a.id, a.user_id, a.bus_id, a.service_date,
+               u.first_name AS uf, u.last_name AS ul,
+               b.identifier AS bus
+        FROM pao_assignments a
+        LEFT JOIN users u ON u.id = a.user_id
+        LEFT JOIN buses b ON b.id = a.bus_id
+        WHERE a.service_date = :d
+        ORDER BY b.identifier
+    """)
+    rows = db.session.execute(sql, {"d": day}).mappings().all()
+    out = []
+    for r in rows:
+        name = f"{(r['uf'] or '').strip()} {(r['ul'] or '').strip()}".strip()
+        out.append({
+            "id": int(r["id"]),
+            "service_date": day.isoformat(),
+            "bus_id": int(r["bus_id"]),
+            "bus": r["bus"],
+            "user_id": int(r["user_id"]),
+            "pao_name": name or None,
+        })
+    return jsonify(out), 200
 
 @manager_bp.route("/revenue-breakdown", methods=["GET"])
 @require_role("manager")
@@ -1070,6 +1191,217 @@ def revenue_breakdown():
         200,
     )
 
+@manager_bp.route("/metrics/tickets", methods=["GET"])
+@require_role("manager")
+def ticket_metrics():
+    today = datetime.utcnow().date()
+    date_to = datetime.strptime(request.args.get("to", today.isoformat()), "%Y-%m-%d").date()
+    date_from = datetime.strptime(
+        request.args.get("from", (date_to - timedelta(days=6)).isoformat()),
+        "%Y-%m-%d",
+    ).date()
+
+    window_start = datetime.combine(date_from, datetime.min.time())
+    window_end = datetime.combine(date_to + timedelta(days=1), datetime.min.time())
+
+    bus_id = request.args.get("bus_id", type=int)
+
+    qs = db.session.query(
+        func.date_format(TicketSale.created_at, "%Y-%m-%d").label("d"),
+        func.count(TicketSale.id).label("tickets"),
+        func.sum(TicketSale.price).label("revenue"),
+    ).filter(TicketSale.created_at.between(window_start, window_end))
+    if bus_id:
+        qs = qs.filter(TicketSale.bus_id == bus_id)
+
+    rows = qs.group_by("d").order_by("d").all()
+
+    daily = []
+    total_tickets = 0
+    total_revenue = 0.0
+    for r in rows:
+        daily.append({"date": r.d, "tickets": int(r.tickets), "revenue": float(r.revenue or 0)})
+        total_tickets += int(r.tickets)
+        total_revenue += float(r.revenue or 0)
+
+    return jsonify(daily=daily, total_tickets=total_tickets, total_revenue=round(total_revenue, 2)), 200
+
+# ─────────────────────────────────────────────
+# Buses (list + patch)
+# ─────────────────────────────────────────────
+@manager_bp.route("/buses", methods=["GET"])
+@require_role("manager", "pao")
+def list_buses():
+    try:
+        out = []
+        buses = Bus.query.order_by(Bus.identifier).all()
+        for b in buses:
+            latest = (
+                SensorReading.query.filter_by(bus_id=b.id)
+                .order_by(SensorReading.timestamp.desc())
+                .first()
+            )
+            out.append(
+                {
+                    "id": b.id,
+                    "identifier": b.identifier,
+                    "capacity": b.capacity,
+                    "description": b.description,
+                    "last_seen": latest.timestamp.isoformat() if latest else None,
+                    "occupancy": latest.total_count if latest else None,
+                }
+            )
+        return jsonify(out), 200
+    except Exception:
+        current_app.logger.exception("ERROR in /manager/buses")
+        return jsonify(error="Could not process the request to list buses."), 500
+
+@manager_bp.route("/buses/<int:bus_id>", methods=["PATCH"])
+@require_role("manager")
+def update_bus(bus_id):
+    bus = Bus.query.get_or_404(bus_id)
+    data = request.get_json() or {}
+
+    if "identifier" in data:
+        bus.identifier = data["identifier"].strip()
+    if "capacity" in data:
+        bus.capacity = data["capacity"]
+    if "description" in data:
+        bus.description = data["description"].strip()
+
+    db.session.commit()
+    return jsonify(success=True), 200
+
+@manager_bp.route("/bus-trips", methods=["GET"])
+@require_role("manager")
+def list_bus_trips():
+    date_str = request.args.get("date")
+    bus_id = request.args.get("bus_id", type=int)
+    include_assignments = (request.args.get("include_assignments", "0").strip().lower() in {"1", "true", "yes"})
+
+    if not (date_str and bus_id):
+        return jsonify(error="date and bus_id are required"), 400
+
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify(error="invalid date format"), 400
+
+    trips = (
+        Trip.query.filter(Trip.bus_id == bus_id, Trip.service_date == day)
+        .order_by(Trip.start_time.asc())
+        .all()
+    )
+
+    trips_payload = [
+        {
+            "id": t.id,
+            "number": t.number,
+            "start_time": t.start_time.strftime("%H:%M"),
+            "end_time": t.end_time.strftime("%H:%M"),
+        }
+        for t in trips
+    ]
+
+    if not include_assignments:
+        # Back-compat: old clients expect a plain array
+        return jsonify(trips_payload), 200
+
+    # Include PAO & Driver assignment for this bus/date
+    # (text() queries keep it portable even if models for assignments aren't defined)
+    pao_row = db.session.execute(
+        text("""
+            SELECT a.user_id, u.first_name AS uf, u.last_name AS ul
+            FROM pao_assignments a
+            LEFT JOIN users u ON u.id = a.user_id
+            WHERE a.service_date = :d AND a.bus_id = :b
+            LIMIT 1
+        """),
+        {"d": day, "b": bus_id},
+    ).mappings().first()
+
+    drv_row = db.session.execute(
+        text("""
+            SELECT a.user_id, u.first_name AS uf, u.last_name AS ul
+            FROM driver_assignments a
+            LEFT JOIN users u ON u.id = a.user_id
+            WHERE a.service_date = :d AND a.bus_id = :b
+            LIMIT 1
+        """),
+        {"d": day, "b": bus_id},
+    ).mappings().first()
+
+    def _name(row):
+        if not row:
+            return None
+        return f"{(row.get('uf') or '').strip()} {(row.get('ul') or '').strip()}".strip() or None
+
+    return jsonify(
+        {
+            "trips": trips_payload,
+            "assignments": {
+                "pao_id": int(pao_row["user_id"]) if pao_row and pao_row.get("user_id") is not None else None,
+                "pao_name": _name(pao_row),
+                "driver_id": int(drv_row["user_id"]) if drv_row and drv_row.get("user_id") is not None else None,
+                "driver_name": _name(drv_row),
+            },
+        }
+    ), 200
+
+
+@manager_bp.route("/trips", methods=["POST"])
+@require_role("manager")
+def create_trip():
+    data = request.get_json() or {}
+    missing = [k for k in ("service_date", "bus_id", "number", "start_time", "end_time") if k not in data]
+    if missing:
+        return jsonify(error=f"Missing field(s): {', '.join(missing)}"), 400
+
+    try:
+        service_date = datetime.strptime(str(data["service_date"]), "%Y-%m-%d").date()
+        start_time = datetime.strptime(str(data["start_time"]), "%H:%M").time()
+        end_time = datetime.strptime(str(data["end_time"]), "%H:%M").time()
+    except ValueError:
+        return jsonify(error="Invalid date/time format"), 400
+
+    number = str(data["number"]).strip()
+    bus_id = int(data["bus_id"])
+
+    bus = Bus.query.get(bus_id)
+    if not bus:
+        return jsonify(error="invalid bus_id"), 400
+
+    if end_time <= start_time:
+        return jsonify(error="end_time must be after start_time"), 400
+
+    existing = Trip.query.filter(Trip.bus_id == bus_id, Trip.service_date == service_date).all()
+
+    ns = datetime.combine(service_date, start_time)
+    ne = datetime.combine(service_date, end_time)
+
+    for t in existing:
+        s = datetime.combine(service_date, t.start_time)
+        e = datetime.combine(service_date, t.end_time)
+        if max(s, ns) < min(e, ne):  # overlap
+            return (
+                jsonify(error=f"Overlaps with {t.number} ({t.start_time.strftime('%H:%M')}–{t.end_time.strftime('%H:%M')})"),
+                409,
+            )
+
+    trip = Trip(bus_id=bus_id, service_date=service_date, number=number, start_time=start_time, end_time=end_time)
+
+    try:
+        db.session.add(trip)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("ERROR creating trip")
+        return jsonify(error="Failed to create trip"), 500
+
+    return (
+        jsonify(id=trip.id, number=trip.number, start_time=trip.start_time.strftime("%H:%M"), end_time=trip.end_time.strftime("%H:%M")),
+        201,
+    )
 
 @manager_bp.route("/trips/<int:trip_id>", methods=["PATCH"])
 @require_role("manager")
@@ -1079,18 +1411,20 @@ def update_trip(trip_id: int):
         number = data.get("number", "").strip()
         start_time = datetime.strptime(data["start_time"], "%H:%M").time()
         end_time = datetime.strptime(data["end_time"], "%H:%M").time()
-
-        trip = Trip.query.get_or_404(trip_id)
-        trip.number = number
-        trip.start_time = start_time
-        trip.end_time = end_time
-
-        db.session.commit()
-
-        return jsonify(id=trip.id, number=trip.number, start_time=trip.start_time.strftime("%H:%M"), end_time=trip.end_time.strftime("%H:%M")), 200
     except (KeyError, ValueError):
         return jsonify(error="Invalid payload or missing required fields"), 400
 
+    if end_time <= start_time:
+        return jsonify(error="end_time must be after start_time"), 400
+
+    trip = Trip.query.get_or_404(trip_id)
+    trip.number = number or trip.number
+    trip.start_time = start_time
+    trip.end_time = end_time
+
+    db.session.commit()
+
+    return jsonify(id=trip.id, number=trip.number, start_time=trip.start_time.strftime("%H:%M"), end_time=trip.end_time.strftime("%H:%M")), 200
 
 @manager_bp.route("/trips/<int:trip_id>", methods=["DELETE"])
 @require_role("manager")
@@ -1107,7 +1441,9 @@ def delete_trip(trip_id: int):
         db.session.rollback()
         return jsonify(error="Error deleting trip: " + str(e)), 500
 
-
+# ─────────────────────────────────────────────
+# Tickets endpoints (day view / composition)
+# ─────────────────────────────────────────────
 @manager_bp.route("/tickets/composition", methods=["GET"])
 @require_role("manager")
 def tickets_composition():
@@ -1141,23 +1477,18 @@ def tickets_composition():
             discount = int(cnt or 0)
 
     return jsonify(regular=regular, discount=discount, total=regular + discount), 200
+
 @manager_bp.route("/tickets", methods=["GET"])
 @require_role("manager")
 def tickets_for_day():
     """
     GET /manager/tickets
       Query:
-        - date=YYYY-MM-DD          → Manila-local calendar day (default: today MNL)
-        - bus_id=<int>             → optional filter
-        - include_voided=true|false→ include voided/cancelled tickets (default: false)
-        - array=1|0                → 1: return plain array (default), 0: wrap with totals
-
-      Notes:
-        - Voided detection is schema-flexible (supports either ticket_sales.voided or .status).
-        - Returned 'paid' is forced false when row is voided.
-        - 'fare' is always a string with 2 decimals.
+        - date=YYYY-MM-DD
+        - bus_id=<int>
+        - include_voided=true|false
+        - array=1|0
     """
-    # ---- parse inputs --------------------------------------------------------
     try:
         day = datetime.strptime(
             request.args.get("date") or datetime.now(MNL_TZ).date().isoformat(),
@@ -1170,19 +1501,16 @@ def tickets_for_day():
     include_voided = (request.args.get("include_voided", "false").strip().lower() in {"1", "true", "yes"})
     want_array = (request.args.get("array", "1").strip().lower() in {"1", "true", "yes"})
 
-    # ---- schema capability checks -------------------------------------------
     has_status = table_has_column("ticket_sales", "status")
     has_voided = table_has_column("ticket_sales", "voided")
     has_paid   = table_has_column("ticket_sales", "paid")
 
-    # Prefer a human reason-ish column if present
     reason_label = None
     for col in ("void_reason", "reason", "note", "remarks"):
         if table_has_column("ticket_sales", col):
             reason_label = getattr(TicketSale, col).label("void_reason")
             break
 
-    # ---- fields --------------------------------------------------------------
     O = aliased(TicketStop)
     D = aliased(TicketStop)
     fields = [
@@ -1204,13 +1532,11 @@ def tickets_for_day():
     if reason_label is not None:
         fields.append(reason_label)
 
-    # ---- Manila-local midnight window → UTC naive (DB default) --------------
     start_mnl = datetime.combine(day, datetime.min.time(), tzinfo=MNL_TZ)
     end_mnl   = start_mnl + timedelta(days=1)
     start_utc = start_mnl.astimezone(timezone.utc).replace(tzinfo=None)
     end_utc   = end_mnl.astimezone(timezone.utc).replace(tzinfo=None)
 
-    # ---- base query ----------------------------------------------------------
     qs = (
         db.session.query(*fields)
         .outerjoin(User, TicketSale.user_id == User.id)
@@ -1222,7 +1548,6 @@ def tickets_for_day():
     if bus_id_filter:
         qs = qs.filter(TicketSale.bus_id == bus_id_filter)
 
-    # Exclude voided by default (schema-flexible)
     if not include_voided:
         if has_voided:
             qs = qs.filter(TicketSale.voided.is_(False))
@@ -1231,7 +1556,6 @@ def tickets_for_day():
 
     rows = qs.order_by(TicketSale.created_at.desc()).all()
 
-    # ---- helpers -------------------------------------------------------------
     def _fmt_price(p) -> str:
         try:
             return f"{float(p or 0):.2f}"
@@ -1242,7 +1566,6 @@ def tickets_for_day():
         st = (str(getattr(row, "status", "") or "")).lower()
         return bool(getattr(row, "voided", False)) or st in {"void", "voided", "refunded", "cancelled", "canceled"}
 
-    # ---- shape rows ----------------------------------------------------------
     items = []
     revenue_ex_voided_paid = 0.0
 
@@ -1253,7 +1576,6 @@ def tickets_for_day():
         is_void = _is_voided(r)
         fare_str = _fmt_price(r.price)
 
-        # revenue we expose (when array=0) excludes voided and only counts paid
         if (bool(getattr(r, "paid", False)) and not is_void):
             try:
                 revenue_ex_voided_paid += float(fare_str)
@@ -1288,41 +1610,16 @@ def tickets_for_day():
             {
                 "tickets": items,
                 "count": len(items),
-                "total": round(revenue_ex_voided_paid, 2),  # server-computed revenue (paid & not voided)
+                "total": round(revenue_ex_voided_paid, 2),
                 "include_voided": bool(include_voided),
                 "date": day.isoformat(),
                 "bus_id": bus_id_filter,
             }
         ), 200
 
-@manager_bp.route("/buses", methods=["GET"])
-@require_role("manager", "pao")
-def list_buses():
-    try:
-        out = []
-        buses = Bus.query.order_by(Bus.identifier).all()
-        for b in buses:
-            latest = (
-                SensorReading.query.filter_by(bus_id=b.id)
-                .order_by(SensorReading.timestamp.desc())
-                .first()
-            )
-            out.append(
-                {
-                    "id": b.id,
-                    "identifier": b.identifier,
-                    "capacity": b.capacity,
-                    "description": b.description,
-                    "last_seen": latest.timestamp.isoformat() if latest else None,
-                    "occupancy": latest.total_count if latest else None,
-                }
-            )
-        return jsonify(out), 200
-    except Exception:
-        current_app.logger.exception("ERROR in /manager/buses")
-        return jsonify(error="Could not process the request to list buses."), 500
-
-
+# ─────────────────────────────────────────────
+# Occupancy insights
+# ─────────────────────────────────────────────
 @manager_bp.route("/route-insights", methods=["GET"])
 @require_role("manager")
 def route_data_insights():
@@ -1443,108 +1740,9 @@ def route_data_insights():
 
     return jsonify(occupancy=series, meta=meta, metrics=metrics, snapshot=use_snapshot), 200
 
-
-@manager_bp.route("/metrics/tickets", methods=["GET"])
-@require_role("manager")
-def ticket_metrics():
-    today = datetime.utcnow().date()
-    date_to = datetime.strptime(request.args.get("to", today.isoformat()), "%Y-%m-%d").date()
-    date_from = datetime.strptime(
-        request.args.get("from", (date_to - timedelta(days=6)).isoformat()),
-        "%Y-%m-%d",
-    ).date()
-
-    window_start = datetime.combine(date_from, datetime.min.time())
-    window_end = datetime.combine(date_to + timedelta(days=1), datetime.min.time())
-
-    bus_id = request.args.get("bus_id", type=int)
-
-    qs = db.session.query(
-        func.date_format(TicketSale.created_at, "%Y-%m-%d").label("d"),
-        func.count(TicketSale.id).label("tickets"),
-        func.sum(TicketSale.price).label("revenue"),
-    ).filter(TicketSale.created_at.between(window_start, window_end))
-    if bus_id:
-        qs = qs.filter(TicketSale.bus_id == bus_id)
-
-    rows = qs.group_by("d").order_by("d").all()
-
-    daily = []
-    total_tickets = 0
-    total_revenue = 0.0
-    for r in rows:
-        daily.append({"date": r.d, "tickets": int(r.tickets), "revenue": float(r.revenue or 0)})
-        total_tickets += int(r.tickets)
-        total_revenue += float(r.revenue or 0)
-
-    return jsonify(daily=daily, total_tickets=total_tickets, total_revenue=round(total_revenue, 2)), 200
-
-
-@manager_bp.route("/buses/<int:bus_id>", methods=["PATCH"])
-@require_role("manager")
-def update_bus(bus_id):
-    bus = Bus.query.get_or_404(bus_id)
-    data = request.get_json() or {}
-
-    if "identifier" in data:
-        bus.identifier = data["identifier"].strip()
-    if "capacity" in data:
-        bus.capacity = data["capacity"]
-    if "description" in data:
-        bus.description = data["description"].strip()
-
-    db.session.commit()
-    return jsonify(success=True), 200
-
-
-@manager_bp.route("/qr-templates", methods=["POST"])
-@require_role("manager")
-def upload_qr():
-    if "file" not in request.files or "fare_segment_id" not in request.form:
-        return jsonify(error="file & fare_segment_id required"), 400
-
-    seg = FareSegment.query.get(request.form["fare_segment_id"])
-    if not seg:
-        return jsonify(error="invalid fare_segment_id"), 400
-
-    file = request.files["file"]
-    fname = secure_filename(f"{uuid.uuid4().hex}{os.path.splitext(file.filename)[1]}")
-    file.save(os.path.join(UPLOAD_DIR, fname))
-
-    tpl = QRTemplate(file_path=fname, price=seg.price, fare_segment_id=seg.id)
-    db.session.add(tpl)
-    db.session.commit()
-
-    return jsonify(id=tpl.id, url=f"/manager/qr-templates/{tpl.id}/file", price=f"{seg.price:.2f}"), 201
-
-
-@manager_bp.route("/qr-templates", methods=["GET"])
-@require_role("manager")
-def list_qr():
-    return (
-        jsonify([{"id": t.id, "url": f"/manager/qr-templates/{t.id}/file", "price": f"{t.price:.2f}"} for t in QRTemplate.query.order_by(QRTemplate.created_at.desc())]),
-        200,
-    )
-
-
-@manager_bp.route("/qr-templates/<int:tpl_id>/file", methods=["GET"])
-def serve_qr_file(tpl_id):
-    tpl = QRTemplate.query.get_or_404(tpl_id)
-    return send_from_directory(UPLOAD_DIR, tpl.file_path)
-
-
-@manager_bp.route("/fare-segments", methods=["GET"])
-@require_role("manager")
-def list_fare_segments():
-    rows = FareSegment.query.order_by(FareSegment.id).all()
-    return (
-        jsonify(
-            [{"id": s.id, "label": f"{s.origin.stop_name} → {s.destination.stop_name}", "price": f"{s.price:.2f}"} for s in rows]
-        ),
-        200,
-    )
-
-
+# ─────────────────────────────────────────────
+# Sensor readings (ingest & view)
+# ─────────────────────────────────────────────
 @manager_bp.route("/sensor-readings", methods=["POST"])
 @require_role("manager")
 def create_sensor_reading():
@@ -1586,7 +1784,6 @@ def create_sensor_reading():
         current_app.logger.exception("Unexpected error inserting sensor reading")
         return jsonify(error=str(e)), 500
 
-
 @manager_bp.route("/buses/<string:device_id>/sensor-readings", methods=["GET"])
 @require_role("manager")
 def list_bus_readings(device_id: str):
@@ -1614,85 +1811,325 @@ def list_bus_readings(device_id: str):
         200,
     )
 
-
-@manager_bp.route("/bus-trips", methods=["GET"])
+# ─────────────────────────────────────────────
+# QR templates & fare segments
+# ─────────────────────────────────────────────
+@manager_bp.route("/qr-templates", methods=["POST"])
 @require_role("manager")
-def list_bus_trips():
-    date_str = request.args.get("date")
-    bus_id = request.args.get("bus_id", type=int)
+def upload_qr():
+    if "file" not in request.files or "fare_segment_id" not in request.form:
+        return jsonify(error="file & fare_segment_id required"), 400
 
-    if not (date_str and bus_id):
-        return jsonify(error="date and bus_id are required"), 400
+    seg = FareSegment.query.get(request.form["fare_segment_id"])
+    if not seg:
+        return jsonify(error="invalid fare_segment_id"), 400
 
-    try:
-        day = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify(error="invalid date format"), 400
+    file = request.files["file"]
+    fname = secure_filename(f"{uuid.uuid4().hex}{os.path.splitext(file.filename)[1]}")
+    file.save(os.path.join(UPLOAD_DIR, fname))
 
-    trips = (
-        Trip.query.filter(Trip.bus_id == bus_id, Trip.service_date == day)
-        .order_by(Trip.start_time.asc())
-        .all()
+    tpl = QRTemplate(file_path=fname, price=seg.price, fare_segment_id=seg.id)
+    db.session.add(tpl)
+    db.session.commit()
+
+    return jsonify(id=tpl.id, url=f"/manager/qr-templates/{tpl.id}/file", price=f"{seg.price:.2f}"), 201
+
+@manager_bp.route("/qr-templates", methods=["GET"])
+@require_role("manager")
+def list_qr():
+    return (
+        jsonify([{"id": t.id, "url": f"/manager/qr-templates/{t.id}/file", "price": f"{t.price:.2f}"} for t in QRTemplate.query.order_by(QRTemplate.created_at.desc())]),
+        200,
     )
 
+@manager_bp.route("/qr-templates/<int:tpl_id>/file", methods=["GET"])
+def serve_qr_file(tpl_id):
+    tpl = QRTemplate.query.get_or_404(tpl_id)
+    return send_from_directory(UPLOAD_DIR, tpl.file_path)
+
+@manager_bp.route("/fare-segments", methods=["GET"])
+@require_role("manager")
+def list_fare_segments():
+    rows = FareSegment.query.order_by(FareSegment.id).all()
     return (
         jsonify(
-            [{"id": t.id, "number": t.number, "start_time": t.start_time.strftime("%H:%M"), "end_time": t.end_time.strftime("%H:%M")} for t in trips]
+            [{"id": s.id, "label": f"{s.origin.stop_name} → {s.destination.stop_name}", "price": f"{s.price:.2f}"} for s in rows]
         ),
         200,
     )
 
 
-@manager_bp.route("/trips", methods=["POST"])
-@require_role("manager")
-def create_trip():
-    data = request.get_json() or {}
-    missing = [k for k in ("service_date", "bus_id", "number", "start_time", "end_time") if k not in data]
-    if missing:
-        return jsonify(error=f"Missing field(s): {', '.join(missing)}"), 400
 
+@manager_bp.route("/pao-assignments", methods=["GET"], endpoint="pao_assignments_get")
+@require_role("manager", "pao")
+def pao_assignments_get():
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    MNL = _tz(_td(hours=8))
+
+    date_str = (request.args.get("date") or _dt.now(MNL).date().isoformat()).strip()
     try:
-        service_date = datetime.strptime(str(data["service_date"]), "%Y-%m-%d").date()
-        start_time = datetime.strptime(str(data["start_time"]), "%H:%M").time()
-        end_time = datetime.strptime(str(data["end_time"]), "%H:%M").time()
+        day = _dt.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
-        return jsonify(error="Invalid date/time format"), 400
+        current_app.logger.info("[pao-assignments][GET] invalid date=%r", date_str)
+        return jsonify(error="invalid date format"), 400
 
-    number = str(data["number"]).strip()
-    bus_id = int(data["bus_id"])
+    current_app.logger.info(
+        "[pao-assignments][GET] caller uid=%s role=%s date=%s",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        day.isoformat(),
+    )
 
-    bus = Bus.query.get(bus_id)
-    if not bus:
+    rows = db.session.execute(
+        text("""
+            SELECT a.id, a.user_id, a.bus_id, a.service_date,
+                   u.first_name AS uf, u.last_name AS ul,
+                   b.identifier AS bus
+            FROM pao_assignments a
+            LEFT JOIN users u ON u.id = a.user_id
+            LEFT JOIN buses b ON b.id = a.bus_id
+            WHERE a.service_date = :d
+            ORDER BY b.identifier
+        """),
+        {"d": day},
+    ).mappings().all()
+
+    out = []
+    for r in rows:
+        name = f"{(r['uf'] or '').strip()} {(r['ul'] or '').strip()}".strip() or None
+        out.append({
+            "id": int(r["id"]),
+            "service_date": day.isoformat(),
+            "bus_id": int(r["bus_id"]),
+            "bus": r["bus"],
+            "user_id": int(r["user_id"]),
+            "pao_name": name,
+        })
+    current_app.logger.info("[pao-assignments][GET] rows=%d", len(out))
+    return jsonify(out), 200
+
+
+@manager_bp.route("/pao-assignments", methods=["POST"], endpoint="pao_assignments_upsert")
+@require_role("manager")
+def pao_assignments_upsert():
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    MNL = _tz(_td(hours=8))
+
+    data = request.get_json(silent=True) or {}
+    uid = int(data.get("user_id") or 0)
+    bid = int(data.get("bus_id") or 0)
+    day_str = (data.get("service_date") or _dt.now(MNL).date().isoformat()).strip()
+
+    current_app.logger.info(
+        "[pao-assignments][POST] caller uid=%s role=%s payload={user_id=%s, bus_id=%s, service_date=%s}",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        uid, bid, day_str
+    )
+
+    if not (uid and bid):
+        return jsonify(error="user_id and bus_id are required"), 400
+    try:
+        day = _dt.strptime(day_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify(error="invalid service_date"), 400
+
+    if not User.query.get(uid):
+        return jsonify(error="invalid user_id"), 400
+    if not Bus.query.get(bid):
         return jsonify(error="invalid bus_id"), 400
 
-    if end_time <= start_time:
-        return jsonify(error="end_time must be after start_time"), 400
-
-    existing = Trip.query.filter(Trip.bus_id == bus_id, Trip.service_date == service_date).all()
-
-    ns = datetime.combine(service_date, start_time)
-    ne = datetime.combine(service_date, end_time)
-
-    for t in existing:
-        s = datetime.combine(service_date, t.start_time)
-        e = datetime.combine(service_date, t.end_time)
-        if max(s, ns) < min(e, ne):  # overlap
-            return (
-                jsonify(error=f"Overlaps with {t.number} ({t.start_time.strftime('%H:%M')}–{t.end_time.strftime('%H:%M')})"),
-                409,
-            )
-
-    trip = Trip(bus_id=bus_id, service_date=service_date, number=number, start_time=start_time, end_time=end_time)
-
     try:
-        db.session.add(trip)
+        del_res = db.session.execute(
+            text("""
+                DELETE FROM pao_assignments
+                WHERE service_date = :d AND (user_id = :u OR bus_id = :b)
+            """),
+            {"d": day, "u": uid, "b": bid},
+        )
+        current_app.logger.info("[pao-assignments][POST] removed_conflicts=%s", getattr(del_res, "rowcount", None))
+
+        ins_res = db.session.execute(
+            text("""
+                INSERT INTO pao_assignments (user_id, bus_id, service_date)
+                VALUES (:u, :b, :d)
+            """),
+            {"u": uid, "b": bid, "d": day},
+        )
+        new_id = getattr(ins_res, "lastrowid", None)
+
         db.session.commit()
+        current_app.logger.info(
+            "[pao-assignments][POST] OK user_id=%s bus_id=%s date=%s new_id=%s",
+            uid, bid, day.isoformat(), new_id
+        )
+        return jsonify(ok=True, id=new_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("[manager] upsert_pao_assignment failed")
+        return jsonify(error=str(e)), 500
+
+
+@manager_bp.route("/pao-assignments/<int:assignment_id>", methods=["DELETE"], endpoint="pao_assignments_delete")
+@require_role("manager")
+def pao_assignments_delete(assignment_id: int):
+    current_app.logger.info(
+        "[pao-assignments][DELETE] caller uid=%s role=%s assignment_id=%s",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        assignment_id
+    )
+    try:
+        rows = db.session.execute(
+            text("DELETE FROM pao_assignments WHERE id = :id"),
+            {"id": assignment_id}
+        ).rowcount
+        if rows == 0:
+            current_app.logger.info("[pao-assignments][DELETE] not_found id=%s", assignment_id)
+            return jsonify(error="assignment not found"), 404
+
+        db.session.commit()
+        current_app.logger.info("[pao-assignments][DELETE] OK id=%s", assignment_id)
+        return jsonify(ok=True), 200
     except Exception:
         db.session.rollback()
-        current_app.logger.exception("ERROR creating trip")
-        return jsonify(error="Failed to create trip"), 500
+        current_app.logger.exception("[pao-assignments][DELETE] failed id=%s", assignment_id)
+        return jsonify(error="delete failed"), 500
+    
+@manager_bp.route("/driver-assignments", methods=["GET"], endpoint="driver_assignments_get")
+@require_role("manager")
+def driver_assignments_get():
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    MNL = _tz(_td(hours=8))
 
-    return (
-        jsonify(id=trip.id, number=trip.number, start_time=trip.start_time.strftime("%H:%M"), end_time=trip.end_time.strftime("%H:%M")),
-        201,
+    date_str = (request.args.get("date") or _dt.now(MNL).date().isoformat()).strip()
+    try:
+        day = _dt.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        current_app.logger.info("[driver-assignments][GET] invalid date=%r", date_str)
+        return jsonify(error="invalid date format"), 400
+
+    current_app.logger.info(
+        "[driver-assignments][GET] caller uid=%s role=%s date=%s",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        day.isoformat(),
     )
+
+    rows = db.session.execute(
+        text("""
+            SELECT a.id, a.user_id, a.bus_id, a.service_date,
+                   u.first_name AS uf, u.last_name AS ul,
+                   b.identifier AS bus
+            FROM driver_assignments a
+            LEFT JOIN users u ON u.id = a.user_id
+            LEFT JOIN buses b ON b.id = a.bus_id
+            WHERE a.service_date = :d
+            ORDER BY b.identifier
+        """),
+        {"d": day},
+    ).mappings().all()
+
+    out = []
+    for r in rows:
+        name = f"{(r['uf'] or '').strip()} {(r['ul'] or '').strip()}".strip() or None
+        out.append({
+            "id": int(r["id"]),
+            "service_date": day.isoformat(),
+            "bus_id": int(r["bus_id"]),
+            "bus": r["bus"],
+            "user_id": int(r["user_id"]),
+            "driver_name": name,
+        })
+    current_app.logger.info("[driver-assignments][GET] rows=%d", len(out))
+    return jsonify(out), 200
+
+@manager_bp.route("/driver-assignments", methods=["POST"], endpoint="driver_assignments_upsert")
+@require_role("manager")
+def driver_assignments_upsert():
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    MNL = _tz(_td(hours=8))
+
+    data = request.get_json(silent=True) or {}
+    uid = int(data.get("user_id") or 0)
+    bid = int(data.get("bus_id") or 0)
+    day_str = (data.get("service_date") or _dt.now(MNL).date().isoformat()).strip()
+
+    current_app.logger.info(
+        "[driver-assignments][POST] caller uid=%s role=%s payload={user_id=%s, bus_id=%s, service_date=%s}",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        uid, bid, day_str
+    )
+
+    if not (uid and bid):
+        return jsonify(error="user_id and bus_id are required"), 400
+    try:
+        day = _dt.strptime(day_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify(error="invalid service_date"), 400
+
+    u = User.query.get(uid)
+    if not u:
+        return jsonify(error="invalid user_id"), 400
+    if (u.role or "").lower() != "driver":
+        return jsonify(error="user is not a driver"), 400
+
+    if not Bus.query.get(bid):
+        return jsonify(error="invalid bus_id"), 400
+
+    try:
+        del_res = db.session.execute(
+            text("""
+                DELETE FROM driver_assignments
+                WHERE service_date = :d AND (user_id = :u OR bus_id = :b)
+            """),
+            {"d": day, "u": uid, "b": bid},
+        )
+        current_app.logger.info("[driver-assignments][POST] removed_conflicts=%s", getattr(del_res, "rowcount", None))
+
+        ins_res = db.session.execute(
+            text("""
+                INSERT INTO driver_assignments (user_id, bus_id, service_date)
+                VALUES (:u, :b, :d)
+            """),
+            {"u": uid, "b": bid, "d": day},
+        )
+        new_id = getattr(ins_res, "lastrowid", None)
+
+        db.session.commit()
+        current_app.logger.info(
+            "[driver-assignments][POST] OK user_id=%s bus_id=%s date=%s new_id=%s",
+            uid, bid, day.isoformat(), new_id
+        )
+        return jsonify(ok=True, id=new_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("[manager] upsert_driver_assignment failed")
+        return jsonify(error=str(e)), 500
+
+@manager_bp.route("/driver-assignments/<int:assignment_id>", methods=["DELETE"], endpoint="driver_assignments_delete")
+@require_role("manager")
+def driver_assignments_delete(assignment_id: int):
+    current_app.logger.info(
+        "[driver-assignments][DELETE] caller uid=%s role=%s assignment_id=%s",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        assignment_id
+    )
+    try:
+        rows = db.session.execute(
+            text("DELETE FROM driver_assignments WHERE id = :id"),
+            {"id": assignment_id}
+        ).rowcount
+        if rows == 0:
+            current_app.logger.info("[driver-assignments][DELETE] not_found id=%s", assignment_id)
+            return jsonify(error="assignment not found"), 404
+
+        db.session.commit()
+        current_app.logger.info("[driver-assignments][DELETE] OK id=%s", assignment_id)
+        return jsonify(ok=True), 200
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("[driver-assignments][DELETE] failed id=%s", assignment_id)
+        return jsonify(error="delete failed"), 500
