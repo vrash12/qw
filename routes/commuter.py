@@ -311,9 +311,6 @@ def _as_local(dt_obj: dt.datetime) -> dt.datetime:
         dt_obj = dt_obj.replace(tzinfo=dt.timezone.utc)
     return dt_obj.astimezone(LOCAL_TZ)
 
-def _debug_enabled() -> bool:
-    return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
-
 SALT_WALLET_QR = "wallet-qr-rot-v1"
 
 def _wallet_qr_token(uid: int, bucket: Optional[int] = None) -> str:
@@ -1109,24 +1106,7 @@ def commuter_ticket_receipt_qr(ticket_id: int):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
-@commuter_bp.app_errorhandler(Exception)
-def _commuter_errors(e: Exception):
-    current_app.logger.exception("Unhandled error on %s %s", request.method, request.path)
-    if isinstance(e, HTTPException) and not _debug_enabled():
-        return e
-    status = getattr(e, "code", 500)
-    if _debug_enabled():
-        return jsonify({
-            "ok": False,
-            "type": e.__class__.__name__,
-            "error": str(e),
-            "endpoint": request.endpoint,
-            "path": request.path,
-            "traceback": traceback.format_exc(),
-        }), status
-    return jsonify({"error": "internal server error"}), status
 
-# -------- time helpers --------
 def _as_time(v: Any) -> Optional[dt.time]:
     if v is None:
         return None
@@ -1275,11 +1255,6 @@ def commuter_get_ticket(ticket_id: int):
 @commuter_bp.route("/dashboard", methods=["GET"])
 @require_role("commuter")
 def dashboard():
-    """
-    Compact dashboard payload + accurate live_now using local time.
-    Debug: ?debug=1 | ?date=YYYY-MM-DD | ?now=HH:MM
-    """
-    debug_on = (request.args.get("debug") or "").lower() in {"1", "true", "yes"}
 
     now_local = dt.datetime.now(LOCAL_TZ) if LOCAL_TZ else dt.datetime.now()
     date_arg = (request.args.get("date") or "").strip()
@@ -1364,7 +1339,7 @@ def dashboard():
         return s <= now_t < e
 
     live_now: List[Dict[str, Any]] = []
-    debug_trips: List[Dict[str, Any]] = []
+
 
     trips_today = (
         db.session.query(Trip, Bus.identifier.label("bus_identifier"))
@@ -1445,28 +1420,6 @@ def dashboard():
                 "description": "",
             })
 
-        if debug_on:
-            def _fmt(x: Optional[dt.time]) -> Optional[str]:
-                return x.strftime("%H:%M") if x else None
-            debug_trips.append({
-                "trip_id": t.id,
-                "bus": (bid or "").replace("bus-", "Bus "),
-                "events": [
-                    {
-                        "type": ev["type"],
-                        "label": ev["label"],
-                        "start": _fmt(ev["start"]),
-                        "end": _fmt(ev["end"]),
-                        "desc": ev["description"],
-                        "hit": _is_live_window(now_time_local, ev["start"], ev["end"], grace_min=3),
-                    } for ev in events
-                ],
-                "chosen": None if not chosen else {
-                    "type": chosen["type"],
-                    "start": _fmt(chosen["start"]),
-                    "end": _fmt(chosen["end"]),
-                },
-            })
 
     current_app.logger.info(
         "dashboard live_now=%d now=%s date=%s trips=%d",
@@ -1484,15 +1437,8 @@ def dashboard():
         "last_announcement": last_announcement,
         "live_now": live_now,
     }
-    if debug_on:
-        payload["debug"] = {
-            "now_local": now_local.strftime("%Y-%m-%d %H:%M:%S"),
-            "today_local": str(today_local),
-            "live_now_len": len(live_now),
-            "trips_today_len": len(trips_today),
-            "first_trip_debug": debug_trips[0] if debug_trips else None,
-        }
-
+  
+  
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp, 200
@@ -2025,29 +1971,13 @@ def schedule():
 
 @commuter_bp.route("/announcements", methods=["GET"])
 def announcements():
-    """
-    GET /commuter/announcements
-      Optional:
-        bus_id=<int>        # only announcements authored by PAOs assigned to this bus
-        date=YYYY-MM-DD     # local calendar day (defaults to today in LOCAL_TZ)
-        limit=<int>         # cap the number of rows (newest first)
-    """
+    from sqlalchemy.orm import aliased
+    from sqlalchemy import func
+    import sqlalchemy as sa
+
     bus_id   = request.args.get("bus_id", type=int)
     date_str = request.args.get("date")
     limit    = request.args.get("limit", type=int)
-
-    q = (
-        db.session.query(
-            Announcement,
-            User.first_name,
-            User.last_name,
-            Bus.identifier.label("bus_identifier"),
-        )
-        .join(User, Announcement.created_by == User.id)
-        .outerjoin(Bus, User.assigned_bus_id == Bus.id)
-    )
-    if bus_id:
-        q = q.filter(User.assigned_bus_id == bus_id)
 
     if date_str:
         try:
@@ -2058,8 +1988,66 @@ def announcements():
         day = (dt.datetime.now(LOCAL_TZ) if LOCAL_TZ else dt.datetime.now()).date()
 
     start_utc, end_utc = _local_day_bounds_utc(day)
-    q = q.filter(Announcement.timestamp >= start_utc, Announcement.timestamp < end_utc)
-    q = q.order_by(Announcement.timestamp.desc())
+
+    BusDaily    = aliased(Bus)
+    BusAssigned = aliased(Bus)
+
+    use_daily_assignment = (
+        _has_column("pao_assignments", "user_id")
+        and _has_column("pao_assignments", "bus_id")
+        and _has_column("pao_assignments", "service_date")
+    )
+
+    if use_daily_assignment:
+        # 👇 build a lightweight selectable for pao_assignments
+        pa = sa.table(
+            "pao_assignments",
+            sa.column("user_id"),
+            sa.column("bus_id"),
+            sa.column("service_date"),
+        )
+
+        q = (
+            db.session.query(
+                Announcement,
+                User.first_name,
+                User.last_name,
+                func.coalesce(BusDaily.identifier, BusAssigned.identifier).label("bus_identifier"),
+            )
+            .join(User, Announcement.created_by == User.id)
+            .outerjoin(
+                pa,
+                sa.and_(pa.c.user_id == User.id, pa.c.service_date == day),
+            )
+            .outerjoin(BusDaily, BusDaily.id == pa.c.bus_id)
+            .outerjoin(BusAssigned, BusAssigned.id == User.assigned_bus_id)
+            .filter(
+                Announcement.timestamp >= start_utc,
+                Announcement.timestamp <  end_utc,
+            )
+            .order_by(Announcement.timestamp.desc())
+        )
+        if bus_id:
+            q = q.filter(func.coalesce(BusDaily.id, BusAssigned.id) == bus_id)
+    else:
+        q = (
+            db.session.query(
+                Announcement,
+                User.first_name,
+                User.last_name,
+                BusAssigned.identifier.label("bus_identifier"),
+            )
+            .join(User, Announcement.created_by == User.id)
+            .outerjoin(BusAssigned, BusAssigned.id == User.assigned_bus_id)
+            .filter(
+                Announcement.timestamp >= start_utc,
+                Announcement.timestamp <  end_utc,
+            )
+            .order_by(Announcement.timestamp.desc())
+        )
+        if bus_id:
+            q = q.filter(BusAssigned.id == bus_id)
+
     if isinstance(limit, int) and limit > 0:
         q = q.limit(limit)
 
@@ -2068,11 +2056,10 @@ def announcements():
         {
             "id": ann.id,
             "message": ann.message,
-            "timestamp": (ann.timestamp.replace(tzinfo=dt.timezone.utc)).isoformat(),
+            "timestamp": ann.timestamp.replace(tzinfo=dt.timezone.utc).isoformat(),
             "author_name": f"{first} {last}",
-            "bus_identifier": bus_identifier or "unassigned",
+            "bus_identifier": (bus_identifier or "unassigned"),
         }
         for ann, first, last, bus_identifier in rows
     ]
     return jsonify(anns), 200
-

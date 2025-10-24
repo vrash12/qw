@@ -18,7 +18,7 @@ from db import db
 from auth_guard import require_role
 
 from utils.push import push_to_user
-
+from sqlalchemy.exc import IntegrityError
 from models.bus import Bus
 from models.schedule import Trip
 from models.qr_template import QRTemplate
@@ -158,7 +158,38 @@ def list_staff():
     ]
     return jsonify(out), 200
 
+def _set_password_for_user(u: User, raw: str | None):
+    """Set a user's password using model's set_password or a werkzeug hash field."""
+    if not raw:
+        return
+    if hasattr(u, "set_password") and callable(getattr(u, "set_password")):
+        u.set_password(raw)  # type: ignore[attr-defined]
+    elif hasattr(u, "password_hash"):
+        setattr(u, "password_hash", generate_password_hash(raw))
 
+def _ensure_unique_username_phone(un: str | None, ph: str | None, *, exclude_id: int | None = None) -> str | None:
+    if un:
+        q = User.query.filter(User.username == un)
+        if exclude_id:
+            q = q.filter(User.id != exclude_id)
+        if q.first():
+            return "username already in use"
+    if ph:
+        q = User.query.filter(User.phone_number == ph)
+        if exclude_id:
+            q = q.filter(User.id != exclude_id)
+        if q.first():
+            return "phone number already in use"
+    return None
+
+def _random_password(n: int = 10) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CREATE STAFF (supports bulk). For PAO without provided password, auto-generate
+# and return it once as `temp_password` so managers can give it to the staffer.
+# ─────────────────────────────────────────────────────────────────────────────
 @manager_bp.route("/staff", methods=["POST"])
 @require_role("manager")
 def create_staff():
@@ -169,25 +200,22 @@ def create_staff():
       {
         "role": "pao" | "driver",
         "first_name": "...", "last_name": "...",
-        "username": "...", "phone_number": "...", "password": "..."
+        "username": "...", "phone_number": "...", "password": "..."  # optional for PAO
       }
 
     Bulk:
       { "users": [ {..}, {..} ] }
+
+    Notes:
+      - If a PAO is created with no password, a strong temporary password is generated
+        and returned once in the response as `temp_password`.
+      - Stored passwords cannot be read back later (they're hashed).
     """
     data = request.get_json(silent=True) or {}
     items = data.get("users") or [data]
 
     allowed_roles = {"pao", "driver"}
     created, errors = [], []
-
-    def _set_password(u, raw: str | None):
-        if not raw:
-            return
-        if hasattr(u, "set_password") and callable(getattr(u, "set_password")):
-            u.set_password(raw)  # type: ignore[attr-defined]
-        elif hasattr(u, "password_hash"):
-            setattr(u, "password_hash", generate_password_hash(raw))
 
     try:
         with db.session.begin():
@@ -199,6 +227,7 @@ def create_staff():
                 ph   = (payload.get("phone_number") or "").strip()
                 pw   = (payload.get("password") or "").strip()
 
+                # validations
                 if role not in allowed_roles:
                     errors.append({"index": i, "error": "invalid role"})
                     continue
@@ -206,14 +235,13 @@ def create_staff():
                     errors.append({"index": i, "error": "first_name, last_name, username are required"})
                     continue
 
-                # basic uniqueness guard
-                q = User.query.filter(User.username == un)
-                if ph:
-                    q = q.union(User.query.filter(User.phone_number == ph))
-                if q.first():
-                    errors.append({"index": i, "error": "username/phone already in use"})
+                # uniqueness
+                clash = _ensure_unique_username_phone(un, ph or None)
+                if clash:
+                    errors.append({"index": i, "error": clash})
                     continue
 
+                # create model row
                 u = User(
                     first_name=fn,
                     last_name=ln,
@@ -221,24 +249,69 @@ def create_staff():
                     phone_number=ph or None,
                     role=role,
                 )
-                _set_password(u, pw or None)
+
+                # password handling
+                temp_pw = None
+                if role == "pao":
+                    if pw:
+                        _set_password_for_user(u, pw)
+                    else:
+                        temp_pw = _random_password(10)
+                        _set_password_for_user(u, temp_pw)
+                else:
+                    # driver: set only if provided
+                    if pw:
+                        _set_password_for_user(u, pw)
 
                 db.session.add(u)
-                db.session.flush()
+                db.session.flush()  # allocate id
 
                 created.append({
                     "id": int(u.id),
                     "role": role,
                     "name": f"{u.first_name} {u.last_name}".strip(),
                     "username": u.username,
+                    # Return a one-time visible password only when the server generated it
+                    "temp_password": temp_pw,
                 })
 
         status = 201 if created and not errors else (207 if created and errors else 400)
         return jsonify(created=created, errors=errors, count=len(created)), status
+
     except Exception as e:
         current_app.logger.exception("[manager] create_staff failed")
         return jsonify(error=str(e)), 500
-    
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESET PASSWORD (safe alternative to “show current password”)
+# Returns a newly-set plaintext password once so you can hand it to the PAO.
+# ─────────────────────────────────────────────────────────────────────────────
+@manager_bp.route("/staff/<int:user_id>/reset-password", methods=["POST"])
+@require_role("manager")
+def reset_staff_password(user_id: int):
+    """
+    Body (optional): { "password": "<explicit new password>" }
+    If omitted, a random 10-char password is generated.
+    Returns: { ok, user_id, password, generated }
+    """
+    u = User.query.filter(User.id == user_id, User.role.in_(("pao","driver"))).first()
+    if not u:
+        return jsonify(error="staff not found"), 404
+
+    payload = request.get_json(silent=True) or {}
+    supplied = (payload.get("password") or "").strip()
+    new_pw = supplied or _random_password(10)
+    generated = not bool(supplied)
+
+    try:
+        _set_password_for_user(u, new_pw)
+        db.session.commit()
+        return jsonify(ok=True, user_id=int(u.id), password=new_pw, generated=generated), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("[manager] reset_staff_password failed")
+        return jsonify(error=str(e)), 500
+
 def table_has_column(table: str, column: str) -> bool:
     row = db.session.execute(
         text(
@@ -1058,44 +1131,6 @@ def list_paos():
         ]
     ), 200
 
-@manager_bp.route("/pao-assignments", methods=["GET"])
-@require_role("manager")
-def roster_for_day():
-    """
-    GET /manager/pao-assignments?date=YYYY-MM-DD
-    Returns the PAO assigned per bus for the given date.
-    """
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-    MNL = _tz(_td(hours=8))
-    date_str = (request.args.get("date") or _dt.now(MNL).date().isoformat()).strip()
-    try:
-        day = _dt.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify(error="invalid date format"), 400
-
-    sql = text("""
-        SELECT a.id, a.user_id, a.bus_id, a.service_date,
-               u.first_name AS uf, u.last_name AS ul,
-               b.identifier AS bus
-        FROM pao_assignments a
-        LEFT JOIN users u ON u.id = a.user_id
-        LEFT JOIN buses b ON b.id = a.bus_id
-        WHERE a.service_date = :d
-        ORDER BY b.identifier
-    """)
-    rows = db.session.execute(sql, {"d": day}).mappings().all()
-    out = []
-    for r in rows:
-        name = f"{(r['uf'] or '').strip()} {(r['ul'] or '').strip()}".strip()
-        out.append({
-            "id": int(r["id"]),
-            "service_date": day.isoformat(),
-            "bus_id": int(r["bus_id"]),
-            "bus": r["bus"],
-            "user_id": int(r["user_id"]),
-            "pao_name": name or None,
-        })
-    return jsonify(out), 200
 
 @manager_bp.route("/revenue-breakdown", methods=["GET"])
 @require_role("manager")
@@ -1908,7 +1943,6 @@ def pao_assignments_get():
     current_app.logger.info("[pao-assignments][GET] rows=%d", len(out))
     return jsonify(out), 200
 
-
 @manager_bp.route("/pao-assignments", methods=["POST"], endpoint="pao_assignments_upsert")
 @require_role("manager")
 def pao_assignments_upsert():
@@ -1940,34 +1974,80 @@ def pao_assignments_upsert():
         return jsonify(error="invalid bus_id"), 400
 
     try:
-        del_res = db.session.execute(
+        # Look up any existing rows for this date
+        by_user = db.session.execute(
             text("""
-                DELETE FROM pao_assignments
-                WHERE service_date = :d AND (user_id = :u OR bus_id = :b)
+                SELECT a.id, a.bus_id
+                FROM pao_assignments a
+                WHERE a.service_date = :d AND a.user_id = :u
+                LIMIT 1
             """),
-            {"d": day, "u": uid, "b": bid},
-        )
-        current_app.logger.info("[pao-assignments][POST] removed_conflicts=%s", getattr(del_res, "rowcount", None))
+            {"d": day, "u": uid},
+        ).mappings().first()
 
-        ins_res = db.session.execute(
+        by_bus = db.session.execute(
             text("""
-                INSERT INTO pao_assignments (user_id, bus_id, service_date)
-                VALUES (:u, :b, :d)
+                SELECT a.id, a.user_id
+                FROM pao_assignments a
+                WHERE a.service_date = :d AND a.bus_id = :b
+                LIMIT 1
             """),
-            {"u": uid, "b": bid, "d": day},
-        )
-        new_id = getattr(ins_res, "lastrowid", None)
+            {"d": day, "b": bid},
+        ).mappings().first()
 
-        db.session.commit()
-        current_app.logger.info(
-            "[pao-assignments][POST] OK user_id=%s bus_id=%s date=%s new_id=%s",
-            uid, bid, day.isoformat(), new_id
-        )
-        return jsonify(ok=True, id=new_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+        # Idempotent: same user already on this bus/date
+        if by_user and int(by_user["bus_id"]) == bid:
+            return jsonify(ok=True, id=int(by_user["id"]), user_id=uid, bus_id=bid, service_date=day.isoformat(), note="no change"), 200
+
+        # Upsert/replace semantics
+        with db.session.begin():
+            if by_user and not by_bus:
+                # Move user's assignment to this bus
+                db.session.execute(
+                    text("UPDATE pao_assignments SET bus_id = :b WHERE id = :id"),
+                    {"b": bid, "id": int(by_user["id"])},
+                )
+                res_id = int(by_user["id"])
+            elif by_bus and not by_user:
+                # Replace whoever is on this bus with this user
+                db.session.execute(
+                    text("UPDATE pao_assignments SET user_id = :u WHERE id = :id"),
+                    {"u": uid, "id": int(by_bus["id"])},
+                )
+                res_id = int(by_bus["id"])
+   
+            elif by_user and by_bus:
+                with db.session.begin():
+                    # 1) remove the user's existing same-day assignment FIRST
+                    if int(by_user["id"]) != int(by_bus["id"]):
+                        db.session.execute(
+                            text("DELETE FROM pao_assignments WHERE id = :id"),
+                            {"id": int(by_user["id"])},
+                        )
+                    # 2) move the user onto the target bus row
+                    db.session.execute(
+                        text("UPDATE pao_assignments SET user_id = :u WHERE id = :id"),
+                        {"u": uid, "id": int(by_bus["id"])},
+                    )
+                    res_id = int(by_bus["id"])
+
+            else:
+                # Nothing exists yet → insert new row
+                ins_res = db.session.execute(
+                    text("INSERT INTO pao_assignments (user_id, bus_id, service_date) VALUES (:u, :b, :d)"),
+                    {"u": uid, "b": bid, "d": day},
+                )
+                res_id = getattr(ins_res, "lastrowid", None)
+
+        current_app.logger.info("[pao-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
+                                res_id, uid, bid, day.isoformat())
+        return jsonify(ok=True, id=res_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("[manager] upsert_pao_assignment failed")
         return jsonify(error=str(e)), 500
+
 
 
 @manager_bp.route("/pao-assignments/<int:assignment_id>", methods=["DELETE"], endpoint="pao_assignments_delete")
@@ -2074,35 +2154,68 @@ def driver_assignments_upsert():
         return jsonify(error="invalid user_id"), 400
     if (u.role or "").lower() != "driver":
         return jsonify(error="user is not a driver"), 400
-
     if not Bus.query.get(bid):
         return jsonify(error="invalid bus_id"), 400
 
     try:
-        del_res = db.session.execute(
+        by_user = db.session.execute(
             text("""
-                DELETE FROM driver_assignments
-                WHERE service_date = :d AND (user_id = :u OR bus_id = :b)
+                SELECT a.id, a.bus_id
+                FROM driver_assignments a
+                WHERE a.service_date = :d AND a.user_id = :u
+                LIMIT 1
             """),
-            {"d": day, "u": uid, "b": bid},
-        )
-        current_app.logger.info("[driver-assignments][POST] removed_conflicts=%s", getattr(del_res, "rowcount", None))
+            {"d": day, "u": uid},
+        ).mappings().first()
 
-        ins_res = db.session.execute(
+        by_bus = db.session.execute(
             text("""
-                INSERT INTO driver_assignments (user_id, bus_id, service_date)
-                VALUES (:u, :b, :d)
+                SELECT a.id, a.user_id
+                FROM driver_assignments a
+                WHERE a.service_date = :d AND a.bus_id = :b
+                LIMIT 1
             """),
-            {"u": uid, "b": bid, "d": day},
-        )
-        new_id = getattr(ins_res, "lastrowid", None)
+            {"d": day, "b": bid},
+        ).mappings().first()
 
-        db.session.commit()
-        current_app.logger.info(
-            "[driver-assignments][POST] OK user_id=%s bus_id=%s date=%s new_id=%s",
-            uid, bid, day.isoformat(), new_id
-        )
-        return jsonify(ok=True, id=new_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+        if by_user and int(by_user["bus_id"]) == bid:
+            return jsonify(ok=True, id=int(by_user["id"]), user_id=uid, bus_id=bid, service_date=day.isoformat(), note="no change"), 200
+
+        with db.session.begin():
+            if by_user and not by_bus:
+                db.session.execute(
+                    text("UPDATE driver_assignments SET bus_id = :b WHERE id = :id"),
+                    {"b": bid, "id": int(by_user["id"])},
+                )
+                res_id = int(by_user["id"])
+            elif by_bus and not by_user:
+                db.session.execute(
+                    text("UPDATE driver_assignments SET user_id = :u WHERE id = :id"),
+                    {"u": uid, "id": int(by_bus["id"])},
+                )
+                res_id = int(by_bus["id"])
+            elif by_user and by_bus:
+                db.session.execute(
+                    text("UPDATE driver_assignments SET user_id = :u WHERE id = :id"),
+                    {"u": uid, "id": int(by_bus["id"])},
+                )
+                if int(by_user["id"]) != int(by_bus["id"]):
+                    db.session.execute(
+                        text("DELETE FROM driver_assignments WHERE id = :id"),
+                        {"id": int(by_user["id"])},
+                    )
+                res_id = int(by_bus["id"])
+            else:
+                ins_res = db.session.execute(
+                    text("INSERT INTO driver_assignments (user_id, bus_id, service_date) VALUES (:u, :b, :d)"),
+                    {"u": uid, "b": bid, "d": day},
+                )
+                res_id = getattr(ins_res, "lastrowid", None)
+
+        current_app.logger.info("[driver-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
+                                res_id, uid, bid, day.isoformat())
+        return jsonify(ok=True, id=res_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("[manager] upsert_driver_assignment failed")
@@ -2133,3 +2246,176 @@ def driver_assignments_delete(assignment_id: int):
         db.session.rollback()
         current_app.logger.exception("[driver-assignments][DELETE] failed id=%s", assignment_id)
         return jsonify(error="delete failed"), 500
+    
+
+
+
+# --- helpers reused for staff updates ---
+def _set_password_dirty(u, raw: str | None):
+    from werkzeug.security import generate_password_hash
+    if not raw:
+        return
+    if hasattr(u, "set_password") and callable(getattr(u, "set_password")):
+        u.set_password(raw)  # type: ignore[attr-defined]
+    elif hasattr(u, "password_hash"):
+        setattr(u, "password_hash", generate_password_hash(raw))
+
+def _ensure_unique_username_phone(un: str | None, ph: str | None, *, exclude_id: int | None = None) -> str | None:
+    if un:
+      q = User.query.filter(User.username == un)
+      if exclude_id:
+          q = q.filter(User.id != exclude_id)
+      if q.first():
+          return "username already in use"
+    if ph:
+      q = User.query.filter(User.phone_number == ph)
+      if exclude_id:
+          q = q.filter(User.id != exclude_id)
+      if q.first():
+          return "phone number already in use"
+    return None
+
+@manager_bp.route("/staff/<int:user_id>", methods=["GET"])
+@require_role("manager")
+def get_staff(user_id: int):
+    u = User.query.get(user_id)
+    if not u or (u.role or "").lower() not in {"pao","driver"}:
+        return jsonify(error="staff not found"), 404
+    return jsonify({
+        "id": int(u.id),
+        "first_name": u.first_name or "",
+        "last_name": u.last_name or "",
+        "username": u.username or "",
+        "phone_number": u.phone_number,
+        "role": (u.role or "").lower() or None,
+        "name": f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or u.username,
+    }), 200
+
+@manager_bp.route("/staff", methods=["DELETE"])
+@require_role("manager")
+def bulk_delete_staff():
+    """
+    Body: { "ids": [1,2,3] }
+    """
+    data = request.get_json(silent=True) or {}
+    ids = [int(i) for i in (data.get("ids") or []) if str(i).isdigit()]
+    if not ids:
+        return jsonify(error="ids required"), 400
+    try:
+        # only staff roles
+        rows = User.query.filter(User.id.in_(ids), User.role.in_(["pao","driver"])).all()
+        for u in rows:
+            db.session.delete(u)
+        db.session.commit()
+        return jsonify(ok=True, deleted=len(rows)), 200
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify(error="one or more records are in use"), 409
+    except Exception as e:
+        db.session.rollback()
+        return jsonify(error=str(e)), 500
+
+# helper: consistent payload
+def _staff_payload(u):
+    return {
+        "id": int(u.id),
+        "first_name": u.first_name,
+        "last_name": u.last_name,
+        "username": u.username,
+        "phone_number": getattr(u, "phone_number", None),
+        "role": (u.role or "").lower(),
+    }
+
+def _set_password_for_user(u, raw: str | None):
+    if not raw:
+        return
+    if hasattr(u, "set_password") and callable(getattr(u, "set_password")):
+        u.set_password(raw)  # type: ignore[attr-defined]
+    elif hasattr(u, "password_hash"):
+        setattr(u, "password_hash", generate_password_hash(raw))
+
+
+
+@manager_bp.route("/staff/<int:user_id>", methods=["PATCH"])
+@require_role("manager")
+def update_staff(user_id: int):
+    data = request.get_json(silent=True) or {}
+
+    u = User.query.filter(User.id == user_id, User.role.in_(("pao","driver"))).first()
+    if not u:
+        return jsonify(error="staff not found"), 404
+
+    # fields
+    new_role  = (data.get("role") or "").strip().lower() or None
+    first     = (data.get("first_name") or "").strip() or None
+    last      = (data.get("last_name") or "").strip() or None
+    username  = (data.get("username") or "").strip() or None
+    phone     = (data.get("phone_number") or "").strip() or None
+    password  = (data.get("password") or "").strip() or None
+
+    # validations
+    if new_role and new_role not in {"pao","driver"}:
+        return jsonify(error="invalid role"), 400
+    if username:
+        clash = User.query.filter(User.username == username, User.id != user_id).first()
+        if clash:
+            return jsonify(error="username already in use"), 409
+    if phone:
+        clash = User.query.filter(User.phone_number == phone, User.id != user_id).first()
+        if clash:
+            return jsonify(error="phone number already in use"), 409
+
+    # apply
+    if new_role:   u.role = new_role
+    if first is not None: u.first_name = first
+    if last  is not None: u.last_name  = last
+    if username is not None: u.username = username
+    if phone is not None:    u.phone_number = phone or None
+    if password: _set_password_for_user(u, password)
+
+    try:
+        db.session.commit()
+        return jsonify(_staff_payload(u)), 200
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("[manager] update_staff failed")
+        return jsonify(error=str(e)), 500
+
+@manager_bp.route("/staff/<int:user_id>", methods=["DELETE"])
+@require_role("manager")
+def delete_staff(user_id: int):
+    u = User.query.filter(User.id == user_id, User.role.in_(("pao","driver"))).first()
+    if not u:
+        return jsonify(error="staff not found"), 404
+
+    # prefer soft-delete if users.active column exists (or deleted_at)
+    soft = request.args.get("soft", "1").strip().lower() in {"1","true","yes"}
+    try:
+        if soft and table_has_column("users", "active"):
+            u.active = False  # type: ignore[attr-defined]
+            if table_has_column("users", "deleted_at"):
+                setattr(u, "deleted_at", datetime.utcnow())
+            db.session.commit()
+            return jsonify(ok=True, soft=True), 200
+
+        # hard delete
+        db.session.delete(u)
+        db.session.commit()
+        return jsonify(ok=True, soft=False), 200
+    except IntegrityError:
+        db.session.rollback()
+        # fall back to soft if possible
+        if table_has_column("users", "active"):
+            try:
+                u.active = False  # type: ignore[attr-defined]
+                if table_has_column("users", "deleted_at"):
+                    setattr(u, "deleted_at", datetime.utcnow())
+                db.session.commit()
+                return jsonify(ok=True, soft=True, note="references exist; performed soft delete"), 200
+            except Exception:
+                db.session.rollback()
+        return jsonify(error="cannot delete: referenced by other records; try soft=1"), 409
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("[manager] delete_staff failed")
+        return jsonify(error=str(e)), 500
