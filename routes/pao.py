@@ -1775,51 +1775,38 @@ def _ann_json(ann: Announcement) -> dict:
 @pao_bp.route("/broadcast", methods=["POST"])
 @require_role("pao")
 def broadcast():
-    """
-    Create a new announcement authored by the current PAO.
-
-    Accepts optional scheduling:
-      - date: "YYYY-MM-DD"  -> post with timestamp falling on that Manila-local day
-      - when: "tomorrow"    -> convenience alias for date = (today+1)
-      - when: "today"       -> same as now (default)
-
-    Emits realtime events on Socket.IO namespace "/rt":
-      - "announcement:new" and "announcement:created"
-    """
-    bus_id = _current_bus_id()
-    if not bus_id:
-        return jsonify(error="PAO has no assigned bus"), 400
-
+    # payload
     data = request.get_json(silent=True) or {}
     message = (data.get("message") or "").strip()
     if not message:
         return jsonify(error="message is required"), 400
 
-    # --- NEW: schedule target timestamp (Asia/Manila aware) ---
-    target_ts = None
+    # figure out service day (Manila)
+    svc_day = dt.datetime.now(_MNL).date()
     raw_date = (data.get("date") or "").strip()
     when     = (data.get("when") or data.get("for") or "").strip().lower()
-
     try:
         if raw_date:
-            # explicit YYYY-MM-DD
-            day_local = dt.datetime.strptime(raw_date, "%Y-%m-%d").date()
-            target_ts = _utc_from_local_date(day_local)
+            svc_day = dt.datetime.strptime(raw_date, "%Y-%m-%d").date()
         elif when in {"tomorrow", "next"}:
-            day_local = (dt.datetime.now(_MNL) + dt.timedelta(days=1)).date()
-            target_ts = _utc_from_local_date(day_local)
-        # else: None -> DB default (now) keeps today
+            svc_day = (dt.datetime.now(_MNL) + dt.timedelta(days=1)).date()
     except ValueError:
         return jsonify(error="invalid date (use YYYY-MM-DD)"), 400
 
+    # resolve bus **for that day**, fall back to user's static assignment
+    bus_id = _bus_for_pao_on(svc_day, int(g.user.id)) or getattr(g.user, "assigned_bus_id", None)
+    if not bus_id:
+        return jsonify(error=f"PAO has no assigned bus for {svc_day.isoformat()}"), 400
+
+    # put the announcement timestamp on the chosen Manila-local day
+    target_ts = _utc_from_local_date(svc_day)
+
     try:
         ann = Announcement(message=message, created_by=g.user.id)
-        if target_ts is not None:
-            ann.timestamp = target_ts  # schedule into the chosen Manila-local day
+        ann.timestamp = target_ts
         db.session.add(ann)
         db.session.commit()
 
-        # Build output WITHOUT extra queries
         author_name = f"{(g.user.first_name or '').strip()} {(g.user.last_name or '').strip()}".strip() or (getattr(g.user, "username", "") or "")
         out = {
             "id": ann.id,
@@ -1830,18 +1817,15 @@ def broadcast():
             "bus": _bus_identifier_str(bus_id),
         }
 
-        try:
-            _emit_announcement("announcement:new", out)
-            _emit_announcement("announcement:created", out)
-        except Exception:
-            current_app.logger.exception("[socketio] failed to emit announcement:new/created")
-
+        _emit_announcement("announcement:new", out)
+        _emit_announcement("announcement:created", out)
         return jsonify(out), 201
 
     except Exception:
         db.session.rollback()
         current_app.logger.exception("broadcast failed")
         return jsonify(error="internal server error"), 500
+
 
 
 @pao_bp.route("/broadcast", methods=["GET"])
