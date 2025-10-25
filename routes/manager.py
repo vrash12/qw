@@ -2043,7 +2043,6 @@ def driver_assignments_get():
     current_app.logger.info("[driver-assignments][GET] rows=%d", len(out))
     return jsonify(out), 200
 
-
 @manager_bp.route("/driver-assignments", methods=["POST"], endpoint="driver_assignments_upsert")
 @require_role("manager")
 def driver_assignments_upsert():
@@ -2098,13 +2097,21 @@ def driver_assignments_upsert():
             {"d": day, "b": bid},
         ).mappings().first()
 
+        # If the user is already assigned to this bus for the day, nothing to change.
         if by_user and int(by_user["bus_id"]) == bid:
-            return jsonify(ok=True, id=int(by_user["id"]), user_id=uid, bus_id=bid,
-                           service_date=day.isoformat(), note="no change"), 200
+            return jsonify(
+                ok=True,
+                id=int(by_user["id"]),
+                user_id=uid,
+                bus_id=bid,
+                service_date=day.isoformat(),
+                note="no change",
+            ), 200
 
-        # 🔧 nested txn to avoid "already begun" error
+        # Use a nested transaction so we can safely order statements to satisfy unique constraints.
         with db.session.begin_nested():
             if by_user and not by_bus:
+                # Move the existing user-day row onto the target bus.
                 db.session.execute(
                     text("UPDATE driver_assignments SET bus_id = :b WHERE id = :id"),
                     {"b": bid, "id": int(by_user["id"])},
@@ -2112,6 +2119,7 @@ def driver_assignments_upsert():
                 res_id = int(by_user["id"])
 
             elif by_bus and not by_user:
+                # Fill the bus-day row with this user.
                 db.session.execute(
                     text("UPDATE driver_assignments SET user_id = :u WHERE id = :id"),
                     {"u": uid, "id": int(by_bus["id"])},
@@ -2119,18 +2127,22 @@ def driver_assignments_upsert():
                 res_id = int(by_bus["id"])
 
             elif by_user and by_bus:
-                db.session.execute(
-                    text("UPDATE driver_assignments SET user_id = :u WHERE id = :id"),
-                    {"u": uid, "id": int(by_bus["id"])},
-                )
+                # Both a user-day row and a bus-day row exist.
+                # IMPORTANT: Delete the user-day row FIRST to avoid a temporary duplicate
+                # (user_id, service_date) when updating the bus-day row.
                 if int(by_user["id"]) != int(by_bus["id"]):
                     db.session.execute(
                         text("DELETE FROM driver_assignments WHERE id = :id"),
                         {"id": int(by_user["id"])},
                     )
+                db.session.execute(
+                    text("UPDATE driver_assignments SET user_id = :u WHERE id = :id"),
+                    {"u": uid, "id": int(by_bus["id"])},
+                )
                 res_id = int(by_bus["id"])
 
             else:
+                # No row for user-day or bus-day; insert fresh.
                 ins_res = db.session.execute(
                     text("INSERT INTO driver_assignments (user_id, bus_id, service_date) VALUES (:u, :b, :d)"),
                     {"u": uid, "b": bid, "d": day},
@@ -2138,14 +2150,17 @@ def driver_assignments_upsert():
                 res_id = getattr(ins_res, "lastrowid", None)
 
         db.session.commit()
-        current_app.logger.info("[driver-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
-                                res_id, uid, bid, day.isoformat())
+        current_app.logger.info(
+            "[driver-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
+            res_id, uid, bid, day.isoformat()
+        )
         return jsonify(ok=True, id=res_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
 
     except Exception as e:
         db.session.rollback()
         current_app.logger.exception("[manager] upsert_driver_assignment failed")
         return jsonify(error=str(e)), 500
+
 
 
 @manager_bp.route("/driver-assignments/<int:assignment_id>", methods=["DELETE"], endpoint="driver_assignments_delete")
