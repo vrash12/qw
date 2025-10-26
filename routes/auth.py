@@ -21,6 +21,22 @@ __all__ = ["auth_bp", "require_role"]
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
+
+def _bus_for_pao_on(user_id: int, day) -> int | None:
+    bus_id = db.session.execute(
+        text("""
+            SELECT bus_id
+            FROM pao_assignments
+            WHERE user_id = :uid AND service_date = :d
+            LIMIT 1
+        """),
+        {"uid": int(user_id), "d": day},
+    ).scalar()
+    current_app.logger.info("[auth] lookup pao uid=%s day=%s → bus_id=%r", user_id, day, bus_id)
+    return int(bus_id) if bus_id is not None else None
+
+
+
 @auth_bp.after_request
 def add_perf_headers(resp):
     resp.headers["Connection"] = "keep-alive"
@@ -43,25 +59,71 @@ def _as_bool(x, default=False) -> bool:
     s = str(x).strip().lower()
     return s in {"1", "true", "yes", "on"}
 
-
 def _today_bus_for_pao(user_id: int) -> int | None:
-    """
-    Look up the bus assigned to this PAO for today's Manila date.
-    Returns the bus_id or None.
-    """
     day = datetime.now(MNL_TZ).date()
     bus_id = db.session.execute(
-        text(
-            """
+        text("""
             SELECT bus_id
             FROM pao_assignments
-            WHERE user_id = :uid AND service_date = :d
+            WHERE user_id = :uid AND DATE(service_date) = :d
             LIMIT 1
-            """
-        ),
+        """),
         {"uid": int(user_id), "d": day},
     ).scalar()
     return int(bus_id) if bus_id is not None else None
+
+def _debug_dump_pao_state(user_id: int, day):
+    """
+    Logs what's in pao_assignments for this PAO and date,
+    and how many total rows exist for that day. Works for DATE or DATETIME columns.
+    """
+    try:
+        # 1) exact user + day
+        row = db.session.execute(
+            text("""
+                SELECT a.id, a.user_id, a.bus_id,
+                       CAST(a.service_date AS CHAR) AS service_date_txt
+                FROM pao_assignments a
+                WHERE a.user_id=:uid AND DATE(a.service_date)=:d
+                ORDER BY a.id DESC
+                LIMIT 1
+            """),
+            {"uid": int(user_id), "d": day}
+        ).mappings().first()
+
+        # 2) what buses have PAOs that day (handy sanity check)
+        day_rows = db.session.execute(
+            text("""
+                SELECT a.id, a.user_id, a.bus_id,
+                       CAST(a.service_date AS CHAR) AS service_date_txt
+                FROM pao_assignments a
+                WHERE DATE(a.service_date)=:d
+                ORDER BY a.bus_id
+            """),
+            {"d": day}
+        ).mappings().all()
+
+        # 3) optional: show nearest assignment for that user (±1 day)
+        near = db.session.execute(
+            text("""
+                SELECT a.id, a.bus_id,
+                       CAST(a.service_date AS CHAR) AS service_date_txt
+                FROM pao_assignments a
+                WHERE a.user_id=:uid
+                ORDER BY ABS(DATEDIFF(DATE(a.service_date), :d)) ASC
+                LIMIT 3
+            """),
+            {"uid": int(user_id), "d": day}
+        ).mappings().all()
+
+        current_app.logger.info(
+            "[pao:debug] uid=%s check_day=%s user_day_row=%s day_rows=%s near=%s",
+            user_id, day, (dict(row) if row else None),
+            [dict(r) for r in day_rows],
+            [dict(n) for n in near],
+        )
+    except Exception:
+        current_app.logger.exception("[pao:debug] dump failed")
 
 
 @auth_bp.route("/me", methods=["GET"])
@@ -127,7 +189,6 @@ def signup():
 
     return jsonify(message="User registered successfully"), 201
 
-
 @auth_bp.route("/login", methods=["POST"])
 def login():
     data = request.get_json() or {}
@@ -138,21 +199,15 @@ def login():
         return (
             User.query.options(
                 load_only(
-                    User.id,
-                    User.username,
-                    User.role,
-                    User.first_name,
-                    User.last_name,
-                    User.assigned_bus_id,
-                    User.password_hash,
-                    User.phone_number,
+                    User.id, User.username, User.role, User.first_name, User.last_name,
+                    User.assigned_bus_id, User.password_hash, User.phone_number,
                 )
             )
             .filter_by(username=data["username"])
             .first()
         )
 
-    # Attempt retrieval (with a one-time retry on dropped connections)
+    # one-time retry if connection dropped
     try:
         user = _get_user()
     except OperationalError as e:
@@ -161,41 +216,20 @@ def login():
         db.engine.dispose()
         user = _get_user()
 
-    password_ok = bool(user and user.check_password(data["password"]))
-    if not (user and password_ok):
+    if not (user and user.check_password(data["password"])):  # noqa: SIM103
         return jsonify(error="Invalid username or password"), 401
 
-    # 🚫 Gate PAO login by roster for Manila's current day (configurable)
-    # Default: True (block if not assigned)
-    require_sched = _as_bool(
-        current_app.config.get(
-            "REQUIRE_SCHEDULE_FOR_PAO_LOGIN",
-            os.environ.get("REQUIRE_SCHEDULE_FOR_PAO_LOGIN", "1"),
-        ),
-        True,
-    )
     role_lower = (user.role or "").lower()
-    todays_bus: int | None = None
-    if role_lower == "pao":
-        todays_bus = _today_bus_for_pao(user.id)
-        if require_sched and todays_bus is None:
-            return jsonify(
-                error="PAO is not scheduled today",
-                code="NOT_ASSIGNED_TODAY",
-            ), 403
+    legacy_bus = int(getattr(user, "assigned_bus_id", None) or 0) or None
 
+    # issue JWT (24h)
     token = jwt.encode(
-        {
-            "user_id": user.id,
-            "username": user.username,
-            "role": user.role,
-            "exp": datetime.utcnow() + timedelta(hours=24),
-        },
-        SECRET_KEY,
-        algorithm="HS256",
+        {"user_id": user.id, "username": user.username, "role": user.role,
+         "exp": datetime.utcnow() + timedelta(hours=24)},
+        SECRET_KEY, algorithm="HS256"
     )
 
-    # Optional: inline push token registration
+    # optional push token registration
     expo_token = (data.get("expoPushToken") or "").strip()
     platform = (data.get("platform") or "").strip()
     if expo_token:
@@ -203,23 +237,25 @@ def login():
         if rec:
             changed = False
             if rec.user_id != user.id:
-                rec.user_id = user.id
-                changed = True
+                rec.user_id = user.id; changed = True
             if platform and rec.platform != platform:
-                rec.platform = platform
-                changed = True
+                rec.platform = platform; changed = True
             if changed:
                 db.session.commit()
         else:
             db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
             db.session.commit()
 
+    # For PAO (and you can also read this for Driver on the app), use assigned_bus_id.
+    bus_id = legacy_bus if role_lower in {"pao", "driver"} else None
+
+    # Keep field names for backward-compat: busSource stays "legacy"
     return jsonify(
         message="Login successful",
         token=token,
         role=user.role,
-        # Prefer today's PAO assignment; legacy clients can still ignore this.
-        busId=(todays_bus if todays_bus is not None else None),
+        busId=bus_id,
+        busSource=("legacy" if bus_id is not None else "none"),
         user={
             "id": user.id,
             "username": user.username,

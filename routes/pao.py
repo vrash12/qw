@@ -104,21 +104,27 @@ def _utc_from_local_date(day: dt.date, *, at_time: Optional[dt.time] = None) -> 
 def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
-# ------------------------------------------------------------------------------
-# PAO assignment helpers
-# ------------------------------------------------------------------------------
 def _today_bus_for_pao(user_id: int) -> Optional[int]:
-    day = dt.datetime.now(_MNL).date()
     bus_id = db.session.execute(
         text("""
-          SELECT bus_id
-          FROM pao_assignments
-          WHERE user_id = :uid AND service_date = :d
-          LIMIT 1
+            SELECT bus_id
+            FROM pao_assignments
+            WHERE user_id = :uid
+              AND service_date = DATE(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'))
+            LIMIT 1
         """),
-        {"uid": int(user_id), "d": day},
+        {"uid": int(user_id)},
     ).scalar()
+
+    # DEBUG: print computed Manila date and result
+    mnl = db.session.execute(
+        text("SELECT DATE(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'))")
+    ).scalar()
+    current_app.logger.info("[today_bus] uid=%s mnl=%s bus_id=%s", user_id, mnl, bus_id)
+
     return int(bus_id) if bus_id is not None else None
+
+
 
 def _bus_for_pao_on(day: dt.date, user_id: int) -> Optional[int]:
     bus_id = db.session.execute(
@@ -472,15 +478,16 @@ def _charge_wallet_pesos(user_id: int, pesos: int, ref_ticket_id: Optional[int] 
     )
     return True
 
-# ------------------------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------------------------
-
 @pao_bp.route("/me", methods=["GET"])
 @require_role("pao")
 def pao_me():
     u = g.user
-    bus_id = _current_bus_id()
+    bus_id = _today_bus_for_pao(u.id)
+    source = "assignment"
+    if not bus_id:
+        bus_id = getattr(u, "assigned_bus_id", None)
+        source = "legacy" if bus_id else "none"
+
     bus = Bus.query.get(bus_id) if bus_id else None
     name = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or u.username
 
@@ -489,7 +496,9 @@ def pao_me():
         "name": name,
         "role": "pao",
         "bus": ({"id": bus.id, "identifier": bus.identifier} if bus else None),
+        "bus_source": source,          # <— add this for easy debugging
     }), 200
+
 
 @pao_bp.route("/users/scan", methods=["GET"])
 @require_role("pao")
@@ -1804,6 +1813,9 @@ def broadcast():
     try:
         ann = Announcement(message=message, created_by=g.user.id)
         ann.timestamp = target_ts
+        ann.bus_id = int(bus_id)  # persist the bus used
+
+        ann.timestamp = target_ts
         db.session.add(ann)
         db.session.commit()
 
@@ -1912,13 +1924,10 @@ def list_broadcasts():
         #  - when all_dates=1, derive per-announcement day from its timestamp (Manila-local)
         #  - otherwise use the single requested day_local
         svc_day: dt.date
-        if all_dates:
-            try:
-                svc_day = _as_mnl(ann.timestamp).date()  # type: ignore[arg-type]
-            except Exception:
-                svc_day = dt.datetime.now(_MNL).date()
-        else:
-            svc_day = day_local  # type: ignore[assignment]
+        try:
+            svc_day = _as_mnl(ann.timestamp).date()
+        except Exception:
+            svc_day = day_local
 
         # Prefer the day assignment (pao_assignments) over static assigned_bus_id
         day_bus_id = _bus_for_pao_on(svc_day, int(author_id))

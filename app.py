@@ -8,6 +8,8 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_cors import CORS
 from sqlalchemy import event, func, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.pool import Pool
 
 from config import Config
 from db import db, migrate
@@ -39,6 +41,30 @@ except Exception:
     _start_mqtt_ingest = None
 
 
+# ───────────────────────────────────────────────────────────────
+# GLOBAL DB TZ ENFORCEMENT (applies to all SQLAlchemy engines)
+# ───────────────────────────────────────────────────────────────
+def _apply_mnl_tz(dbapi_conn):
+    """Force session time zone to Manila (+08:00) on every connection/checkout."""
+    cur = dbapi_conn.cursor()
+    try:
+        # Use offset form so MySQL time zone tables aren't required
+        cur.execute("SET time_zone = '+08:00'")
+    finally:
+        cur.close()
+
+
+@event.listens_for(Engine, "connect")
+def _on_connect(dbapi_conn, _):
+    _apply_mnl_tz(dbapi_conn)
+
+
+@event.listens_for(Pool, "checkout")
+def _on_checkout(dbapi_conn, *_):
+    # Ensures setting sticks for reused pooled connections
+    _apply_mnl_tz(dbapi_conn)
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
 
@@ -51,22 +77,28 @@ def create_app() -> Flask:
 
     # Load config + init extensions
     app.config.from_object(Config)
+
+    # Extra safety: ask driver to run the same TZ command at connect time
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "connect_args": {"init_command": "SET time_zone = '+08:00'"},
+        "pool_pre_ping": True,
+    }
+
     db.init_app(app)
     migrate.init_app(app, db)
     socketio.init_app(app, cors_allowed_origins="*")
 
-    # DB connection tweaks (set timezone to Asia/Manila, a.k.a. +08:00)
+    # App context for startup work
     with app.app_context():
-        @event.listens_for(db.engine, "connect")
-        def _set_manila_timezone(dbapi_conn, _):
-            cur = dbapi_conn.cursor()
-            try:
-                cur.execute("SET time_zone = '+08:00'")
-            finally:
-                cur.close()
-
         # Touch models so Alembic/Flask-Migrate registers them
         _ = (User, Bus, TicketSale, WalletAccount, WalletLedger, TopUp)
+
+        # Sanity log: confirm session time zone is +08:00
+        try:
+            tz = db.session.execute(text("SELECT @@session.time_zone")).scalar()
+            app.logger.info("[app] MySQL @@session.time_zone=%s", tz)
+        except Exception:
+            app.logger.exception("[app] Failed to check @@session.time_zone")
 
         # ───────────────────────────────────────────────────────────────
         # MQTT INGEST START + PATCHES (so "2" works the same as "bus-02")
