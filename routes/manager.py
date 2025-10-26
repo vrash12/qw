@@ -88,61 +88,6 @@ UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 manager_bp = Blueprint("manager", __name__, url_prefix="/manager")
-@manager_bp.route("/pao-assignments/me/today", methods=["GET"])
-@require_role("pao", "manager")
-def my_pao_bus_today():
-    # Manila “today”
-    try:
-        db.session.execute(text("SET time_zone = '+08:00'"))
-    except Exception:
-        pass
-    day = datetime.now(MNL_TZ).date()
-
-    # who are we checking?
-    target_uid = request.args.get("user_id", type=int)
-    if not target_uid and getattr(g, "user", None):
-        target_uid = int(g.user.id)
-
-    # lookup by assignment first
-    row = db.session.execute(
-        text("""
-            SELECT a.id AS assign_id, a.bus_id, b.identifier
-            FROM pao_assignments a
-            LEFT JOIN buses b ON b.id = a.bus_id
-            WHERE a.service_date = :d AND a.user_id = :u
-            LIMIT 1
-        """),
-        {"d": day, "u": target_uid}
-    ).mappings().first()
-
-    # fallback to users.assigned_bus_id
-    fallback = db.session.execute(
-        text("SELECT assigned_bus_id FROM users WHERE id=:u"), {"u": target_uid}
-    ).mappings().first()
-
-    current_app.logger.info(
-        "[today_bus] uid=%s date=%s assignment=%s fallback_assigned_bus=%s",
-        target_uid, day.isoformat(),
-        (dict(row) if row else None),
-        (fallback and fallback.get("assigned_bus_id"))
-    )
-
-    if row:
-        return jsonify(
-            date=day.isoformat(),
-            user_id=target_uid,
-            bus_id=int(row["bus_id"]),
-            bus=row["identifier"],
-            assignment_id=int(row["assign_id"]),
-            source="pao_assignments"
-        ), 200
-
-    return jsonify(
-        date=day.isoformat(),
-        user_id=target_uid,
-        bus_id=(fallback and fallback.get("assigned_bus_id")),
-        source="users.assigned_bus_id"
-    ), 200
 
 # Optional realtime publish (best-effort / no-op if module missing)
 try:
@@ -208,7 +153,49 @@ def _publish_user_wallet(uid: int, *, new_balance_pesos: int, event: str, **extr
         current_app.logger.info("[mqtt] wallet → %s ok=%s", topic, ok)
     return ok
 
+@manager_bp.route("/staff", methods=["GET"])
+@require_role("manager")
+def list_staff():
+    """
+    List staff. Optional query:
+      - role=pao|driver
+      - q=<search>
+    Returns: [ { id, name, username, role } ]
+    """
+    role = (request.args.get("role") or "").strip().lower()
+    q = (request.args.get("q") or "").strip()
+    valid = {"pao", "driver"}
 
+    base = User.query
+    if role:
+        if role not in valid:
+            return jsonify(error="invalid role"), 400
+        base = base.filter(User.role == role)
+    else:
+        base = base.filter(User.role.in_(valid))
+
+    if q:
+        like = f"%{q}%"
+        base = base.filter(
+            or_(
+                User.first_name.ilike(like),
+                User.last_name.ilike(like),
+                User.username.ilike(like),
+                User.phone_number.ilike(like),
+            )
+        )
+
+    rows = base.order_by(User.last_name.asc(), User.first_name.asc()).all()
+    out = [
+        {
+            "id": u.id,
+            "name": f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or u.username,
+            "username": u.username,
+            "role": u.role,
+        }
+        for u in rows
+    ]
+    return jsonify(out), 200
 
 def _set_password_for_user(u: User, raw: str | None):
     """Set a user's password using model's set_password or a werkzeug hash field."""
@@ -1881,7 +1868,392 @@ def list_fare_segments():
         200,
     )
 
-# --- helpers reused for staff updates ---
+# ──────────────── PAO: upsert ────────────────
+@manager_bp.route("/pao-assignments", methods=["POST"], endpoint="pao_assignments_upsert")
+@require_role("manager")
+def pao_assignments_upsert():
+    """
+    Upsert a PAO assignment for a given service_date.
+    Body: { "user_id": <int>, "bus_id": <int>, "service_date": "YYYY-MM-DD" }
+    Rules:
+      - a PAO can appear only once per day across all buses
+      - a bus can have at most one PAO for the day
+    Idempotent when the same (user_id, bus_id, date) is already set.
+    Also mirrors the assignment to users.assigned_bus_id (best-effort).
+    """
+    MNL = _tz(_td(hours=8))
+
+    data = request.get_json(silent=True) or {}
+    uid = int(data.get("user_id") or 0)
+    bid = int(data.get("bus_id") or 0)
+    day_str = (data.get("service_date") or _dt.now(MNL).date().isoformat()).strip()
+
+    current_app.logger.info(
+        "[pao-assignments][POST] caller uid=%s role=%s payload={user_id=%s, bus_id=%s, service_date=%s}",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        uid, bid, day_str
+    )
+
+    if not (uid and bid):
+        return jsonify(error="user_id and bus_id are required"), 400
+    try:
+        day = _dt.strptime(day_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify(error="invalid service_date"), 400
+
+    u = User.query.get(uid)
+    if not u:
+        return jsonify(error="invalid user_id"), 400
+    if (u.role or "").lower() != "pao":
+        return jsonify(error="user is not a pao"), 400
+    if not Bus.query.get(bid):
+        return jsonify(error="invalid bus_id"), 400
+
+    try:
+        # Find existing rows that would conflict (user-per-day, bus-per-day)
+        by_user = db.session.execute(
+            text("""
+                SELECT a.id, a.bus_id
+                FROM pao_assignments a
+                WHERE a.service_date = :d AND a.user_id = :u
+                LIMIT 1
+            """),
+            {"d": day, "u": uid},
+        ).mappings().first()
+
+        by_bus = db.session.execute(
+            text("""
+                SELECT a.id, a.user_id
+                FROM pao_assignments a
+                WHERE a.service_date = :d AND a.bus_id = :b
+                LIMIT 1
+            """),
+            {"d": day, "b": bid},
+        ).mappings().first()
+
+        # Idempotent no-op
+        if by_user and int(by_user["bus_id"]) == bid:
+            return jsonify(
+                ok=True,
+                id=int(by_user["id"]),
+                user_id=uid,
+                bus_id=bid,
+                service_date=day.isoformat(),
+                note="no change",
+            ), 200
+
+        # Carefully reorder writes to avoid transient unique collisions:
+        # - If both exist and are different rows, delete user-day row first then
+        #   update the bus-day row to point to the new user.
+        with db.session.begin_nested():
+            if by_user and not by_bus:
+                db.session.execute(
+                    text("UPDATE pao_assignments SET bus_id = :b WHERE id = :id"),
+                    {"b": bid, "id": int(by_user["id"])},
+                )
+                res_id = int(by_user["id"])
+
+            elif by_bus and not by_user:
+                db.session.execute(
+                    text("UPDATE pao_assignments SET user_id = :u WHERE id = :id"),
+                    {"u": uid, "id": int(by_bus["id"])},
+                )
+                res_id = int(by_bus["id"])
+
+            elif by_user and by_bus:
+                if int(by_user["id"]) != int(by_bus["id"]):
+                    db.session.execute(
+                        text("DELETE FROM pao_assignments WHERE id = :id"),
+                        {"id": int(by_user["id"])},
+                    )
+                db.session.execute(
+                    text("UPDATE pao_assignments SET user_id = :u WHERE id = :id"),
+                    {"u": uid, "id": int(by_bus["id"])},
+                )
+                res_id = int(by_bus["id"])
+
+            else:
+                ins_res = db.session.execute(
+                    text("INSERT INTO pao_assignments (user_id, bus_id, service_date) VALUES (:u, :b, :d)"),
+                    {"u": uid, "b": bid, "d": day},
+                )
+                res_id = getattr(ins_res, "lastrowid", None)
+
+        db.session.commit()
+
+        # Optional: mirror to users.assigned_bus_id so the change is visible on the user row.
+        try:
+            # If we replaced a different PAO on this bus, clear their mirror
+            if by_bus and by_bus.get("user_id") and int(by_bus["user_id"]) != uid:
+                db.session.execute(
+                    text("UPDATE users SET assigned_bus_id = NULL WHERE id = :old"),
+                    {"old": int(by_bus["user_id"])},
+                )
+            db.session.execute(
+                text("UPDATE users SET assigned_bus_id = :b WHERE id = :u"),
+                {"b": bid, "u": uid},
+            )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            current_app.logger.warning("[pao-assignments] mirror to users.assigned_bus_id failed", exc_info=True)
+
+        current_app.logger.info(
+            "[pao-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
+            res_id, uid, bid, day.isoformat()
+        )
+        return jsonify(ok=True, id=res_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("[manager] upsert_pao_assignment failed")
+        return jsonify(error=str(e)), 500
+
+
+@manager_bp.route("/pao-assignments", methods=["GET"], endpoint="pao_assignments_get")
+@require_role("manager", "pao")  # allow PAO & Manager to call
+def pao_assignments_get():
+    """
+    GET /manager/pao-assignments?date=YYYY-MM-DD
+    Defaults to "today" in Manila if date is omitted.
+    Returns: [
+      { id, service_date, bus_id, bus, user_id, pao_name }, ...
+    ]
+    """
+    MNL = _tz(_td(hours=8))
+
+    date_str = (request.args.get("date") or _dt.now(MNL).date().isoformat()).strip()
+    try:
+        day = _dt.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        current_app.logger.info("[pao-assignments][GET] invalid date=%r", date_str)
+        return jsonify(error="invalid date format"), 400
+
+    current_app.logger.info(
+        "[pao-assignments][GET] caller uid=%s role=%s date=%s",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        day.isoformat(),
+    )
+
+    # include username for robust display fallback
+    rows = db.session.execute(
+        text("""
+            SELECT a.id, a.user_id, a.bus_id, a.service_date,
+                   u.first_name AS uf, u.last_name AS ul, u.username AS un,
+                   b.identifier AS bus
+            FROM pao_assignments a
+            LEFT JOIN users u ON u.id = a.user_id
+            LEFT JOIN buses b ON b.id = a.bus_id
+            WHERE a.service_date = :d
+            ORDER BY b.identifier
+        """),
+        {"d": day},
+    ).mappings().all()
+
+    out = []
+    for r in rows:
+        first = (r.get("uf") or "").strip()
+        last  = (r.get("ul") or "").strip()
+        user  = (r.get("un") or "").strip()
+        name  = (f"{first} {last}".strip() or user or None)
+        out.append({
+            "id": int(r["id"]),
+            "service_date": day.isoformat(),
+            "bus_id": int(r["bus_id"]),
+            "bus": r["bus"],
+            "user_id": int(r["user_id"]),
+            "pao_name": name,
+        })
+    current_app.logger.info("[pao-assignments][GET] rows=%d", len(out))
+    return jsonify(out), 200
+
+
+@manager_bp.route("/driver-assignments", methods=["GET"], endpoint="driver_assignments_get")
+@require_role("manager")
+def driver_assignments_get():
+    MNL = _tz(_td(hours=8))
+
+    date_str = (request.args.get("date") or _dt.now(MNL).date().isoformat()).strip()
+    try:
+        day = _dt.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        current_app.logger.info("[driver-assignments][GET] invalid date=%r", date_str)
+        return jsonify(error="invalid date format"), 400
+
+    current_app.logger.info(
+        "[driver-assignments][GET] caller uid=%s role=%s date=%s",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        day.isoformat(),
+    )
+
+    rows = db.session.execute(
+        text("""
+            SELECT a.id, a.user_id, a.bus_id, a.service_date,
+                   u.first_name AS uf, u.last_name AS ul,
+                   b.identifier AS bus
+            FROM driver_assignments a
+            LEFT JOIN users u ON u.id = a.user_id
+            LEFT JOIN buses b ON b.id = a.bus_id
+            WHERE a.service_date = :d
+            ORDER BY b.identifier
+        """),
+        {"d": day},
+    ).mappings().all()
+
+    out = []
+    for r in rows:
+        name = f"{(r['uf'] or '').strip()} {(r['ul'] or '').strip()}".strip() or None
+        out.append({
+            "id": int(r["id"]),
+            "service_date": day.isoformat(),
+            "bus_id": int(r["bus_id"]),
+            "bus": r["bus"],
+            "user_id": int(r["user_id"]),
+            "driver_name": name,
+        })
+    current_app.logger.info("[driver-assignments][GET] rows=%d", len(out))
+    return jsonify(out), 200
+
+# ──────────────── Driver: upsert ────────────────
+@manager_bp.route("/driver-assignments", methods=["POST"], endpoint="driver_assignments_upsert")
+@require_role("manager")
+def driver_assignments_upsert():
+    """
+    Upsert a Driver assignment for a given service_date.
+    Body: { "user_id": <int>, "bus_id": <int>, "service_date": "YYYY-MM-DD" }
+    Rules:
+      - a driver can appear only once per day across all buses
+      - a bus can have at most one driver for the day
+    Idempotent when the same (user_id, bus_id, date) is already set.
+    Also mirrors the assignment to users.assigned_bus_id (best-effort).
+    """
+    MNL = _tz(_td(hours=8))
+
+    data = request.get_json(silent=True) or {}
+    uid = int(data.get("user_id") or 0)
+    bid = int(data.get("bus_id") or 0)
+    day_str = (data.get("service_date") or _dt.now(MNL).date().isoformat()).strip()
+
+    current_app.logger.info(
+        "[driver-assignments][POST] caller uid=%s role=%s payload={user_id=%s, bus_id=%s, service_date=%s}",
+        getattr(g, "user", None) and g.user.id,
+        getattr(g, "user", None) and g.user.role,
+        uid, bid, day_str
+    )
+
+    if not (uid and bid):
+        return jsonify(error="user_id and bus_id are required"), 400
+    try:
+        day = _dt.strptime(day_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify(error="invalid service_date"), 400
+
+    u = User.query.get(uid)
+    if not u:
+        return jsonify(error="invalid user_id"), 400
+    if (u.role or "").lower() != "driver":
+        return jsonify(error="user is not a driver"), 400
+    if not Bus.query.get(bid):
+        return jsonify(error="invalid bus_id"), 400
+
+    try:
+        by_user = db.session.execute(
+            text("""
+                SELECT a.id, a.bus_id
+                FROM driver_assignments a
+                WHERE a.service_date = :d AND a.user_id = :u
+                LIMIT 1
+            """),
+            {"d": day, "u": uid},
+        ).mappings().first()
+
+        by_bus = db.session.execute(
+            text("""
+                SELECT a.id, a.user_id
+                FROM driver_assignments a
+                WHERE a.service_date = :d AND a.bus_id = :b
+                LIMIT 1
+            """),
+            {"d": day, "b": bid},
+        ).mappings().first()
+
+        if by_user and int(by_user["bus_id"]) == bid:
+            return jsonify(
+                ok=True,
+                id=int(by_user["id"]),
+                user_id=uid,
+                bus_id=bid,
+                service_date=day.isoformat(),
+                note="no change",
+            ), 200
+
+        with db.session.begin_nested():
+            if by_user and not by_bus:
+                db.session.execute(
+                    text("UPDATE driver_assignments SET bus_id = :b WHERE id = :id"),
+                    {"b": bid, "id": int(by_user["id"])},
+                )
+                res_id = int(by_user["id"])
+
+            elif by_bus and not by_user:
+                db.session.execute(
+                    text("UPDATE driver_assignments SET user_id = :u WHERE id = :id"),
+                    {"u": uid, "id": int(by_bus["id"])},
+                )
+                res_id = int(by_bus["id"])
+
+            elif by_user and by_bus:
+                if int(by_user["id"]) != int(by_bus["id"]):
+                    db.session.execute(
+                        text("DELETE FROM driver_assignments WHERE id = :id"),
+                        {"id": int(by_user["id"])},
+                    )
+                db.session.execute(
+                    text("UPDATE driver_assignments SET user_id = :u WHERE id = :id"),
+                    {"u": uid, "id": int(by_bus["id"])},
+                )
+                res_id = int(by_bus["id"])
+
+            else:
+                ins_res = db.session.execute(
+                    text("INSERT INTO driver_assignments (user_id, bus_id, service_date) VALUES (:u, :b, :d)"),
+                    {"u": uid, "b": bid, "d": day},
+                )
+                res_id = getattr(ins_res, "lastrowid", None)
+
+        db.session.commit()
+
+        # Optional: mirror to users.assigned_bus_id so the change is visible on the user row.
+        try:
+            if by_bus and by_bus.get("user_id") and int(by_bus["user_id"]) != uid:
+                db.session.execute(
+                    text("UPDATE users SET assigned_bus_id = NULL WHERE id = :old"),
+                    {"old": int(by_bus["user_id"])},
+                )
+            db.session.execute(
+                text("UPDATE users SET assigned_bus_id = :b WHERE id = :u"),
+                {"b": bid, "u": uid},
+            )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            current_app.logger.warning("[driver-assignments] mirror to users.assigned_bus_id failed", exc_info=True)
+
+        current_app.logger.info(
+            "[driver-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
+            res_id, uid, bid, day.isoformat()
+        )
+        return jsonify(ok=True, id=res_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("[manager] upsert_driver_assignment failed")
+        return jsonify(error=str(e)), 500
+
+
 def _set_password_dirty(u, raw: str | None):
     from werkzeug.security import generate_password_hash
     if not raw:

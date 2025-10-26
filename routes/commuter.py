@@ -593,6 +593,7 @@ def commuter_ticket_image(ticket_id: int):
     - Adds a batch/group breakdown panel when the ticket represents a group.
     - Falls back to driver/PAO daily assignments if bus staff aren't resolved
       via assigned_bus_id / issued_by.
+    - QR code and "Scan to view" panel removed.
     """
     t = (
         TicketSale.query.options(
@@ -673,12 +674,8 @@ def commuter_ticket_image(ticket_id: int):
 
     display_ref = _display_ticket_ref_for(t=t)
 
-    # QR that points back to THIS image URL
+    # (We still compute the image URL for the footer, but we no longer render a QR.)
     img_link = url_for("commuter.commuter_ticket_image", ticket_id=t.id, _external=True)
-    qr = qrcode.QRCode(box_size=12, border=2)
-    qr.add_data(img_link)
-    qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
     # ─── Drawing setup ────────────────────────────────────────────────────────
     W, H = 1440, 2100
@@ -845,38 +842,36 @@ def commuter_ticket_image(ticket_id: int):
 
         # Passengers line
         draw.text((col_label_x, yy + 6), "Passengers", fill=MUTED, font=ft_label)
-        _right_text(col_sub_x, yy + 6, f"{group_qty}", font=ft_value, fill=TEXT)
+        # total passengers right-aligned at subtotal column
+        tot_txt = f"{group_qty}"
+        tw_tot = draw.textlength(tot_txt, font=ft_value)
+        draw.text((col_sub_x - tw_tot, yy + 6), tot_txt, font=ft_value, fill=TEXT)
         yy += line_h
 
-  
+        y += panel_h + 24  # move y down before the staff section
 
-        y += panel_h + 24  # move y down before the QR panel
+    # ─── Staff / meta section (no QR) ─────────────────────────────────────────
+    # We render a clean panel listing Payment Method, PAO, Driver, Bus ID.
+    panel_pad = 36
+    line_h = 88
+    rows = [
+        ("Payment Method", method_display),
+        ("PAO", (f"{pao_name} (ID {pao_id})" if pao_id and pao_name else (pao_name or "—"))),
+        ("Driver", (f"{driver_name} (ID {driver_id})" if driver_id and driver_name else (driver_name or "—"))),
+        ("Bus ID", str(getattr(t, "bus_id", "") or "—")),
+    ]
+    panel_h = panel_pad * 2 + len(rows) * line_h
 
-    # QR panel
-    qr_size, pad = 480, 36
-    panel_w = qr_size + pad * 2
-    panel_h = qr_size + pad * 2 + 96
-    draw.rectangle((L, y, L + panel_w, y + panel_h), fill=(247, 251, 247), outline=BORDER, width=2)
-    img.paste(qr_img.resize((qr_size, qr_size)), (L + pad, y + pad))
-    draw.text((L + pad, y + pad + qr_size + 20), "Scan to view", fill=MUTED, font=ft_value)
-
-    # Staff panel (right of QR)
-    rx, ry = L + panel_w + 56, y + 12
-
-    def staff_line(title, value):
-        nonlocal ry
-        draw.text((rx, ry), title.upper(), fill=MUTED, font=ft_label)
-        draw.text((rx, ry + 40), value or "—", fill=TEXT, font=ft_value)
-        ry += 88
-
-    staff_line("Payment Method", method_display)
-    staff_line("PAO", (f"{pao_name} (ID {pao_id})" if pao_id and pao_name else pao_name) or "—")
-    staff_line("Driver", (f"{driver_name} (ID {driver_id})" if driver_id and driver_name else driver_name) or "—")
-    staff_line("Bus ID", str(getattr(t, "bus_id", "") or "—"))
+    draw.rectangle((L, y, R, y + panel_h), fill=(247, 251, 247), outline=BORDER, width=2)
+    yy = y + panel_pad
+    for label, value in rows:
+        draw.text((L + panel_pad, yy), label.upper(), fill=MUTED, font=ft_label)
+        draw.text((L + panel_pad, yy + 40), value or "—", fill=TEXT, font=ft_value)
+        yy += line_h
 
     y = y + panel_h + 36
 
-    # Footer
+    # Footer (kept; remove if you also don't want any reference to the URL)
     draw.text((L, y + 24), img_link if len(img_link) <= 90 else (img_link[:90] + "…"), fill=MUTED, font=ft_small)
     now_local = dt.datetime.now(LOCAL_TZ)
     draw.text((L, y + 60), now_local.strftime("Generated on %B %d, %Y at %I:%M %p"), fill=MUTED, font=ft_small)
@@ -889,6 +884,7 @@ def commuter_ticket_image(ticket_id: int):
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
+
 
 
 def _is_unknown_col(err: Exception) -> bool:
