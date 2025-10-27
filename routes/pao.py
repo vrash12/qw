@@ -812,108 +812,163 @@ def wallet_resolve():
 
     return resp, 200
 
+
+
 @pao_bp.route("/wallet/<int:user_id>/overview", methods=["GET"])
 @require_role("pao")
 def wallet_overview(user_id: int):
-    limit_topups = request.args.get("limit_topups", type=int) or 10
-    limit_ledger = request.args.get("limit_ledger", type=int) or 15
-    include_today = (request.args.get("include_today", "1") != "0")
+    """
+    Lightweight wallet overview for PAO. Never 500s: on any internal error,
+    return a safe fallback payload with balance 0 and empty arrays.
+    Supports a fast path when the client only needs the balance.
+    """
+    try:
+        limit_topups = request.args.get("limit_topups", type=int) or 10
+        limit_ledger = request.args.get("limit_ledger", type=int) or 15
+        include_today = (request.args.get("include_today", "1") != "0")
 
-    row = db.session.execute(
-        text(
-            "SELECT user_id, COALESCE(balance_pesos,0) AS balance_pesos "
-            "FROM wallet_accounts WHERE user_id=:uid"
-        ),
-        {"uid": user_id},
-    ).mappings().first()
+        row = db.session.execute(
+            text(
+                "SELECT user_id, COALESCE(balance_pesos,0) AS balance_pesos "
+                "FROM wallet_accounts WHERE user_id=:uid"
+            ),
+            {"uid": user_id},
+        ).mappings().first()
 
-    balance_pesos = int((row or {}).get("balance_pesos", 0))
-    account_id = int((row or {}).get("user_id", 0) or 0) or None
+        balance_pesos = int((row or {}).get("balance_pesos", 0))
+        account_id = int((row or {}).get("user_id", 0) or 0) or None
 
-    # Fetch recent topups
-    topups: List[Dict[str, Any]] = []
-    if account_id and limit_topups > 0:
-        trs = db.session.execute(
-            text("""
-                SELECT id, amount_pesos, status, COALESCE(pao_id,0) AS pao_id, created_at
-                FROM wallet_topups
-                WHERE user_id = :uid
-                ORDER BY id DESC
-                LIMIT :lim
-            """),
-            {"uid": user_id, "lim": limit_topups},
-        ).mappings().all()
-        for r in trs:
-            topups.append({
-                "id": int(r["id"]),
-                "amount_php": float(int(r["amount_pesos"] or 0)),
-                "status": (r["status"] or ""),
-                "pao_id": int(r["pao_id"] or 0) or None,
-                "created_at": _iso_utc(r["created_at"]),
-            })
+        # Fast-path: only balance requested
+        if (limit_topups <= 0 and limit_ledger <= 0 and not include_today):
+            return jsonify(
+                user_id=int(user_id),
+                balance_php=float(balance_pesos),
+                recent_topups=[],
+                recent_ledger=[],
+                pao_today=None,
+            ), 200
 
-    # Fetch recent ledger entries
-    ledger: List[Dict[str, Any]] = []
-    if account_id and limit_ledger > 0:
-        lrs = db.session.execute(
-            text("""
-                SELECT id, direction, event, amount_pesos, running_balance_pesos,
-                       ref_table, ref_id, created_at
-                FROM wallet_ledger
-                WHERE account_id = :uid
-                ORDER BY id DESC
-                LIMIT :lim
-            """),
-            {"uid": user_id, "lim": limit_ledger},
-        ).mappings().all()
-        for r in lrs:
-            ledger.append({
-                "id": int(r["id"]),
-                "direction": r["direction"],
-                "event": r["event"],
-                "amount_php": float(int(r["amount_pesos"] or 0)),
-                "running_balance_php": float(int(r["running_balance_pesos"] or 0)),
-                "ref": {"table": r["ref_table"], "id": int(r["ref_id"] or 0) or None},
-                "created_at": _iso_utc(r["created_at"]),
-            })
+        # Recent topups
+        topups: List[Dict[str, Any]] = []
+        if account_id and limit_topups > 0:
+            trs = db.session.execute(
+                text("""
+                    SELECT id, amount_pesos, status, COALESCE(pao_id,0) AS pao_id, created_at
+                    FROM wallet_topups
+                    WHERE user_id = :uid
+                    ORDER BY id DESC
+                    LIMIT :lim
+                """),
+                {"uid": user_id, "lim": limit_topups},
+            ).mappings().all()
 
-    # PAO "today" usage stats
-    pao_today = None
-    if include_today:
-        day_local = dt.datetime.now(_MNL).date()
-        start_dt, end_dt = _local_day_bounds_utc(day_local)
+            for r in trs:
+                topups.append({
+                    "id": int(r["id"]),
+                    "amount_php": float(int(r["amount_pesos"] or 0)),
+                    "status": (r["status"] or ""),
+                    "pao_id": int(r["pao_id"] or 0) or None,
+                    "created_at": _iso_utc(r["created_at"]),
+                })
 
-        used_sum = db.session.execute(
-            text("""
-                SELECT COALESCE(SUM(amount_pesos), 0)
-                FROM wallet_topups
-                WHERE pao_id = :pid
-                  AND status = 'succeeded'
-                  AND created_at >= :s AND created_at < :e
-            """),
-            {"pid": g.user.id, "s": start_dt, "e": end_dt},
+        # Recent ledger
+        ledger: List[Dict[str, Any]] = []
+        if account_id and limit_ledger > 0:
+            lrs = db.session.execute(
+                text("""
+                    SELECT id, direction, event, amount_pesos, running_balance_pesos,
+                           ref_table, ref_id, created_at
+                    FROM wallet_ledger
+                    WHERE account_id = :uid
+                    ORDER BY id DESC
+                    LIMIT :lim
+                """),
+                {"uid": user_id, "lim": limit_ledger},
+            ).mappings().all()
+
+            for r in lrs:
+                ledger.append({
+                    "id": int(r["id"]),
+                    "direction": r["direction"],
+                    "event": r["event"],
+                    "amount_php": float(int(r["amount_pesos"] or 0)),
+                    "running_balance_php": float(int(r["running_balance_pesos"] or 0)),
+                    "ref": {"table": r["ref_table"], "id": int(r["ref_id"] or 0) or None},
+                    "created_at": _iso_utc(r["created_at"]),
+                })
+
+        # PAO "today" usage stats (optional)
+        pao_today = None
+        if include_today:
+            day_local = dt.datetime.now(_MNL).date()
+            start_dt, end_dt = _local_day_bounds_utc(day_local)
+
+            used_sum = db.session.execute(
+                text("""
+                    SELECT COALESCE(SUM(amount_pesos), 0)
+                    FROM wallet_topups
+                    WHERE pao_id = :pid
+                      AND status = 'succeeded'
+                      AND created_at >= :s AND created_at < :e
+                """),
+                {"pid": g.user.id, "s": start_dt, "e": end_dt},
+            ).scalar() or 0
+
+            used_count = db.session.execute(
+                text("""
+                    SELECT COUNT(*)
+                    FROM wallet_topups
+                    WHERE pao_id = :pid
+                      AND status = 'succeeded'
+                      AND created_at >= :s AND created_at < :e
+                """),
+                {"pid": g.user.id, "s": start_dt, "e": end_dt},
+            ).scalar() or 0
+
+            pao_today = {"count": int(used_count), "sum_php": float(used_sum)}
+
+        return jsonify(
+            user_id=int(user_id),
+            balance_php=float(balance_pesos),
+            recent_topups=topups,
+            recent_ledger=ledger,
+            pao_today=pao_today,
+        ), 200
+
+    except Exception:
+        current_app.logger.exception("[pao:wallet_overview] failed")
+        # Never break the client flow; return a safe fallback
+        return jsonify(
+            user_id=int(user_id),
+            balance_php=0.0,
+            recent_topups=[],
+            recent_ledger=[],
+            pao_today=None,
+            error="temporary_unavailable",
+        ), 200
+
+
+@pao_bp.route("/wallet/<int:user_id>/balance", methods=["GET"])
+@require_role("pao")
+def wallet_balance(user_id: int):
+    """
+    Ultra-light balance fetch used by the PAO checkout UI.
+    Always 200; never 500. Adds no-store to avoid stale caches.
+    """
+    try:
+        bal = db.session.execute(
+            text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
+            {"uid": user_id},
         ).scalar() or 0
+        resp = jsonify(user_id=int(user_id), balance_php=float(bal))
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp, 200
+    except Exception:
+        # graceful fallback so UI can choose the "proceed anyway" path
+        resp = jsonify(user_id=int(user_id), balance_php=0.0, stale=True)
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp, 200
 
-        used_count = db.session.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM wallet_topups
-                WHERE pao_id = :pid
-                  AND status = 'succeeded'
-                  AND created_at >= :s AND created_at < :e
-            """),
-            {"pid": g.user.id, "s": start_dt, "e": end_dt},
-        ).scalar() or 0
-
-        pao_today = {"count": int(used_count), "sum_php": float(used_sum)}
-
-    return jsonify(
-        user_id=user_id,
-        balance_php=float(balance_pesos),
-        recent_topups=topups,
-        recent_ledger=ledger,
-        pao_today=pao_today,
-    ), 200
 
 @pao_bp.route("/tickets/<int:ticket_id>/receipt.png", methods=["GET"])
 def pao_ticket_receipt_image(ticket_id: int):
@@ -1187,14 +1242,22 @@ def preview_ticket():
 @require_role("pao")
 def pao_create_ticket():
     """
-    Create a wallet or GCash ticket; supports group counts via items[].
+    Create a wallet or GCash ticket (supports group via items[]).
+    Adds idempotency:
+      - Accepts X-Idempotency-Key header or 'idempotency_key' in JSON.
+      - Reuses 'external_ref' column to store the key for BOTH wallet & gcash.
+      - Returns existing ticket (200) on duplicates.
     """
     data = request.get_json(silent=True) or {}
 
-    origin_stop_id      = int(data.get("origin_stop_id") or data.get("origin_stop_time_id") or 0)
-    destination_stop_id = int(data.get("destination_stop_id") or data.get("destination_stop_time_id") or 0)
+    # Required stops
+    try:
+        origin_stop_id = int(data.get("origin_stop_id") or data.get("origin_stop_time_id") or 0)
+        destination_stop_id = int(data.get("destination_stop_id") or data.get("destination_stop_time_id") or 0)
+    except Exception:
+        return jsonify(error="invalid origin/destination id"), 400
 
-    # items normalization
+    # Normalize items (group)
     raw_items = data.get("items") or []
     if not isinstance(raw_items, list):
         raw_items = []
@@ -1212,6 +1275,7 @@ def pao_create_ticket():
     if not items:
         items = [{"passenger_type": (data.get("primary_type") or "regular"), "quantity": 1}]
 
+    # Payment method + fields
     payment_method = (data.get("payment_method") or "").strip().lower()
     if payment_method not in {"wallet", "gcash"}:
         return jsonify(error="unsupported payment_method"), 400
@@ -1227,6 +1291,14 @@ def pao_create_ticket():
     gcash_paid = bool(data.get("gcash_paid")) if "gcash_paid" in data else is_gcash
     gcash_ref = (data.get("gcash_ref") or data.get("external_ref") or "").strip() or None
 
+    # Idempotency key (works for both methods)
+    idem = (
+        (request.headers.get("X-Idempotency-Key") or "").strip()
+        or (data.get("idempotency_key") or "").strip()
+        or gcash_ref  # reuse PSP reference when available
+    ) or None
+
+    # Validate requireds per method
     if payment_method == "wallet":
         if not (commuter_id and commuter_id > 0):
             return jsonify(error="commuter_id required for wallet payment"), 400
@@ -1239,15 +1311,16 @@ def pao_create_ticket():
     if not (origin_stop_id and destination_stop_id):
         return jsonify(error="origin_stop_id and destination_stop_id are required"), 400
 
+    # Compute fare totals
     totals = _compute_totals(origin_stop_id, destination_stop_id, items)
     total_fare = int(totals["total_fare"] or 0)
     reg_qty    = int(totals["reg_qty"] or 0)
     dis_qty    = int(totals["dis_qty"] or 0)
     total_qty  = int(totals["total_qty"] or 1)
-
     if total_fare <= 0:
         return jsonify(error="calculated fare is zero"), 400
 
+    # Caller PAO + bus assignment
     pao_id  = _who_is_pao_user_id()
     bus_id  = _bus_for_pao() or data.get("bus_id")
     try:
@@ -1255,9 +1328,23 @@ def pao_create_ticket():
     except Exception:
         bus_id = None
 
+    # Idempotency pre-check (return existing 200)
+    if _has_column("ticket_sales", "external_ref") and (idem is not None):
+        existing = (
+            TicketSale.query
+            .filter_by(bus_id=bus_id, external_ref=idem)
+            .order_by(TicketSale.id.desc())
+            .first()
+        )
+        if existing:
+            origin_name, _ = _resolve_stop(getattr(existing, "origin_stop_time_id", None))
+            destination_name, _ = _resolve_stop(getattr(existing, "destination_stop_time_id", None))
+            return jsonify(_serialize_ticket_json(existing, origin_name, destination_name)), 200
+
     can_group = _has_column("ticket_sales", "is_group")
 
     try:
+        # Create ticket row
         t = TicketSale()
         t.user_id = int(commuter_id) if (commuter_id and commuter_id > 0) else None
         t.bus_id  = int(bus_id) if bus_id else None
@@ -1272,37 +1359,15 @@ def pao_create_ticket():
         if _has_column("ticket_sales", "payment_method"):
             t.payment_method = payment_method
 
-        if payment_method == "gcash" and gcash_ref and _has_column("ticket_sales", "external_ref"):
-            existing = (
-                TicketSale.query
-                .filter_by(bus_id=_bus_for_pao() or data.get("bus_id"), external_ref=gcash_ref)
-                .order_by(TicketSale.id.desc())
-                .first()
-            )
-            if existing:
-                origin_name, _ = _resolve_stop(getattr(existing, "origin_stop_time_id", None))
-                destination_name, _ = _resolve_stop(getattr(existing, "destination_stop_time_id", None))
-                return jsonify({
-                    "id": int(existing.id),
-                    "referenceNo": getattr(existing, "reference_no", None) or f"{existing.id}",
-                    "origin": origin_name,
-                    "destination": destination_name,
-                    "passengerType": (existing.passenger_type or "regular").lower(),
-                    "fare": int(round(float(existing.price or 0))),
-                    "paid": bool(existing.paid),
-                    "commuter": "Guest" if not existing.user_id else None,
-                    "payment_method": "gcash",
-                    "qr": None, "qr_link": None, "qr_bg_url": None,
-                }), 200
-
-        # Optional: store external_ref/gcash_ref when column exists
-        for col, val in (("external_ref", gcash_ref), ("gcash_ref", gcash_ref)):
+        # Persist idempotency/external refs (for both wallet & gcash)
+        for col, val in (("external_ref", (idem or gcash_ref)), ("gcash_ref", gcash_ref)):
             if val and _has_column("ticket_sales", col):
                 setattr(t, col, val)
 
         if _has_column("ticket_sales", "issued_by"):
             t.issued_by = int(pao_id) if pao_id else None
 
+        # Group flags (if table supports it)
         if can_group and total_qty > 1:
             setattr(t, "is_group", True)
             setattr(t, "group_regular", int(reg_qty))
@@ -1312,10 +1377,10 @@ def pao_create_ticket():
             setattr(t, "group_regular", None)
             setattr(t, "group_discount", None)
 
+        # Temporary reference, then final after flush
         if _has_column("ticket_sales", "reference_no") and not getattr(t, "reference_no", None):
             t.reference_no = _temp_reference(bus_id)
 
-        t.issued_by = int(pao_id) if pao_id else None
         db.session.add(t)
         db.session.flush()  # get t.id
 
@@ -1325,20 +1390,32 @@ def pao_create_ticket():
             except Exception:
                 t.reference_no = f"BUS{int(bus_id or 0)}_{int(t.id):04d}"
 
+        # Wallet charge (atomic)
         if payment_method == "wallet":
             ok = _charge_wallet_pesos(int(commuter_id), int(total_fare), ref_ticket_id=int(t.id))
             if not ok:
+                # Read current balance to report shortfall in one go
+                bal = db.session.execute(
+                    text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
+                    {"uid": int(commuter_id)},
+                ).scalar() or 0
                 db.session.rollback()
-                return jsonify(error="insufficient_funds", required_php=int(total_fare)), 402
+                return jsonify(
+                    error="insufficient_funds",
+                    required_php=int(total_fare),
+                    balance_php=int(bal),
+                ), 402
             t.paid = True
 
         db.session.commit()
 
+        # Build response
         origin_name = totals["origin_name"]
         destination_name = totals["destination_name"]
 
+        # Group response (head only)
         if total_qty > 1:
-            head_item = {
+            head_item: Dict[str, Any] = {
                 "id": int(t.id),
                 "referenceNo": getattr(t, "reference_no", None) or f"{t.id}",
                 "origin": origin_name,
@@ -1363,6 +1440,7 @@ def pao_create_ticket():
                 "items": [head_item],
             }), 201
 
+        # Solo ticket response
         commuter_name = None
         if t.user_id:
             try:
@@ -1382,15 +1460,33 @@ def pao_create_ticket():
             "paid": bool(t.paid),
             "commuter": commuter_name or ("Guest" if not t.user_id else None),
             "payment_method": payment_method,
+            # QR fields omitted for PAO JSON (client can fetch full receipt later)
             "qr": None,
             "qr_link": None,
             "qr_bg_url": None,
         }), 201
 
+    except IntegrityError:
+        # If you made (bus_id, external_ref) UNIQUE, concurrent duplicates land here
+        db.session.rollback()
+        if _has_column("ticket_sales", "external_ref") and (idem or gcash_ref):
+            dup = (
+                TicketSale.query
+                .filter_by(bus_id=bus_id, external_ref=(idem or gcash_ref))
+                .order_by(TicketSale.id.desc())
+                .first()
+            )
+            if dup:
+                origin_name, _ = _resolve_stop(getattr(dup, "origin_stop_time_id", None))
+                destination_name, _ = _resolve_stop(getattr(dup, "destination_stop_time_id", None))
+                return jsonify(_serialize_ticket_json(dup, origin_name, destination_name)), 200
+        return jsonify(error="duplicate"), 409
+
     except Exception as e:
         current_app.logger.exception("Failed to create ticket: %s", e)
         db.session.rollback()
         return jsonify(error="failed to create ticket"), 500
+
 
 @pao_bp.route("/tickets/<int:ticket_id>/void", methods=["PATCH"])
 @require_role("pao")
@@ -1839,110 +1935,79 @@ def broadcast():
         return jsonify(error="internal server error"), 500
 
 
-
 @pao_bp.route("/broadcast", methods=["GET"])
 @require_role("pao")
 def list_broadcasts():
     """
-    Return announcements.
-
-    Query params:
-      - scope=bus|all       (default: bus)
-      - limit=<int>         (default: 200)
-      - since_id=<int>      (optional; for incremental fetch)
-      - date=YYYY-MM-DD     (optional; Manila-local day; default: today)
-      - all_dates=1         (optional; disable day filter; resolves bus per-announcement day)
+    Return today's announcements for the caller's bus (Asia/Manila).
+    Query params honored:
+      - limit=<int>      (default: 200, max 500)
+      - since_id=<int>   (optional; incremental fetch)
     """
-    scope     = (request.args.get("scope") or "bus").lower()
     limit_req = request.args.get("limit", type=int) or 200
-    limit     = max(1, min(limit_req, 500))  # clamp
-    since_id  = request.args.get("since_id", type=int)
-    date_str  = request.args.get("date")
-    all_dates = (request.args.get("all_dates") or "0").lower() in {"1", "true", "yes"}
+    limit = max(1, min(limit_req, 500))
+    since_id = request.args.get("since_id", type=int)
 
     bus_id = _current_bus_id()
-    if not bus_id and scope != "all":
+    if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
 
-    # Compute Manila-local day bounds (unless all_dates)
-    start_dt = end_dt = None
-    day_local = None
-    if not all_dates:
-        try:
-            day_local = (
-                dt.datetime.strptime(date_str, "%Y-%m-%d").date()
-                if date_str else
-                dt.datetime.now(_MNL).date()
-            )
-        except ValueError:
-            return jsonify(error="invalid date"), 400
-        start_dt, end_dt = _local_day_bounds_utc(day_local)
+    # Manila "today"
+    day_local = dt.datetime.now(_MNL).date()
+    start_dt, end_dt = _local_day_bounds_utc(day_local)
 
-    # Base query: pull the author name and the *assigned* bus identifier quickly.
+    # Base query: author info
     q = (
         db.session.query(
             Announcement,
             User.first_name.label("first"),
             User.last_name.label("last"),
             User.id.label("author_id"),
-            Bus.identifier.label("assigned_ident"),
         )
         .join(User, Announcement.created_by == User.id)
-        .outerjoin(Bus, User.assigned_bus_id == Bus.id)
+        .filter(Announcement.timestamp >= start_dt,
+                Announcement.timestamp <  end_dt)
     )
 
-    if scope != "all":
-        q = q.filter(User.assigned_bus_id == bus_id)
     if since_id:
         q = q.filter(Announcement.id > since_id)
-    if start_dt and end_dt:
-        q = q.filter(Announcement.timestamp >= start_dt,
-                     Announcement.timestamp <  end_dt)
+
+    # Authors whose bus for *today* is this bus OR whose legacy assigned_bus_id matches.
+    # (Avoids missing authors scheduled via pao_assignments.)
+    q = q.filter(
+        text("""
+            (users.assigned_bus_id = :bus)
+            OR EXISTS (
+                SELECT 1
+                FROM pao_assignments pa
+                WHERE pa.user_id = users.id
+                  AND pa.service_date = DATE(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'))
+                  AND pa.bus_id = :bus
+            )
+        """)
+    ).params(bus=bus_id)
 
     rows = (
-        q.order_by(Announcement.id.desc())   # id index is fast & correlates with recency
+        q.order_by(Announcement.id.desc())
          .limit(limit)
          .all()
     )
 
-    # Helper to resolve PAO's bus for a given Manila-local day from pao_assignments.
-    def _bus_for_pao_on(day: dt.date, user_id: int) -> Optional[int]:
-        bid = db.session.execute(
-            text("""
-                SELECT bus_id
-                FROM pao_assignments
-                WHERE user_id = :uid AND service_date = :d
-                LIMIT 1
-            """),
-            {"uid": int(user_id), "d": day},
-        ).scalar()
-        return int(bid) if bid is not None else None
-
     anns = []
-    for (ann, first, last, author_id, assigned_ident) in rows:
-        # Choose the service day to check:
-        #  - when all_dates=1, derive per-announcement day from its timestamp (Manila-local)
-        #  - otherwise use the single requested day_local
-        svc_day: dt.date
-        try:
-            svc_day = _as_mnl(ann.timestamp).date()
-        except Exception:
-            svc_day = day_local
-
-        # Prefer the day assignment (pao_assignments) over static assigned_bus_id
-        day_bus_id = _bus_for_pao_on(svc_day, int(author_id))
-        final_ident = _bus_identifier_str(day_bus_id) if day_bus_id else (assigned_ident or "—")
-
+    for (ann, first, last, author_id) in rows:
+        # show the author's bus identifier for *today*
+        day_bus_id = _bus_for_pao_on(day_local, int(author_id)) or getattr(User.query.get(author_id), "assigned_bus_id", None)
         anns.append(
             _ann_json_fast(
                 ann,
                 author_first=first,
                 author_last=last,
-                bus_identifier=final_ident,
+                bus_identifier=_bus_identifier_str(day_bus_id),
             )
         )
 
     return jsonify(anns), 200
+
 
 
 @pao_bp.route("/broadcast/<int:ann_id>", methods=["PATCH"])
