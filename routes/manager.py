@@ -1599,6 +1599,9 @@ def tickets_for_day():
 from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 from sqlalchemy import func, text
 
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+from sqlalchemy import func, text, literal  # keep these at top of file
+
 @manager_bp.route("/route-insights", methods=["GET"])
 @require_role("manager", "pao")  # allow PAO to view
 def route_data_insights():
@@ -1617,7 +1620,7 @@ def route_data_insights():
           snapshot: boolean
         }
     """
-    # Keep DB session aligned to Manila for DATETIME comparisons
+    # Keep DB session aligned to Manila for DATETIME comparisons (no-op on sqlite/pg)
     try:
         db.session.execute(text("SET time_zone = '+08:00'"))
     except Exception:
@@ -1633,6 +1636,7 @@ def route_data_insights():
             end_dt = end_dt + _td(days=1)
         return start_dt, end_dt
 
+    # ── Determine window & meta ─────────────────────────────────────────────
     if trip_id:
         trip = Trip.query.filter_by(id=trip_id).first()
         if not trip:
@@ -1643,9 +1647,13 @@ def route_data_insights():
         window_from, window_to = _trip_window(day, trip.start_time, trip.end_time)
         window_end_excl = window_to + _td(minutes=1)
 
-        # If the trip already ended, try to use a snapshot
+        # If the trip already ended, try to use a snapshot (and don't crash if table missing)
+        metrics = None
         if _dt.utcnow() > window_to + _td(minutes=2):
-            snap = TripMetric.query.filter_by(trip_id=trip_id).first()
+            try:
+                snap = TripMetric.query.filter_by(trip_id=trip_id).first()
+            except Exception:
+                snap = None
             if snap:
                 use_snapshot = True
                 metrics = dict(
@@ -1657,10 +1665,6 @@ def route_data_insights():
                     end_pax=snap.end_pax or 0,
                     net_change=(snap.end_pax or 0) - (snap.start_pax or 0),
                 )
-            else:
-                metrics = None
-        else:
-            metrics = None
 
         meta = {
             "trip_id": trip_id,
@@ -1700,10 +1704,27 @@ def route_data_insights():
         }
         metrics = None
 
-    # Aggregate per minute
+    # ── Dialect-agnostic "HH:MM" expression ────────────────────────────────
+    try:
+        bind = db.session.get_bind()
+        dialect = (getattr(bind, "dialect", None) and bind.dialect.name or "").lower()
+    except Exception:
+        dialect = ""
+
+    # Build the per-minute label in a way that works on your DB
+    if dialect in ("mysql", "mariadb"):
+        hhmm_expr = func.date_format(SensorReading.timestamp, "%H:%i")
+    elif dialect in ("postgresql", "postgres"):
+        hhmm_expr = func.to_char(SensorReading.timestamp, 'HH24:MI')
+    else:  # default to SQLite-style strftime (works on SQLite, and SQLAlchemy will emulate on others if available)
+        hhmm_expr = func.strftime("%H:%M", SensorReading.timestamp)
+
+    hhmm = hhmm_expr.label("hhmm")
+
+    # ── Aggregate per minute ────────────────────────────────────────────────
     occ_rows = (
         db.session.query(
-            func.date_format(SensorReading.timestamp, "%H:%i").label("hhmm"),
+            hhmm,
             func.max(SensorReading.total_count).label("pax"),
             func.sum(SensorReading.in_count).label("ins"),
             func.sum(SensorReading.out_count).label("outs"),
@@ -1713,8 +1734,8 @@ def route_data_insights():
             SensorReading.timestamp >= window_from,
             SensorReading.timestamp < window_end_excl,
         )
-        .group_by("hhmm")
-        .order_by("hhmm")
+        .group_by(hhmm)         # group by the expression, not the string name (cross-DB safe)
+        .order_by(hhmm)
         .all()
     )
 
@@ -1724,12 +1745,11 @@ def route_data_insights():
             "passengers": int(r.pax or 0),
             "in": int(r.ins or 0),
             "out": int(r.outs or 0),
-            # "stop": None,  # include if/when you enrich with stop names
         }
         for r in occ_rows
     ]
 
-    # Compute metrics when we didn't return a stored snapshot
+    # ── Compute metrics when we didn't return a stored snapshot ─────────────
     if not metrics:
         pax_values = [p["passengers"] for p in series]
         avg_pax = round(sum(pax_values) / len(pax_values)) if pax_values else 0
@@ -1868,7 +1888,6 @@ def list_fare_segments():
         200,
     )
 
-# ──────────────── PAO: upsert ────────────────
 @manager_bp.route("/pao-assignments", methods=["POST"], endpoint="pao_assignments_upsert")
 @require_role("manager")
 def pao_assignments_upsert():
@@ -1879,7 +1898,10 @@ def pao_assignments_upsert():
       - a PAO can appear only once per day across all buses
       - a bus can have at most one PAO for the day
     Idempotent when the same (user_id, bus_id, date) is already set.
-    Also mirrors the assignment to users.assigned_bus_id (best-effort).
+
+    Mirror rule:
+      - Only mirror to users.assigned_bus_id when service_date == "today in Manila".
+      - Before mirroring, clear the bus from any other PAO to avoid duplicates.
     """
     MNL = _tz(_td(hours=8))
 
@@ -1911,7 +1933,7 @@ def pao_assignments_upsert():
         return jsonify(error="invalid bus_id"), 400
 
     try:
-        # Find existing rows that would conflict (user-per-day, bus-per-day)
+        # Conflicts (user-per-day, bus-per-day)
         by_user = db.session.execute(
             text("""
                 SELECT a.id, a.bus_id
@@ -1943,11 +1965,9 @@ def pao_assignments_upsert():
                 note="no change",
             ), 200
 
-        # Carefully reorder writes to avoid transient unique collisions:
-        # - If both exist and are different rows, delete user-day row first then
-        #   update the bus-day row to point to the new user.
         with db.session.begin_nested():
             if by_user and not by_bus:
+                # Move user's assignment to this bus
                 db.session.execute(
                     text("UPDATE pao_assignments SET bus_id = :b WHERE id = :id"),
                     {"b": bid, "id": int(by_user["id"])},
@@ -1955,6 +1975,7 @@ def pao_assignments_upsert():
                 res_id = int(by_user["id"])
 
             elif by_bus and not by_user:
+                # Replace the PAO on this bus
                 db.session.execute(
                     text("UPDATE pao_assignments SET user_id = :u WHERE id = :id"),
                     {"u": uid, "id": int(by_bus["id"])},
@@ -1962,6 +1983,7 @@ def pao_assignments_upsert():
                 res_id = int(by_bus["id"])
 
             elif by_user and by_bus:
+                # Different rows: remove old user/day row, point bus/day row to new user
                 if int(by_user["id"]) != int(by_bus["id"]):
                     db.session.execute(
                         text("DELETE FROM pao_assignments WHERE id = :id"),
@@ -1974,6 +1996,7 @@ def pao_assignments_upsert():
                 res_id = int(by_bus["id"])
 
             else:
+                # Fresh insert
                 ins_res = db.session.execute(
                     text("INSERT INTO pao_assignments (user_id, bus_id, service_date) VALUES (:u, :b, :d)"),
                     {"u": uid, "b": bid, "d": day},
@@ -1982,22 +2005,21 @@ def pao_assignments_upsert():
 
         db.session.commit()
 
-        # Optional: mirror to users.assigned_bus_id so the change is visible on the user row.
+        # Mirror only for "today in Manila" and clear bus from any other PAO first
         try:
-            # If we replaced a different PAO on this bus, clear their mirror
-            if by_bus and by_bus.get("user_id") and int(by_bus["user_id"]) != uid:
+            if day == _dt.now(MNL).date():
                 db.session.execute(
-                    text("UPDATE users SET assigned_bus_id = NULL WHERE id = :old"),
-                    {"old": int(by_bus["user_id"])},
+                    text("UPDATE users SET assigned_bus_id = NULL WHERE role = 'pao' AND assigned_bus_id = :b"),
+                    {"b": bid},
                 )
-            db.session.execute(
-                text("UPDATE users SET assigned_bus_id = :b WHERE id = :u"),
-                {"b": bid, "u": uid},
-            )
-            db.session.commit()
+                db.session.execute(
+                    text("UPDATE users SET assigned_bus_id = :b WHERE id = :u"),
+                    {"b": bid, "u": uid},
+                )
+                db.session.commit()
         except Exception:
             db.session.rollback()
-            current_app.logger.warning("[pao-assignments] mirror to users.assigned_bus_id failed", exc_info=True)
+            current_app.logger.warning("[pao-assignments] mirror update skipped/failed", exc_info=True)
 
         current_app.logger.info(
             "[pao-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
@@ -2009,6 +2031,7 @@ def pao_assignments_upsert():
         db.session.rollback()
         current_app.logger.exception("[manager] upsert_pao_assignment failed")
         return jsonify(error=str(e)), 500
+
 
 
 @manager_bp.route("/pao-assignments", methods=["GET"], endpoint="pao_assignments_get")
@@ -2117,7 +2140,6 @@ def driver_assignments_get():
     current_app.logger.info("[driver-assignments][GET] rows=%d", len(out))
     return jsonify(out), 200
 
-# ──────────────── Driver: upsert ────────────────
 @manager_bp.route("/driver-assignments", methods=["POST"], endpoint="driver_assignments_upsert")
 @require_role("manager")
 def driver_assignments_upsert():
@@ -2128,7 +2150,10 @@ def driver_assignments_upsert():
       - a driver can appear only once per day across all buses
       - a bus can have at most one driver for the day
     Idempotent when the same (user_id, bus_id, date) is already set.
-    Also mirrors the assignment to users.assigned_bus_id (best-effort).
+
+    Mirror rule:
+      - Only mirror to users.assigned_bus_id when service_date == "today in Manila".
+      - Before mirroring, clear the bus from any other Driver to avoid duplicates.
     """
     MNL = _tz(_td(hours=8))
 
@@ -2226,21 +2251,21 @@ def driver_assignments_upsert():
 
         db.session.commit()
 
-        # Optional: mirror to users.assigned_bus_id so the change is visible on the user row.
+        # Mirror only for "today in Manila" and clear bus from any other Driver first
         try:
-            if by_bus and by_bus.get("user_id") and int(by_bus["user_id"]) != uid:
+            if day == _dt.now(MNL).date():
                 db.session.execute(
-                    text("UPDATE users SET assigned_bus_id = NULL WHERE id = :old"),
-                    {"old": int(by_bus["user_id"])},
+                    text("UPDATE users SET assigned_bus_id = NULL WHERE role = 'driver' AND assigned_bus_id = :b"),
+                    {"b": bid},
                 )
-            db.session.execute(
-                text("UPDATE users SET assigned_bus_id = :b WHERE id = :u"),
-                {"b": bid, "u": uid},
-            )
-            db.session.commit()
+                db.session.execute(
+                    text("UPDATE users SET assigned_bus_id = :b WHERE id = :u"),
+                    {"b": bid, "u": uid},
+                )
+                db.session.commit()
         except Exception:
             db.session.rollback()
-            current_app.logger.warning("[driver-assignments] mirror to users.assigned_bus_id failed", exc_info=True)
+            current_app.logger.warning("[driver-assignments] mirror update skipped/failed", exc_info=True)
 
         current_app.logger.info(
             "[driver-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
@@ -2252,6 +2277,7 @@ def driver_assignments_upsert():
         db.session.rollback()
         current_app.logger.exception("[manager] upsert_driver_assignment failed")
         return jsonify(error=str(e)), 500
+
 
 
 def _set_password_dirty(u, raw: str | None):

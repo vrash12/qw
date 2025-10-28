@@ -1893,8 +1893,7 @@ def broadcast():
     try:
         if raw_date:
             svc_day = dt.datetime.strptime(raw_date, "%Y-%m-%d").date()
-        elif when in {"tomorrow", "next"}:
-            svc_day = (dt.datetime.now(_MNL) + dt.timedelta(days=1)).date()
+    
     except ValueError:
         return jsonify(error="invalid date (use YYYY-MM-DD)"), 400
 
@@ -1939,10 +1938,12 @@ def broadcast():
 @require_role("pao")
 def list_broadcasts():
     """
-    Return today's announcements for the caller's bus (Asia/Manila).
-    Query params honored:
-      - limit=<int>      (default: 200, max 500)
-      - since_id=<int>   (optional; incremental fetch)
+    Return today's announcements for the caller's bus (Asia/Manila),
+    strictly by the ANNOUNCEMENT'S bus_id. This ensures you see messages
+    from other PAOs on the same bus, regardless of their user assignment.
+    Query params:
+      - limit=<int>    (default: 200, max 500)
+      - since_id=<int> (optional; incremental fetch)
     """
     limit_req = request.args.get("limit", type=int) or 200
     limit = max(1, min(limit_req, 500))
@@ -1956,59 +1957,38 @@ def list_broadcasts():
     day_local = dt.datetime.now(_MNL).date()
     start_dt, end_dt = _local_day_bounds_utc(day_local)
 
-    # Base query: author info
+    # Pull today's rows for *this bus* only
     q = (
         db.session.query(
             Announcement,
             User.first_name.label("first"),
             User.last_name.label("last"),
-            User.id.label("author_id"),
         )
         .join(User, Announcement.created_by == User.id)
-        .filter(Announcement.timestamp >= start_dt,
-                Announcement.timestamp <  end_dt)
+        .filter(
+            Announcement.bus_id == bus_id,
+            Announcement.timestamp >= start_dt,
+            Announcement.timestamp <  end_dt,
+        )
     )
-
     if since_id:
         q = q.filter(Announcement.id > since_id)
 
-    # Authors whose bus for *today* is this bus OR whose legacy assigned_bus_id matches.
-    # (Avoids missing authors scheduled via pao_assignments.)
-    q = q.filter(
-        text("""
-            (users.assigned_bus_id = :bus)
-            OR EXISTS (
-                SELECT 1
-                FROM pao_assignments pa
-                WHERE pa.user_id = users.id
-                  AND pa.service_date = DATE(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'))
-                  AND pa.bus_id = :bus
-            )
-        """)
-    ).params(bus=bus_id)
+    rows = q.order_by(Announcement.id.desc()).limit(limit).all()
 
-    rows = (
-        q.order_by(Announcement.id.desc())
-         .limit(limit)
-         .all()
-    )
-
+    # Use the announcement's stored bus_id for the label
     anns = []
-    for (ann, first, last, author_id) in rows:
-        # show the author's bus identifier for *today*
-        day_bus_id = _bus_for_pao_on(day_local, int(author_id)) or getattr(User.query.get(author_id), "assigned_bus_id", None)
+    for (ann, first, last) in rows:
         anns.append(
             _ann_json_fast(
                 ann,
                 author_first=first,
                 author_last=last,
-                bus_identifier=_bus_identifier_str(day_bus_id),
+                bus_identifier=_bus_identifier_str(getattr(ann, "bus_id", None) or bus_id),
             )
         )
 
     return jsonify(anns), 200
-
-
 
 @pao_bp.route("/broadcast/<int:ann_id>", methods=["PATCH"])
 @require_role("pao")

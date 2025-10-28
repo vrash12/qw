@@ -21,8 +21,24 @@ __all__ = ["auth_bp", "require_role"]
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
+# -------------------------------------------------------------------
+# Config & helpers
+# -------------------------------------------------------------------
+SECRET_KEY = os.environ.get("SECRET_KEY", "your-secret-key-here")
+MNL_TZ = timezone(timedelta(hours=8))
+
+
+def _as_bool(x, default=False) -> bool:
+    if x is None:
+        return default
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    return s in {"1", "true", "yes", "on"}
+
 
 def _bus_for_pao_on(user_id: int, day) -> int | None:
+    """Helper used by some PAO/driver screens; looks up assignment on a given day."""
     bus_id = db.session.execute(
         text("""
             SELECT bus_id
@@ -35,29 +51,6 @@ def _bus_for_pao_on(user_id: int, day) -> int | None:
     current_app.logger.info("[auth] lookup pao uid=%s day=%s → bus_id=%r", user_id, day, bus_id)
     return int(bus_id) if bus_id is not None else None
 
-
-
-@auth_bp.after_request
-def add_perf_headers(resp):
-    resp.headers["Connection"] = "keep-alive"
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-@auth_bp.route("/ping", methods=["GET"])
-def ping():
-    return jsonify(ok=True, ts=time.time()), 200
-
-SECRET_KEY = os.environ.get("SECRET_KEY", "your-secret-key-here")
-MNL_TZ = timezone(timedelta(hours=8))
-
-
-def _as_bool(x, default=False) -> bool:
-    if x is None:
-        return default
-    if isinstance(x, bool):
-        return x
-    s = str(x).strip().lower()
-    return s in {"1", "true", "yes", "on"}
 
 def _today_bus_for_pao(user_id: int) -> int | None:
     day = datetime.now(MNL_TZ).date()
@@ -72,13 +65,10 @@ def _today_bus_for_pao(user_id: int) -> int | None:
     ).scalar()
     return int(bus_id) if bus_id is not None else None
 
+
 def _debug_dump_pao_state(user_id: int, day):
-    """
-    Logs what's in pao_assignments for this PAO and date,
-    and how many total rows exist for that day. Works for DATE or DATETIME columns.
-    """
+    """Optional debug: log what we have for PAO assignments for the given date."""
     try:
-        # 1) exact user + day
         row = db.session.execute(
             text("""
                 SELECT a.id, a.user_id, a.bus_id,
@@ -91,7 +81,6 @@ def _debug_dump_pao_state(user_id: int, day):
             {"uid": int(user_id), "d": day}
         ).mappings().first()
 
-        # 2) what buses have PAOs that day (handy sanity check)
         day_rows = db.session.execute(
             text("""
                 SELECT a.id, a.user_id, a.bus_id,
@@ -103,7 +92,6 @@ def _debug_dump_pao_state(user_id: int, day):
             {"d": day}
         ).mappings().all()
 
-        # 3) optional: show nearest assignment for that user (±1 day)
         near = db.session.execute(
             text("""
                 SELECT a.id, a.bus_id,
@@ -126,6 +114,27 @@ def _debug_dump_pao_state(user_id: int, day):
         current_app.logger.exception("[pao:debug] dump failed")
 
 
+# -------------------------------------------------------------------
+# Middleware
+# -------------------------------------------------------------------
+@auth_bp.after_request
+def add_perf_headers(resp):
+    resp.headers["Connection"] = "keep-alive"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# -------------------------------------------------------------------
+# Health
+# -------------------------------------------------------------------
+@auth_bp.route("/ping", methods=["GET"])
+def ping():
+    return jsonify(ok=True, ts=time.time()), 200
+
+
+# -------------------------------------------------------------------
+# Me (token-based)
+# -------------------------------------------------------------------
 @auth_bp.route("/me", methods=["GET"])
 def me():
     auth = request.headers.get("Authorization", "")
@@ -157,6 +166,9 @@ def me():
     }), 200
 
 
+# -------------------------------------------------------------------
+# Signup (commuter)
+# -------------------------------------------------------------------
 @auth_bp.route("/signup", methods=["POST"])
 def signup():
     data = request.get_json() or {}
@@ -189,6 +201,10 @@ def signup():
 
     return jsonify(message="User registered successfully"), 201
 
+
+# -------------------------------------------------------------------
+# Login
+# -------------------------------------------------------------------
 @auth_bp.route("/login", methods=["POST"])
 def login():
     data = request.get_json() or {}
@@ -246,10 +262,9 @@ def login():
             db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
             db.session.commit()
 
-    # For PAO (and you can also read this for Driver on the app), use assigned_bus_id.
+    # For PAO / Driver apps, keep returning assigned_bus_id for legacy compatibility.
     bus_id = legacy_bus if role_lower in {"pao", "driver"} else None
 
-    # Keep field names for backward-compat: busSource stays "legacy"
     return jsonify(
         message="Login successful",
         token=token,
@@ -266,6 +281,9 @@ def login():
     ), 200
 
 
+# -------------------------------------------------------------------
+# Verify Token
+# -------------------------------------------------------------------
 @auth_bp.route("/verify-token", methods=["GET"])
 def verify_token():
     auth_header = request.headers.get("Authorization", "")
@@ -284,27 +302,103 @@ def verify_token():
     except jwt.InvalidTokenError:
         return jsonify(error="Invalid token"), 401
 
-
 @auth_bp.route("/reset-password", methods=["POST"])
 def reset_password_by_username_phone():
     """
     Reset password for a commuter by matching username + phoneNumber.
-    Body: { "username": "...", "phoneNumber": "...", "newPassword": "..." }
+
+    Request JSON:
+      {
+        "username": "jdoe",
+        "phoneNumber": "09123456789",
+        "newPassword": "newpass123"
+      }
+
+    Rules:
+      - Only commuters can reset via this endpoint (staff should be reset by admins).
+      - Phone must be PH format: starts with 09 and is 11 digits.
+      - newPassword must be at least 6 chars.
     """
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
-    phone = (data.get("phoneNumber") or "").strip()
-    new_pw = (data.get("newPassword") or "").strip()
+    phone    = (data.get("phoneNumber") or "").strip()
+    new_pw   = (data.get("newPassword") or "").strip()
 
+    # Basic presence checks
     if not username or not phone or not new_pw:
         return jsonify(error="username, phoneNumber and newPassword are required"), 400
     if len(new_pw) < 6:
         return jsonify(error="newPassword must be at least 6 characters"), 400
 
-    user = User.query.filter_by(username=username, phone_number=phone, role="commuter").first()
+    # Normalize + validate PH phone number (e.g., 09123456789)
+    digits = re.sub(r"\D", "", phone)
+    if not re.fullmatch(r"09\d{9}", digits):
+        return jsonify(error="phoneNumber must start with 09 and be 11 digits (e.g., 09123456789)"), 400
+
+    # Only commuters are allowed to reset here
+    user = User.query.filter_by(username=username, phone_number=digits, role="commuter").first()
     if not user:
+        # Do not reveal which field failed (prevents enumeration)
         return jsonify(error="Username and phone number do not match"), 404
 
+    # Update password
     user.set_password(new_pw)
     db.session.commit()
+
     return jsonify(message="Password updated successfully"), 200
+
+
+
+@auth_bp.route("/check-username-phone", methods=["POST"])
+def check_username_phone():
+    """
+    Lightweight identity check used by the Forgot Password screen.
+
+    Request JSON:
+      { "username": "jdoe", "phoneNumber": "09123456789" }
+
+    Response JSON:
+      {
+        "usernameExists": true/false,
+        "phoneExists": true/false,
+        "match": true/false,           # username + phone belong to the SAME commuter
+        "roleOfUsername": "commuter"|...|None,
+        "resetAllowed": true/false     # True only for commuters
+      }
+    """
+    import re as _re
+
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    phone    = (data.get("phoneNumber") or "").strip()
+    digits   = _re.sub(r"\D", "", phone)
+
+    username_exists = False
+    phone_exists = False
+    pair_match_commuter = False
+    role_of_username = None
+
+    if username:
+      row = User.query.filter_by(username=username).first()
+      if row:
+        username_exists = True
+        role_of_username = (row.role or None)
+
+    if digits:
+      phone_exists = User.query.filter_by(phone_number=digits).first() is not None
+
+    if username and digits:
+      pair_match_commuter = (
+        User.query.filter_by(username=username, phone_number=digits, role="commuter").first() is not None
+      )
+
+    return jsonify(
+        usernameExists=username_exists,
+        phoneExists=phone_exists,
+        match=pair_match_commuter,
+        roleOfUsername=role_of_username,
+        resetAllowed=(role_of_username == "commuter")
+    ), 200
+
+# ... keep the existing /reset-password and other routes below ...
+
