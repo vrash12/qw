@@ -202,11 +202,13 @@ def signup():
     return jsonify(message="User registered successfully"), 201
 
 
-# -------------------------------------------------------------------
-# Login
-# -------------------------------------------------------------------
+
 @auth_bp.route("/login", methods=["POST"])
 def login():
+    """
+    Sign in a user and return a JWT.
+    For PAO users, require an assigned bus (either users.assigned_bus_id or a row in pao_assignments for today).
+    """
     data = request.get_json() or {}
     if "username" not in data or "password" not in data:
         return jsonify(error="Missing username or password"), 400
@@ -215,15 +217,21 @@ def login():
         return (
             User.query.options(
                 load_only(
-                    User.id, User.username, User.role, User.first_name, User.last_name,
-                    User.assigned_bus_id, User.password_hash, User.phone_number,
+                    User.id,
+                    User.username,
+                    User.role,
+                    User.first_name,
+                    User.last_name,
+                    User.assigned_bus_id,
+                    User.password_hash,
+                    User.phone_number,
                 )
             )
             .filter_by(username=data["username"])
             .first()
         )
 
-    # one-time retry if connection dropped
+    # One-time retry if DB connection dropped
     try:
         user = _get_user()
     except OperationalError as e:
@@ -232,20 +240,56 @@ def login():
         db.engine.dispose()
         user = _get_user()
 
-    if not (user and user.check_password(data["password"])):  # noqa: SIM103
+    if not (user and user.check_password(data["password"])):
         return jsonify(error="Invalid username or password"), 401
 
     role_lower = (user.role or "").lower()
+
+    # Prefer the static column first
     legacy_bus = int(getattr(user, "assigned_bus_id", None) or 0) or None
 
-    # issue JWT (24h)
+    # 🔒 Enforce PAO must have a bus today
+    bus_id = None
+    bus_source = "none"
+    if role_lower == "pao":
+        if legacy_bus is not None:
+            bus_id = legacy_bus
+            bus_source = "static"
+        else:
+            try:
+                bus_id = _today_bus_for_pao(user.id)  # defined above in this module
+                if bus_id is not None:
+                    bus_source = "pao_assignments"
+            except Exception:
+                current_app.logger.exception("[auth] _today_bus_for_pao lookup failed")
+
+        if bus_id is None:
+            # Block PAO login with a clear message
+            return (
+                jsonify(
+                    error="You are not assigned to a bus today. Please contact your manager."
+                ),
+                403,
+            )
+
+    elif role_lower == "driver":
+        # (Optional) If you also want to enforce drivers having a bus, do the same check here.
+        bus_id = legacy_bus
+        bus_source = "static" if bus_id is not None else "none"
+
+    # Issue JWT (24h)
     token = jwt.encode(
-        {"user_id": user.id, "username": user.username, "role": user.role,
-         "exp": datetime.utcnow() + timedelta(hours=24)},
-        SECRET_KEY, algorithm="HS256"
+        {
+            "user_id": user.id,
+            "username": user.username,
+            "role": user.role,
+            "exp": datetime.utcnow() + timedelta(hours=24),
+        },
+        SECRET_KEY,
+        algorithm="HS256",
     )
 
-    # optional push token registration
+    # Optional push-token registration
     expo_token = (data.get("expoPushToken") or "").strip()
     platform = (data.get("platform") or "").strip()
     if expo_token:
@@ -253,33 +297,37 @@ def login():
         if rec:
             changed = False
             if rec.user_id != user.id:
-                rec.user_id = user.id; changed = True
+                rec.user_id = user.id
+                changed = True
             if platform and rec.platform != platform:
-                rec.platform = platform; changed = True
+                rec.platform = platform
+                changed = True
             if changed:
                 db.session.commit()
         else:
             db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
             db.session.commit()
 
-    # For PAO / Driver apps, keep returning assigned_bus_id for legacy compatibility.
-    bus_id = legacy_bus if role_lower in {"pao", "driver"} else None
+    # For PAO/Driver apps, keep returning busId (legacy compat)
+    include_bus_id = bus_id if role_lower in {"pao", "driver"} else None
 
-    return jsonify(
-        message="Login successful",
-        token=token,
-        role=user.role,
-        busId=bus_id,
-        busSource=("legacy" if bus_id is not None else "none"),
-        user={
-            "id": user.id,
-            "username": user.username,
-            "firstName": user.first_name,
-            "lastName": user.last_name,
-            "phoneNumber": user.phone_number,
-        },
-    ), 200
-
+    return (
+        jsonify(
+            message="Login successful",
+            token=token,
+            role=user.role,
+            busId=include_bus_id,
+            busSource=bus_source,
+            user={
+                "id": user.id,
+                "username": user.username,
+                "firstName": user.first_name,
+                "lastName": user.last_name,
+                "phoneNumber": user.phone_number,
+            },
+        ),
+        200,
+    )
 
 # -------------------------------------------------------------------
 # Verify Token
