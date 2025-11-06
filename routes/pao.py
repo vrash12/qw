@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dateutil import parser as dtparse
 from flask import Blueprint, request, jsonify, g, current_app, url_for, redirect
 from itsdangerous import URLSafeTimedSerializer, URLSafeSerializer, BadSignature, SignatureExpired
-from sqlalchemy import func, text
+from sqlalchemy import func, text, or_, and_ 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload
 
@@ -1933,58 +1933,69 @@ def broadcast():
         current_app.logger.exception("broadcast failed")
         return jsonify(error="internal server error"), 500
 
-
 @pao_bp.route("/broadcast", methods=["GET"])
 @require_role("pao")
 def list_broadcasts():
     """
-    Return today's announcements for the caller's bus (Asia/Manila),
-    strictly by the ANNOUNCEMENT'S bus_id. This ensures you see messages
-    from other PAOs on the same bus, regardless of their user assignment.
+    Return today's announcements for the caller's bus (Asia/Manila).
+
+    Includes:
+      (a) rows where Announcement.bus_id == current bus_id, and
+      (b) legacy rows where Announcement.bus_id IS NULL but the author's
+          users.assigned_bus_id == current bus_id.
+
     Query params:
       - limit=<int>    (default: 200, max 500)
       - since_id=<int> (optional; incremental fetch)
     """
+    # Pagination / incremental fetch
     limit_req = request.args.get("limit", type=int) or 200
     limit = max(1, min(limit_req, 500))
     since_id = request.args.get("since_id", type=int)
 
+    # Resolve the PAO's current bus (for *today* in Manila)
     bus_id = _current_bus_id()
     if not bus_id:
         return jsonify(error="PAO has no assigned bus"), 400
 
-    # Manila "today"
+    # Manila "today" window in UTC
     day_local = dt.datetime.now(_MNL).date()
     start_dt, end_dt = _local_day_bounds_utc(day_local)
 
-    # Pull today's rows for *this bus* only
+    # Build query: strict-match + legacy fallback (bus_id=NULL + author's legacy bus matches)
     q = (
         db.session.query(
             Announcement,
             User.first_name.label("first"),
             User.last_name.label("last"),
+            User.assigned_bus_id.label("legacy_bus_id"),
         )
         .join(User, Announcement.created_by == User.id)
         .filter(
-            Announcement.bus_id == bus_id,
             Announcement.timestamp >= start_dt,
             Announcement.timestamp <  end_dt,
+            or_(
+                Announcement.bus_id == bus_id,
+                and_(Announcement.bus_id.is_(None), User.assigned_bus_id == bus_id),
+            ),
         )
     )
+
     if since_id:
         q = q.filter(Announcement.id > since_id)
 
     rows = q.order_by(Announcement.id.desc()).limit(limit).all()
 
-    # Use the announcement's stored bus_id for the label
+    # Use the announcement's own bus_id when present; otherwise fallback to author's legacy bus
     anns = []
-    for (ann, first, last) in rows:
+    for (ann, first, last, legacy_bus_id) in rows:
+        label_bus_id = getattr(ann, "bus_id", None) or legacy_bus_id or bus_id
         anns.append(
             _ann_json_fast(
                 ann,
                 author_first=first,
                 author_last=last,
-                bus_identifier=_bus_identifier_str(getattr(ann, "bus_id", None) or bus_id),
+                bus_identifier=_bus_identifier_str(label_bus_id),
             )
         )
 
