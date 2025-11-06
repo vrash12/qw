@@ -104,6 +104,8 @@ def _utc_from_local_date(day: dt.date, *, at_time: Optional[dt.time] = None) -> 
 def _debug_enabled() -> bool:
     return (request.args.get("debug") or request.headers.get("X-Debug") or "").lower() in {"1","true","yes"}
 
+# backend/routes/pao.py
+
 def _today_bus_for_pao(user_id: int) -> Optional[int]:
     bus_id = db.session.execute(
         text("""
@@ -111,19 +113,13 @@ def _today_bus_for_pao(user_id: int) -> Optional[int]:
             FROM pao_assignments
             WHERE user_id = :uid
               AND service_date = DATE(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'))
+            ORDER BY id DESC              -- ✅ make deterministic
             LIMIT 1
         """),
         {"uid": int(user_id)},
     ).scalar()
-
-    # DEBUG: print computed Manila date and result
-    mnl = db.session.execute(
-        text("SELECT DATE(CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', '+08:00'))")
-    ).scalar()
-    current_app.logger.info("[today_bus] uid=%s mnl=%s bus_id=%s", user_id, mnl, bus_id)
-
+    ...
     return int(bus_id) if bus_id is not None else None
-
 
 
 def _bus_for_pao_on(day: dt.date, user_id: int) -> Optional[int]:
@@ -132,6 +128,7 @@ def _bus_for_pao_on(day: dt.date, user_id: int) -> Optional[int]:
             SELECT bus_id
             FROM pao_assignments
             WHERE user_id = :uid AND service_date = :d
+            ORDER BY id DESC              -- ✅ make deterministic
             LIMIT 1
         """),
         {"uid": int(user_id), "d": day},
@@ -1932,37 +1929,18 @@ def broadcast():
         db.session.rollback()
         current_app.logger.exception("broadcast failed")
         return jsonify(error="internal server error"), 500
-
 @pao_bp.route("/broadcast", methods=["GET"])
 @require_role("pao")
 def list_broadcasts():
-    """
-    Return today's announcements for the caller's bus (Asia/Manila).
-
-    Includes:
-      (a) rows where Announcement.bus_id == current bus_id, and
-      (b) legacy rows where Announcement.bus_id IS NULL but the author's
-          users.assigned_bus_id == current bus_id.
-
-    Query params:
-      - limit=<int>    (default: 200, max 500)
-      - since_id=<int> (optional; incremental fetch)
-    """
-    # Pagination / incremental fetch
-    limit_req = request.args.get("limit", type=int) or 200
-    limit = max(1, min(limit_req, 500))
+    limit = max(1, min((request.args.get("limit", type=int) or 200), 500))
     since_id = request.args.get("since_id", type=int)
+    scope = (request.args.get("scope") or "bus").lower()
+    filter_bus_id = request.args.get("bus_id", type=int)
 
-    # Resolve the PAO's current bus (for *today* in Manila)
-    bus_id = _current_bus_id()
-    if not bus_id:
-        return jsonify(error="PAO has no assigned bus"), 400
-
-    # Manila "today" window in UTC
+    # Manila 'today' window
     day_local = dt.datetime.now(_MNL).date()
     start_dt, end_dt = _local_day_bounds_utc(day_local)
 
-    # Build query: strict-match + legacy fallback (bus_id=NULL + author's legacy bus matches)
     q = (
         db.session.query(
             Announcement,
@@ -1971,35 +1949,51 @@ def list_broadcasts():
             User.assigned_bus_id.label("legacy_bus_id"),
         )
         .join(User, Announcement.created_by == User.id)
-        .filter(
-            Announcement.timestamp >= start_dt,
-            Announcement.timestamp <  end_dt,
-            or_(
-                Announcement.bus_id == bus_id,
-                and_(Announcement.bus_id.is_(None), User.assigned_bus_id == bus_id),
-            ),
-        )
+        .filter(Announcement.timestamp >= start_dt, Announcement.timestamp < end_dt)
     )
 
     if since_id:
         q = q.filter(Announcement.id > since_id)
 
+    if scope in ("bus", "mine"):
+        my_bus_id = _current_bus_id()
+        if not my_bus_id:
+            return jsonify(error="PAO has no assigned bus"), 400
+        q = q.filter(or_(
+            Announcement.bus_id == my_bus_id,
+            and_(Announcement.bus_id.is_(None), User.assigned_bus_id == my_bus_id),
+        ))
+    elif scope in ("by_bus", "bus_id") and filter_bus_id:
+        q = q.filter(or_(
+            Announcement.bus_id == filter_bus_id,
+            and_(Announcement.bus_id.is_(None), User.assigned_bus_id == filter_bus_id),
+        ))
+    elif scope == "all":
+        pass  # no bus filter
+    else:
+        # fallback to bus if unknown scope
+        my_bus_id = _current_bus_id()
+        if not my_bus_id:
+            return jsonify(error="PAO has no assigned bus"), 400
+        q = q.filter(or_(
+            Announcement.bus_id == my_bus_id,
+            and_(Announcement.bus_id.is_(None), User.assigned_bus_id == my_bus_id),
+        ))
+
     rows = q.order_by(Announcement.id.desc()).limit(limit).all()
 
-    # Use the announcement's own bus_id when present; otherwise fallback to author's legacy bus
     anns = []
     for (ann, first, last, legacy_bus_id) in rows:
-        label_bus_id = getattr(ann, "bus_id", None) or legacy_bus_id or bus_id
-        anns.append(
-            _ann_json_fast(
-                ann,
-                author_first=first,
-                author_last=last,
-                bus_identifier=_bus_identifier_str(label_bus_id),
-            )
-        )
-
+        label_bus_id = getattr(ann, "bus_id", None) or legacy_bus_id
+        anns.append(_ann_json_fast(
+            ann,
+            author_first=first,
+            author_last=last,
+            bus_identifier=_bus_identifier_str(label_bus_id) if label_bus_id else None,
+        ))
     return jsonify(anns), 200
+
+
 
 @pao_bp.route("/broadcast/<int:ann_id>", methods=["PATCH"])
 @require_role("pao")
