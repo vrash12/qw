@@ -6,12 +6,14 @@ import socket
 from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 
-MNL_TZ = timezone(timedelta(hours=8))
+# NEW: load .env when this module is imported
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # loads .env from the current working dir
+except Exception:
+    pass
 
-BREVO_HOST = os.getenv("BREVO_HOST", "smtp-relay.brevo.com")
-BREVO_LOGIN = os.getenv("BREVO_LOGIN")       # e.g. "9b5024001@smtp-brevo.com"
-BREVO_PASSWORD = os.getenv("BREVO_PASSWORD") # your new xsmtpsib-… key
-MAIL_FROM = os.getenv("MAIL_FROM")           # e.g. "PGT <pgtmanagement045@gmail.com>"
+MNL_TZ = timezone(timedelta(hours=8))
 
 _PORT_PLAN = [("STARTTLS", 587), ("STARTTLS", 2525), ("SSL", 465)]
 
@@ -28,15 +30,21 @@ def _to_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=MNL_TZ).astimezone(timezone.utc)
 
 def send_email(*, to: str, subject: str, html: str = "", text: str = "") -> None:
-    if not BREVO_LOGIN:
+    # READ ENV **AT CALL TIME** (so .env or container env is respected)
+    host        = os.getenv("BREVO_HOST", "smtp-relay.brevo.com")
+    login       = os.getenv("BREVO_LOGIN")
+    password    = os.getenv("BREVO_PASSWORD")
+    mail_from   = os.getenv("MAIL_FROM")
+
+    if not login:
         raise RuntimeError("BREVO_LOGIN env var is not set.")
-    if not BREVO_PASSWORD:
+    if not password:
         raise RuntimeError("BREVO_PASSWORD env var is not set.")
-    if not MAIL_FROM:
+    if not mail_from:
         raise RuntimeError("MAIL_FROM env var is not set.")
 
     msg = EmailMessage()
-    msg["From"] = MAIL_FROM
+    msg["From"] = mail_from
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(text or "")
@@ -48,18 +56,18 @@ def send_email(*, to: str, subject: str, html: str = "", text: str = "") -> None
         try:
             if mode == "SSL":
                 ctx = ssl.create_default_context()
-                with smtplib.SMTP_SSL(BREVO_HOST, port, context=ctx, timeout=20) as s:
-                    s.login(BREVO_LOGIN, BREVO_PASSWORD)
+                with smtplib.SMTP_SSL(host, port, context=ctx, timeout=20) as s:
+                    s.login(login, password)
                     s.send_message(msg)
             else:
                 ctx = ssl.create_default_context()
-                with smtplib.SMTP(BREVO_HOST, port, timeout=20) as s:
+                with smtplib.SMTP(host, port, timeout=20) as s:
                     s.ehlo(); s.starttls(context=ctx); s.ehlo()
-                    s.login(BREVO_LOGIN, BREVO_PASSWORD)
+                    s.login(login, password)
                     s.send_message(msg)
-            print(f"[mail] sent via {BREVO_HOST}:{port} as {_mask(BREVO_LOGIN)} from {_mask(MAIL_FROM)} to {_mask(to)}")
+            print(f"[mail] sent via {host}:{port} as {_mask(login)} from {_mask(mail_from)} to {_mask(to)}")
             return
         except (smtplib.SMTPAuthenticationError, smtplib.SMTPException, OSError, socket.error) as e:
             last_err = e
-            print(f"[mail] attempt {mode} {BREVO_HOST}:{port} failed: {e!r}")
+            print(f"[mail] attempt {mode} {host}:{port} failed: {e!r}")
     raise RuntimeError(f"All SMTP attempts failed; last error: {last_err!r}")
