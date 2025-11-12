@@ -1,13 +1,16 @@
+# models/user.py
 from __future__ import annotations
 from db import db
 from sqlalchemy.sql import func
+from sqlalchemy.dialects.mysql import BIGINT
 from werkzeug.security import generate_password_hash, check_password_hash
 
 class User(db.Model):
     __tablename__ = "users"
 
-    id               = db.Column(db.Integer, primary_key=True)
-    # NO email column here – your DB doesn’t have it
+    # Match MySQL: BIGINT(20) UNSIGNED
+    id               = db.Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+
     username         = db.Column(db.String(80), nullable=False, unique=True, index=True)
     phone_number     = db.Column(db.String(32), nullable=True, unique=True)
     first_name       = db.Column(db.String(80), nullable=True)
@@ -15,8 +18,9 @@ class User(db.Model):
     role             = db.Column(db.String(32), nullable=False, default="commuter", index=True)
 
     assigned_bus_id  = db.Column(db.Integer, db.ForeignKey("buses.id"), nullable=True, index=True)
-
+    email            = db.Column(db.String(254), nullable=True, unique=True, index=True)
     password_hash    = db.Column(db.String(255), nullable=False)
+    email_verified_at = db.Column(db.DateTime, nullable=True)
 
     created_at       = db.Column(db.DateTime, server_default=func.now(), nullable=False)
     updated_at       = db.Column(db.DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -28,7 +32,6 @@ class User(db.Model):
         foreign_keys=[assigned_bus_id],
     )
 
-    # Ticket relationships (to match TicketSale.back_populates)
     ticket_sales = db.relationship(
         "TicketSale",
         back_populates="user",
@@ -58,4 +61,3 @@ class User(db.Model):
         fn = (self.first_name or "").strip()
         ln = (self.last_name or "").strip()
         return (fn + " " + ln).strip() or (self.username or f"User #{self.id}")
-
