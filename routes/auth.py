@@ -28,13 +28,19 @@ auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 # -------------------------------------------------------------------
 SECRET_KEY = os.environ.get("SECRET_KEY", "your-secret-key-here")
 MNL_TZ = timezone(timedelta(hours=8))
-
+LOGIN_MFA_ROLES = {"commuter", "pao", "manager", "teller"}
 # OTP config
 OTP_TTL_MINUTES        = int(os.environ.get("OTP_TTL_MINUTES", "10"))
 OTP_MAX_ATTEMPTS       = int(os.environ.get("OTP_MAX_ATTEMPTS", "5"))
 OTP_RESEND_COOLDOWN_SEC= int(os.environ.get("OTP_RESEND_COOLDOWN_SEC", "60"))
 OTP_PEPPER             = os.environ.get("OTP_PEPPER", "change-me")  # set long random in prod
 
+def _to_utc(dt: datetime) -> datetime:
+    """Coerce a possibly-naive DB timestamp to aware UTC for safe math."""
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc)
+    # Assume DB wrote local server time (Asia/Manila), then convert to UTC
+    return dt.replace(tzinfo=MNL_TZ).astimezone(timezone.utc)
 
 def _as_bool(x, default=False) -> bool:
     if x is None:
@@ -44,7 +50,7 @@ def _as_bool(x, default=False) -> bool:
     s = str(x).strip().lower()
     return s in {"1", "true", "yes", "on"}
 
-
+OTP_DEV_MODE = (str(os.environ.get("OTP_DEV_MODE", "0")).strip().lower() in {"1","true","yes","on"})
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -163,8 +169,12 @@ def _mask_email(addr: str) -> str:
         dom_mask = domain[0] + "***"
     return f"{local_mask}@{dom_mask}"
 
-def _create_and_email_otp(user: User, *, purpose: str) -> None:
-    """Create a new OTP row and email it to the user."""
+
+def _create_and_email_otp(user: User, *, purpose: str) -> str:
+    """
+    Create a new OTP row and email it to the user (transaction-safe).
+    Returns the plaintext OTP (useful in DEV mode / logs).
+    """
     code = _gen_otp_code()
     rec = UserOtp(
         user_id=user.id,
@@ -174,19 +184,33 @@ def _create_and_email_otp(user: User, *, purpose: str) -> None:
         code_hash=_hash_code(code),
         expires_at=_otp_expiry(),
     )
+    # Don't commit yet; if email fails we don't want a cooldown record
     db.session.add(rec)
-    db.session.commit()
+    db.session.flush()  # allocates rec.id but keeps txn open
 
-    html = f"""
-      <div style="font-family:system-ui,Segoe UI,Roboto,Arial">
-        <h2>Verify your sign-in</h2>
-        <p>Your one-time code is:</p>
-        <div style="font-size:24px;font-weight:700;letter-spacing:3px">{code}</div>
-        <p>This code expires in {OTP_TTL_MINUTES} minutes.</p>
-      </div>
-    """
-    send_email(to=user.email, subject="Your verification code", html=html, text=f"Your code is {code}")
+    if OTP_DEV_MODE:
+        current_app.logger.warning("[DEV_OTP] user_id=%s purpose=%s code=%s", user.id, purpose, code)
+        db.session.commit()
+        return code
 
+    try:
+        # Send first; only commit if delivery succeeded
+        subj = {"signup": "Verify your email", "login": "Your verification code", "reset": "Password reset code"}.get(purpose, "Your verification code")
+        heading = {"signup": "Verify your email", "login": "Verify your sign-in", "reset": "Reset your password"}.get(purpose, "Your verification code")
+        html = f"""
+          <div style="font-family:system-ui,Segoe UI,Roboto,Arial">
+            <h2>{heading}</h2>
+            <p>Your one-time code is:</p>
+            <div style="font-size:24px;font-weight:700;letter-spacing:3px">{code}</div>
+            <p>This code expires in {OTP_TTL_MINUTES} minutes.</p>
+          </div>
+        """
+        send_email(to=user.email, subject=subj, html=html, text=f"Your code is {code}")
+        db.session.commit()
+        return code
+    except Exception:
+        db.session.rollback()  # removes the OTP row so cooldown doesn't trigger
+        raise
 
 def _require_login_otp(user: User) -> bool:
     # Require OTP only for commuters who have a verified email, except the first user (id==1).
@@ -318,9 +342,9 @@ def signup():
 @auth_bp.route("/login", methods=["POST"])
 def login():
     """
-    Sign in a user and return a JWT.
-    For PAO users, require an assigned bus (either users.assigned_bus_id or a row in pao_assignments for today).
-    For commuter users with a verified email, require MFA (email OTP).
+    Password check → always require an email OTP to proceed (all roles).
+    No role-based MFA gating and no email_verified_at check.
+    PAO bus rule still enforced before sending OTP.
     """
     data = request.get_json() or {}
     if "username" not in data or "password" not in data:
@@ -330,23 +354,15 @@ def login():
         return (
             User.query.options(
                 load_only(
-                    User.id,
-                    User.username,
-                    User.role,
-                    User.first_name,
-                    User.last_name,
-                    User.assigned_bus_id,
-                    User.password_hash,
-                    User.phone_number,
-                    User.email,
-                    User.email_verified_at,
+                    User.id, User.username, User.role, User.first_name, User.last_name,
+                    User.assigned_bus_id, User.password_hash, User.phone_number,
+                    User.email, User.email_verified_at,
                 )
             )
             .filter_by(username=data["username"])
             .first()
         )
 
-    # One-time retry if DB connection dropped
     try:
         user = _get_user()
     except OperationalError as e:
@@ -358,126 +374,64 @@ def login():
     if not (user and user.check_password(data["password"])):
         return jsonify(error="Invalid username or password"), 401
 
-    # Gate commuters that have email but not verified
-    if (user.role or "").lower() == "commuter" and user.email and not user.email_verified_at:
-        return jsonify(error="Please verify your email to sign in."), 403
-
     role_lower = (user.role or "").lower()
 
-    # Prefer the static column first
+    # 🔒 PAO must have a bus today (before we even send OTP)
     legacy_bus = int(getattr(user, "assigned_bus_id", None) or 0) or None
-
-    # 🔒 Enforce PAO must have a bus today
-    bus_id = None
-    bus_source = "none"
     if role_lower == "pao":
-        if legacy_bus is not None:
-            bus_id = legacy_bus
-            bus_source = "static"
-        else:
+        bus_id = legacy_bus
+        if bus_id is None:
             try:
                 bus_id = _today_bus_for_pao(user.id)
-                if bus_id is not None:
-                    bus_source = "pao_assignments"
             except Exception:
                 current_app.logger.exception("[auth] _today_bus_for_pao lookup failed")
-
         if bus_id is None:
             return jsonify(error="You are not assigned to a bus today. Please contact your manager."), 403
 
-    elif role_lower == "driver":
-        bus_id = legacy_bus
-        bus_source = "static" if bus_id is not None else "none"
+    # ✅ Require OTP for everyone (must have an email on file)
+    if not user.email:
+        return jsonify(error="No email on file for this account."), 400
 
-    # ✅ MFA branch for commuters with verified email
-    if role_lower == "commuter" and user.email and user.email_verified_at:
-        try:
-            # Cooldown on re-sends for purpose='login'
-            last = (
-                UserOtp.query.filter_by(user_id=user.id, purpose="login", channel="email")
-                .order_by(UserOtp.id.desc())
-                .first()
-            )
-            if last:
-                last_ts = last.created_at if last.created_at.tzinfo else last.created_at.replace(tzinfo=timezone.utc)
-                since = (_now_utc() - last_ts).total_seconds()
-                if since < OTP_RESEND_COOLDOWN_SEC:
-                    # Don't create a new row; re-use last (email a fresh code only if you want)
-                    pass
+    resend_cooldown = 0
+    try:
+        last = (
+            UserOtp.query.filter_by(user_id=user.id, purpose="login", channel="email")
+            .order_by(UserOtp.id.desc())
+            .first()
+        )
 
-            # Create & send login OTP
+        should_send = True
+        if last:
+            last_ts_utc = _to_utc(last.created_at)  # ← proper TZ handling
+            since = (_now_utc() - last_ts_utc).total_seconds()
+            remaining = int(max(0, OTP_RESEND_COOLDOWN_SEC - since))
+            if remaining > 0:
+                should_send = False
+                resend_cooldown = remaining
+
+        if should_send:
             _create_and_email_otp(user, purpose="login")
-        except Exception:
-            current_app.logger.exception("Failed to send login OTP email")
-            # If email fails, do not log in silently
-            return jsonify(error="Unable to send verification code. Please try again."), 500
 
-        return jsonify(
-            mfaRequired=True,
-            delivery="email",
-            to=_mask_email(user.email),
-        ), 200
+    except Exception:
+        current_app.logger.exception("Failed to send login OTP email")
+        return jsonify(error="Unable to send verification code. Please try again."), 500
 
-    # Otherwise: issue JWT (24h)
-    token = jwt.encode(
-        {
-            "user_id": user.id,
-            "username": user.username,
-            "role": user.role,
-            "exp": datetime.utcnow() + timedelta(hours=24),
-        },
-        SECRET_KEY,
-        algorithm="HS256",
-    )
-
-    # Optional push-token registration
-    expo_token = (data.get("expoPushToken") or "").strip()
-    platform = (data.get("platform") or "").strip()
-    if expo_token:
-        rec = DeviceToken.query.filter_by(token=expo_token).first()
-        if rec:
-            changed = False
-            if rec.user_id != user.id:
-                rec.user_id = user.id
-                changed = True
-            if platform and rec.platform != platform:
-                rec.platform = platform
-                changed = True
-            if changed:
-                db.session.commit()
-        else:
-            db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
-            db.session.commit()
-
-    include_bus_id = bus_id if role_lower in {"pao", "driver"} else None
-
-    return (
-        jsonify(
-            message="Login successful",
-            token=token,
-            role=user.role,
-            busId=include_bus_id,
-            busSource=bus_source,
-            user={
-                "id": user.id,
-                "username": user.username,
-                "firstName": user.first_name,
-                "lastName": user.last_name,
-                "phoneNumber": user.phone_number,
-                "email": user.email,
-                "emailVerified": bool(user.email_verified_at),
-            },
-        ),
-        200,
-    )
+    # No token here — client must call /auth/login/verify-otp with the code
+    return jsonify(
+        otpRequired=True,
+        delivery="email",
+        to=_mask_email(user.email),
+        resendCooldown=resend_cooldown,
+        message="Verification code sent" if resend_cooldown == 0 else "Code recently sent; please wait before resending"
+    ), 200
 
 
 
 @auth_bp.route("/login/verify-otp", methods=["POST"])
 def login_verify_otp():
     """
-    Verify a commuter login OTP (purpose='login') and return a JWT on success.
-    Body: { username, code, expoPushToken?, platform? }
+    Verify a login OTP (purpose='login') for ANY role and return a JWT on success.
+    Body: { username | email, code, expoPushToken?, platform? }
     """
     data = request.get_json(silent=True) or {}
     ident = (data.get("username") or "").strip() or (data.get("email") or "").strip().lower()
@@ -489,13 +443,6 @@ def login_verify_otp():
     user = User.query.filter((User.username == ident) | (User.email == ident)).first()
     if not user:
         return jsonify(error="User not found"), 404
-
-    # Only commuters use this login MFA path
-    if (user.role or "").lower() != "commuter":
-        return jsonify(error="MFA not required for this account"), 400
-
-    if not (user.email and user.email_verified_at):
-        return jsonify(error="Email not verified"), 403
 
     row = (
         UserOtp.query.filter_by(user_id=user.id, purpose="login", channel="email")
@@ -512,13 +459,12 @@ def login_verify_otp():
     if _now_utc() > exp_ts:
         return jsonify(error="Code expired. Please request a new code."), 410
 
-    ok = secrets.compare_digest(row.code_hash, _hash_code(code))
-    if not ok:
+    if not secrets.compare_digest(row.code_hash, _hash_code(code)):
         row.attempts += 1
         db.session.commit()
         return jsonify(error="Invalid code"), 401
 
-    # Success: consume OTP and issue JWT
+    # Success → consume OTP
     try:
         db.session.delete(row)
         db.session.commit()
@@ -526,6 +472,30 @@ def login_verify_otp():
         db.session.rollback()
         return jsonify(error="Verification failed. Try again."), 500
 
+    # Compute bus info (same rules as /login)
+    role_lower = (user.role or "").lower()
+    legacy_bus = int(getattr(user, "assigned_bus_id", None) or 0) or None
+    bus_id = None
+    bus_source = "none"
+    if role_lower == "pao":
+        if legacy_bus is not None:
+            bus_id = legacy_bus
+            bus_source = "static"
+        else:
+            try:
+                bus_id = _today_bus_for_pao(user.id)
+                if bus_id is not None:
+                    bus_source = "pao_assignments"
+            except Exception:
+                current_app.logger.exception("[auth] _today_bus_for_pao lookup failed")
+        if bus_id is None:
+            # Should be very rare since we checked in /login, but keep safety
+            return jsonify(error="You are not assigned to a bus today. Please contact your manager."), 403
+    elif role_lower == "driver":
+        bus_id = legacy_bus
+        bus_source = "static" if bus_id is not None else "none"
+
+    # Issue JWT (24h)
     token = jwt.encode(
         {
             "user_id": user.id,
@@ -545,24 +515,21 @@ def login_verify_otp():
         if rec:
             changed = False
             if rec.user_id != user.id:
-                rec.user_id = user.id
-                changed = True
+                rec.user_id = user.id; changed = True
             if platform and rec.platform != platform:
-                rec.platform = platform
-                changed = True
+                rec.platform = platform; changed = True
             if changed:
                 db.session.commit()
         else:
             db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
             db.session.commit()
 
-    # Return same shape as normal login
     return jsonify(
         message="Login successful",
         token=token,
         role=user.role,
-        busId=None,
-        busSource="none",
+        busId=bus_id if role_lower in {"pao", "driver"} else None,
+        busSource=bus_source,
         user={
             "id": user.id,
             "username": user.username,
@@ -573,8 +540,6 @@ def login_verify_otp():
             "emailVerified": bool(user.email_verified_at),
         },
     ), 200
-
-
 
 @auth_bp.route("/verify-token", methods=["GET"])
 def verify_token():
@@ -660,14 +625,31 @@ def check_username_phone():
     ), 200
 
 
+
 @auth_bp.route("/otp/send", methods=["POST"])
 def otp_send():
-    data = request.get_json(silent=True) or {}
-    ident = (data.get("username") or "").strip() or (data.get("email") or "").strip().lower()
-    purpose = (data.get("purpose") or "signup").strip().lower()  # "signup" | "login"
-    if purpose not in {"signup", "login"}:
-        return jsonify(error="Invalid purpose"), 400
+    """
+    Send an OTP by email for purpose in {'signup','login','reset'}.
+    - 'login': allowed for ANY role; no email_verified_at requirement.
+    - 'reset': still commuter-only (keep/change to your policy).
+    Cooldown per purpose uses OTP_RESEND_COOLDOWN_SEC. Accepts JSON or form-encoded.
+    """
+    raw = request.get_json(silent=True) or {}
+    if not raw and request.form:
+        raw = request.form.to_dict()
 
+    def _coerce_purpose(p):
+        p = (p or "signup").strip().lower()
+        alias = {"forgot": "reset", "forgot-password": "reset", "password_reset": "reset", "password-reset": "reset"}
+        return alias.get(p, p)
+
+    purpose = _coerce_purpose(raw.get("purpose"))
+    ident = (raw.get("username") or "").strip() or (raw.get("email") or "").strip().lower() or (raw.get("to") or "").strip().lower()
+
+    current_app.logger.info("[otp_send] payload=%r → purpose=%s ident=%s", raw, purpose, ident or "<empty>")
+
+    if purpose not in {"signup", "login", "reset"}:
+        return jsonify(error="Invalid purpose; use signup, login, or reset"), 400
     if not ident:
         return jsonify(error="Provide username or email"), 400
 
@@ -675,12 +657,11 @@ def otp_send():
     if not user or not user.email:
         return jsonify(error="User/email not found"), 404
 
-    # For login purpose, ensure commuter + verified email
-    if purpose == "login":
-        if (user.role or "").lower() != "commuter":
-            return jsonify(error="MFA not required for this account"), 400
-        if not user.email_verified_at:
-            return jsonify(error="Email not verified"), 403
+    role_lower = (user.role or "").lower()
+
+    # Reset: keep commuter-only (align with your existing reset policy)
+    if purpose == "reset" and role_lower != "commuter":
+        return jsonify(error="Password reset via email is only available for commuter accounts"), 400
 
     # Cooldown per purpose
     last = (
@@ -689,10 +670,12 @@ def otp_send():
         .first()
     )
     if last:
-        last_ts = last.created_at if last.created_at.tzinfo else last.created_at.replace(tzinfo=timezone.utc)
-        since = (_now_utc() - last_ts).total_seconds()
-        if since < OTP_RESEND_COOLDOWN_SEC:
-            return jsonify(error=f"Please wait {int(OTP_RESEND_COOLDOWN_SEC - since)}s before requesting a new code"), 429
+        last_ts_utc = _to_utc(last.created_at)  # ← fix here too
+        since = (_now_utc() - last_ts_utc).total_seconds()
+        remaining = int(max(0, OTP_RESEND_COOLDOWN_SEC - since))
+        if remaining > 0:
+            return jsonify(error=f"Please wait {remaining}s before requesting a new code"), 429
+
 
     try:
         _create_and_email_otp(user, purpose=purpose)
@@ -701,7 +684,6 @@ def otp_send():
         return jsonify(error="Unable to send OTP right now"), 500
 
     return jsonify(message="OTP sent"), 200
-
 
 @auth_bp.route("/otp/verify", methods=["POST"])
 def otp_verify():
@@ -756,3 +738,108 @@ def otp_verify():
         return jsonify(error="Verification failed. Try again."), 500
 
     return jsonify(message="Email verified"), 200
+
+
+@auth_bp.route("/otp/verify-reset", methods=["POST"])
+def otp_verify_reset():
+    """
+    Verify a password-reset OTP (purpose='reset') by email.
+    Body: { email: str, code: str }
+    Does NOT consume the OTP; only validates it.
+    """
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    code  = (data.get("code") or "").strip()
+
+    if not email or not code:
+        return jsonify(error="email and code are required"), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify(error="User/email not found"), 404
+
+    # Optional: restrict to commuter accounts (keeps consistent with your older reset flow)
+    if (user.role or "").lower() != "commuter":
+        return jsonify(error="Password reset via email is only available for commuter accounts"), 400
+
+    row = (
+        UserOtp.query.filter_by(user_id=user.id, purpose="reset", channel="email")
+        .order_by(UserOtp.id.desc())
+        .first()
+    )
+    if not row:
+        return jsonify(error="No pending code. Please request a new one."), 404
+
+    # Expiry
+    exp_ts = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
+    if _now_utc() > exp_ts:
+        return jsonify(error="Code expired. Please request a new code."), 410
+
+    # Attempts & comparison
+    if not secrets.compare_digest(row.code_hash, _hash_code(code)):
+        row.attempts += 1
+        db.session.commit()
+        if row.attempts >= OTP_MAX_ATTEMPTS:
+            return jsonify(error="Too many attempts. Please request a new code."), 429
+        return jsonify(error="Invalid code"), 401
+
+    # Valid (do NOT delete here)
+    return jsonify(message="Code valid"), 200
+
+
+@auth_bp.route("/reset-password-email", methods=["POST"])
+def reset_password_email():
+    """
+    Reset password using email + OTP.
+    Body: { email: str, code: str, newPassword: str }
+    Validates latest OTP (purpose='reset'), updates password, and CONSUMES the OTP.
+    """
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    code  = (data.get("code") or "").strip()
+    new_pw = (data.get("newPassword") or "").strip()
+
+    if not email or not code or not new_pw:
+        return jsonify(error="email, code and newPassword are required"), 400
+    if len(new_pw) < 6:
+        return jsonify(error="newPassword must be at least 6 characters"), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify(error="User/email not found"), 404
+
+    # Optional: commuter-only, for parity with existing logic
+    if (user.role or "").lower() != "commuter":
+        return jsonify(error="Password reset via email is only available for commuter accounts"), 400
+
+    row = (
+        UserOtp.query.filter_by(user_id=user.id, purpose="reset", channel="email")
+        .order_by(UserOtp.id.desc())
+        .first()
+    )
+    if not row:
+        return jsonify(error="No pending code. Please request a new one."), 404
+
+    # Expiry
+    exp_ts = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
+    if _now_utc() > exp_ts:
+        return jsonify(error="Code expired. Please request a new code."), 410
+
+    # Attempts & comparison
+    if not secrets.compare_digest(row.code_hash, _hash_code(code)):
+        row.attempts += 1
+        db.session.commit()
+        if row.attempts >= OTP_MAX_ATTEMPTS:
+            return jsonify(error="Too many attempts. Please request a new code."), 429
+        return jsonify(error="Invalid code"), 401
+
+    # Update password + consume OTP
+    try:
+        user.set_password(new_pw)
+        db.session.delete(row)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify(error="Could not update password. Try again."), 500
+
+    return jsonify(message="Password updated successfully"), 200
