@@ -202,12 +202,8 @@ def _publish_user_event(uid: int, payload: dict) -> bool:
 @commuter_bp.route("/me", methods=["GET"])
 @require_role("commuter")
 def commuter_me():
-    """
-    GET /commuter/me
-    Basic profile for the logged-in commuter.
-    """
     u = g.user
-    def _val(x):  # normalize None -> '' for strings
+    def _val(x):
         return (x or "").strip() if isinstance(x, str) else x
 
     return jsonify(
@@ -216,6 +212,7 @@ def commuter_me():
         phone_number=_val(getattr(u, "phone_number", None)),
         first_name=_val(getattr(u, "first_name", None)),
         last_name=_val(getattr(u, "last_name", None)),
+        email=_val(getattr(u, "email", None)),             # ← add this line
         role=_val(getattr(u, "role", None)) or "commuter",
         created_at=(
             getattr(u, "created_at", None).isoformat()
@@ -223,8 +220,211 @@ def commuter_me():
         ),
     ), 200
 
+
 def _unique_ref(prefix: str) -> str:
     return f"{prefix}-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
+
+
+
+
+
+@commuter_bp.route("/dashboard", methods=["GET"])
+@require_role("commuter")
+def dashboard():
+
+
+
+    now_local = dt.datetime.now(LOCAL_TZ) if LOCAL_TZ else dt.datetime.now()
+    date_arg = (request.args.get("date") or "").strip()
+    force_now = (request.args.get("now") or request.args.get("force_now") or "").strip()
+
+    if date_arg:
+        try:
+            today_local = dt.datetime.strptime(date_arg, "%Y-%m-%d").date()
+        except ValueError:
+            today_local = now_local.date()
+    else:
+        today_local = now_local.date()
+
+    if force_now:
+        try:
+            hh, mm = map(int, force_now.split(":")[:2])
+            now_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except Exception:
+            pass
+
+    now_time_local = now_local.time().replace(tzinfo=None)
+
+    def _choose_greeting() -> str:
+        hr = now_local.hour
+        if hr < 12:
+            return "Good morning"
+        elif hr < 18:
+            return "Good afternoon"
+        return "Good evening"
+
+    next_trip_row = (
+        db.session.query(Trip, Bus.identifier.label("bus_identifier"))
+        .join(Bus, Trip.bus_id == Bus.id)
+        .filter(
+            Trip.service_date == today_local,
+            Trip.start_time >= now_time_local,
+        )
+        .order_by(Trip.start_time.asc())
+        .first()
+    )
+    if next_trip_row:
+        trip, identifier = next_trip_row
+        next_trip = {
+            "bus": (identifier or "").replace("bus-", "Bus "),
+            "start": _as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
+            "end": _as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
+        }
+    else:
+        next_trip = None
+
+    unread_msgs = Announcement.query.count()
+
+    last_ann_row = (
+        db.session.query(
+            Announcement,
+            User.first_name,
+            User.last_name,
+            Bus.identifier.label("bus_identifier"),
+        )
+        .join(User, Announcement.created_by == User.id)
+        .outerjoin(Bus, User.assigned_bus_id == Bus.id)
+        .order_by(Announcement.timestamp.desc())
+        .first()
+    )
+    last_announcement = None
+    if last_ann_row:
+        ann, fn, ln, bid = last_ann_row
+        last_announcement = {
+            "message": ann.message,
+            "timestamp": ann.timestamp.isoformat(),
+            "author_name": f"{fn} {ln}",
+            "bus_identifier": bid or "unassigned",
+        }
+
+    def _is_live_window(now_t: dt.time, s: Optional[dt.time], e: Optional[dt.time], *, grace_min: int = 3) -> bool:
+        if not s or not e:
+            return False
+        if s == e:
+            base = dt.datetime.combine(today_local, s)
+            nowd = dt.datetime.combine(today_local, now_t)
+            return abs((nowd - base).total_seconds()) <= grace_min * 60
+        return s <= now_t < e
+
+    live_now: List[Dict[str, Any]] = []
+
+
+    trips_today = (
+        db.session.query(Trip, Bus.identifier.label("bus_identifier"))
+        .join(Bus, Trip.bus_id == Bus.id)
+        .filter(Trip.service_date == today_local)
+        .order_by(Trip.start_time.asc())
+        .all()
+    )
+
+    for t, bid in trips_today:
+        sts = (
+            StopTime.query.filter_by(trip_id=t.id)
+            .order_by(StopTime.seq.asc(), StopTime.id.asc())
+            .all()
+        )
+
+        events: List[Dict[str, Any]] = []
+        if len(sts) < 2:
+            events.append({
+                "type": "trip",
+                "label": "In Transit",
+                "start": _as_time(t.start_time),
+                "end": _as_time(t.end_time),
+                "description": "",
+            })
+        else:
+            for idx, st in enumerate(sts):
+                s = _as_time(st.arrive_time or st.depart_time)
+                e = _as_time(st.depart_time or st.arrive_time)
+                if s or e:
+                    events.append({
+                        "type": "stop",
+                        "label": "At Stop",
+                        "start": s,
+                        "end": e,
+                        "description": st.stop_name,
+                    })
+                if idx < len(sts) - 1:
+                    nxt = sts[idx + 1]
+                    s2 = _as_time(st.depart_time or st.arrive_time)
+                    e2 = _as_time(nxt.arrive_time or nxt.depart_time)
+                    if s2 and e2 and s2 != e2:
+                        events.append({
+                            "type": "trip",
+                            "label": "In Transit",
+                            "start": s2,
+                            "end": e2,
+                            "description": f"{st.stop_name} → {nxt.stop_name}",
+                        })
+
+        chosen = None
+        for ev in events:
+            if _is_live_window(now_time_local, ev["start"], ev["end"], grace_min=3):
+                chosen = ev
+                live_now.append({
+                    "bus_id": t.bus_id,
+                    "bus": (bid or "").replace("bus-", "Bus "),
+                    "trip_id": t.id,
+                    "type": ev["type"],
+                    "label": ev["label"],
+                    "start": ev["start"].strftime("%H:%M"),
+                    "end": ev["end"].strftime("%H:%M"),
+                    "description": ev["description"],
+                })
+                break
+
+        ts = _as_time(t.start_time)
+        te = _as_time(t.end_time)
+        if not chosen and ts and te and _is_live_window(now_time_local, ts, te, grace_min=0):
+            live_now.append({
+                "bus_id": t.bus_id,
+                "bus": (bid or "").replace("bus-", "Bus "),
+                "trip_id": t.id,
+                "type": "trip",
+                "label": "In Transit",
+                "start": ts.strftime("%H:%M"),
+                "end": te.strftime("%H:%M"),
+                "description": "",
+            })
+
+
+    current_app.logger.info(
+        "dashboard live_now=%d now=%s date=%s trips=%d",
+        len(live_now),
+        now_time_local,
+        today_local,
+        len(trips_today),
+    )
+
+    payload: Dict[str, Any] = {
+        "greeting": _choose_greeting(),
+        "user_name": f"{g.user.first_name} {g.user.last_name}",
+        "next_trip": next_trip,
+        "unread_messages": int(unread_msgs or 0),
+        "last_announcement": last_announcement,
+        "live_now": live_now,
+    }
+  
+  
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp, 200
+
+
+
+
+
 
 def _save_receipt(file_storage, topup_id: int) -> Optional[str]:
     if not file_storage or not getattr(file_storage, "filename", None):
@@ -1248,196 +1448,7 @@ def commuter_get_ticket(ticket_id: int):
     return jsonify(payload), 200
 
 
-@commuter_bp.route("/dashboard", methods=["GET"])
-@require_role("commuter")
-def dashboard():
 
-    now_local = dt.datetime.now(LOCAL_TZ) if LOCAL_TZ else dt.datetime.now()
-    date_arg = (request.args.get("date") or "").strip()
-    force_now = (request.args.get("now") or request.args.get("force_now") or "").strip()
-
-    if date_arg:
-        try:
-            today_local = dt.datetime.strptime(date_arg, "%Y-%m-%d").date()
-        except ValueError:
-            today_local = now_local.date()
-    else:
-        today_local = now_local.date()
-
-    if force_now:
-        try:
-            hh, mm = map(int, force_now.split(":")[:2])
-            now_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        except Exception:
-            pass
-
-    now_time_local = now_local.time().replace(tzinfo=None)
-
-    def _choose_greeting() -> str:
-        hr = now_local.hour
-        if hr < 12:
-            return "Good morning"
-        elif hr < 18:
-            return "Good afternoon"
-        return "Good evening"
-
-    next_trip_row = (
-        db.session.query(Trip, Bus.identifier.label("bus_identifier"))
-        .join(Bus, Trip.bus_id == Bus.id)
-        .filter(
-            Trip.service_date == today_local,
-            Trip.start_time >= now_time_local,
-        )
-        .order_by(Trip.start_time.asc())
-        .first()
-    )
-    if next_trip_row:
-        trip, identifier = next_trip_row
-        next_trip = {
-            "bus": (identifier or "").replace("bus-", "Bus "),
-            "start": _as_time(trip.start_time).strftime("%H:%M") if _as_time(trip.start_time) else "",
-            "end": _as_time(trip.end_time).strftime("%H:%M") if _as_time(trip.end_time) else "",
-        }
-    else:
-        next_trip = None
-
-    unread_msgs = Announcement.query.count()
-
-    last_ann_row = (
-        db.session.query(
-            Announcement,
-            User.first_name,
-            User.last_name,
-            Bus.identifier.label("bus_identifier"),
-        )
-        .join(User, Announcement.created_by == User.id)
-        .outerjoin(Bus, User.assigned_bus_id == Bus.id)
-        .order_by(Announcement.timestamp.desc())
-        .first()
-    )
-    last_announcement = None
-    if last_ann_row:
-        ann, fn, ln, bid = last_ann_row
-        last_announcement = {
-            "message": ann.message,
-            "timestamp": ann.timestamp.isoformat(),
-            "author_name": f"{fn} {ln}",
-            "bus_identifier": bid or "unassigned",
-        }
-
-    def _is_live_window(now_t: dt.time, s: Optional[dt.time], e: Optional[dt.time], *, grace_min: int = 3) -> bool:
-        if not s or not e:
-            return False
-        if s == e:
-            base = dt.datetime.combine(today_local, s)
-            nowd = dt.datetime.combine(today_local, now_t)
-            return abs((nowd - base).total_seconds()) <= grace_min * 60
-        return s <= now_t < e
-
-    live_now: List[Dict[str, Any]] = []
-
-
-    trips_today = (
-        db.session.query(Trip, Bus.identifier.label("bus_identifier"))
-        .join(Bus, Trip.bus_id == Bus.id)
-        .filter(Trip.service_date == today_local)
-        .order_by(Trip.start_time.asc())
-        .all()
-    )
-
-    for t, bid in trips_today:
-        sts = (
-            StopTime.query.filter_by(trip_id=t.id)
-            .order_by(StopTime.seq.asc(), StopTime.id.asc())
-            .all()
-        )
-
-        events: List[Dict[str, Any]] = []
-        if len(sts) < 2:
-            events.append({
-                "type": "trip",
-                "label": "In Transit",
-                "start": _as_time(t.start_time),
-                "end": _as_time(t.end_time),
-                "description": "",
-            })
-        else:
-            for idx, st in enumerate(sts):
-                s = _as_time(st.arrive_time or st.depart_time)
-                e = _as_time(st.depart_time or st.arrive_time)
-                if s or e:
-                    events.append({
-                        "type": "stop",
-                        "label": "At Stop",
-                        "start": s,
-                        "end": e,
-                        "description": st.stop_name,
-                    })
-                if idx < len(sts) - 1:
-                    nxt = sts[idx + 1]
-                    s2 = _as_time(st.depart_time or st.arrive_time)
-                    e2 = _as_time(nxt.arrive_time or nxt.depart_time)
-                    if s2 and e2 and s2 != e2:
-                        events.append({
-                            "type": "trip",
-                            "label": "In Transit",
-                            "start": s2,
-                            "end": e2,
-                            "description": f"{st.stop_name} → {nxt.stop_name}",
-                        })
-
-        chosen = None
-        for ev in events:
-            if _is_live_window(now_time_local, ev["start"], ev["end"], grace_min=3):
-                chosen = ev
-                live_now.append({
-                    "bus_id": t.bus_id,
-                    "bus": (bid or "").replace("bus-", "Bus "),
-                    "trip_id": t.id,
-                    "type": ev["type"],
-                    "label": ev["label"],
-                    "start": ev["start"].strftime("%H:%M"),
-                    "end": ev["end"].strftime("%H:%M"),
-                    "description": ev["description"],
-                })
-                break
-
-        ts = _as_time(t.start_time)
-        te = _as_time(t.end_time)
-        if not chosen and ts and te and _is_live_window(now_time_local, ts, te, grace_min=0):
-            live_now.append({
-                "bus_id": t.bus_id,
-                "bus": (bid or "").replace("bus-", "Bus "),
-                "trip_id": t.id,
-                "type": "trip",
-                "label": "In Transit",
-                "start": ts.strftime("%H:%M"),
-                "end": te.strftime("%H:%M"),
-                "description": "",
-            })
-
-
-    current_app.logger.info(
-        "dashboard live_now=%d now=%s date=%s trips=%d",
-        len(live_now),
-        now_time_local,
-        today_local,
-        len(trips_today),
-    )
-
-    payload: Dict[str, Any] = {
-        "greeting": _choose_greeting(),
-        "user_name": f"{g.user.first_name} {g.user.last_name}",
-        "next_trip": next_trip,
-        "unread_messages": int(unread_msgs or 0),
-        "last_announcement": last_announcement,
-        "live_now": live_now,
-    }
-  
-  
-    resp = jsonify(payload)
-    resp.headers["Cache-Control"] = "no-store, max-age=0"
-    return resp, 200
 @commuter_bp.route("/trips", methods=["GET"])
 def list_all_trips():
     date_str = request.args.get("date")
