@@ -263,13 +263,24 @@ def me():
         "emailVerified": bool(getattr(u, "email_verified_at", None)),
     }), 200
 
-
-# -------------------------------------------------------------------
-# Signup (commuter) + send OTP if email provided
-# -------------------------------------------------------------------
 @auth_bp.route("/signup", methods=["POST"])
 def signup():
-    data = request.get_json() or {}
+    """
+    Create a commuter account, send a signup OTP by email (if email provided),
+    and immediately issue a JWT so the app can go straight to the dashboard.
+    Body JSON:
+      {
+        "firstName": str,
+        "lastName": str,
+        "email": str (optional),
+        "username": str,
+        "phoneNumber": "09XXXXXXXXX",  # PH format, 11 digits
+        "password": str
+      }
+    """
+    data = request.get_json(silent=True) or {}
+
+    # Required fields (email optional)
     required = ["firstName", "lastName", "username", "phoneNumber", "password"]
     if not all(k in data and str(data[k]).strip() for k in required):
         return jsonify(error="Missing fields"), 400
@@ -280,19 +291,20 @@ def signup():
     if not re.fullmatch(r"09\d{9}", digits):
         return jsonify(error="phoneNumber must start with 09 and be 11 digits (e.g., 09123456789)"), 400
 
+    # Normalize & validate email (optional)
     email = (data.get("email") or "").strip().lower()
     if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         return jsonify(error="Invalid email address"), 400
 
-    # Uniqueness
+    # Uniqueness checks (username, phone, and email if given)
     cond = (User.username == data["username"].strip()) | (User.phone_number == digits)
     if email:
         cond = cond | (User.email == email)
     existing = User.query.filter(cond).first()
-
     if existing:
         return jsonify(error="Username, phone or email already exists"), 409
 
+    # Create user
     user = User(
         first_name=data["firstName"].strip(),
         last_name=data["lastName"].strip(),
@@ -305,39 +317,63 @@ def signup():
     db.session.add(user)
     db.session.commit()
 
-    # Send OTP if email present
+    # If email present, create & send a signup OTP (non-blocking on send failure)
     if user.email:
-        code = _gen_otp_code()
-        rec = UserOtp(
-            user_id=user.id,
-            channel="email",
-            destination=user.email,
-            purpose="signup",
-            code_hash=_hash_code(code),
-            expires_at=_otp_expiry(),
-        )
-        db.session.add(rec)
-        db.session.commit()
-
-        html = f"""
-          <div style="font-family:system-ui,Segoe UI,Roboto,Arial">
-            <h2>Verify your email</h2>
-            <p>Your one-time code is:</p>
-            <div style="font-size:24px;font-weight:700;letter-spacing:3px">{code}</div>
-            <p>This code expires in {OTP_TTL_MINUTES} minutes.</p>
-          </div>
-        """
         try:
-            send_email(to=user.email, subject="Your verification code",
-                       html=html, text=f"Your code is {code}")
+            code = _gen_otp_code()
+            rec = UserOtp(
+                user_id=user.id,
+                channel="email",
+                destination=user.email,
+                purpose="signup",
+                code_hash=_hash_code(code),
+                expires_at=_otp_expiry(),
+            )
+            db.session.add(rec)
+            db.session.commit()
+
+            html = f"""
+              <div style="font-family:system-ui,Segoe UI,Roboto,Arial">
+                <h2>Verify your email</h2>
+                <p>Your one-time code is:</p>
+                <div style="font-size:24px;font-weight:700;letter-spacing:3px">{code}</div>
+                <p>This code expires in {OTP_TTL_MINUTES} minutes.</p>
+              </div>
+            """
+            try:
+                send_email(
+                    to=user.email,
+                    subject="Your verification code",
+                    html=html,
+                    text=f"Your code is {code}"
+                )
+            except Exception:
+                current_app.logger.exception("Failed to send signup OTP email (delivery error)")
         except Exception:
-            current_app.logger.exception("Failed to send signup OTP email")
+            current_app.logger.exception("Failed to create/signup OTP row")
+
+  
 
     return jsonify(
-        message="User registered successfully. Verification code sent." if user.email else "User registered successfully",
+        message=(
+            "User registered successfully. Verification code sent."
+            if user.email else "User registered successfully"
+        ),
         userId=user.id,
-        email=user.email
+        email=user.email,
+        role=user.role,
+   
+        user={
+            "id": user.id,
+            "username": user.username,
+            "firstName": user.first_name,
+            "lastName": user.last_name,
+            "phoneNumber": user.phone_number,
+            "email": user.email,
+            "emailVerified": bool(getattr(user, "email_verified_at", None)),
+        },
     ), 201
+
 
 @auth_bp.route("/login", methods=["POST"])
 def login():
@@ -690,13 +726,14 @@ def otp_verify():
     """
     Verify a one-time code for SIGNUP email verification.
     Body: { "username": "..."} OR { "email": "..." }, plus { "code": "123456" }.
-    Notes:
-      - Purpose here is fixed to 'signup' (login MFA uses /auth/login/verify-otp).
-      - Consumes the latest OTP if valid and marks users.email_verified_at.
+    Optional: { "expoPushToken": str, "platform": "ios"|"android" }
+    On success: marks email as verified AND returns a JWT so client can go to dashboard.
     """
     data = request.get_json(silent=True) or {}
     ident = (data.get("username") or "").strip() or (data.get("email") or "").strip().lower()
     code  = (data.get("code") or "").strip()
+    expo_token = (data.get("expoPushToken") or "").strip()
+    platform   = (data.get("platform") or "").strip()
 
     if not ident or not code:
         return jsonify(error="username/email and code are required"), 400
@@ -705,7 +742,7 @@ def otp_verify():
     if not user or not user.email:
         return jsonify(error="User/email not found"), 404
 
-    # Get the most recent signup OTP for this user
+    # Get most recent SIGNUP OTP
     row = (
         UserOtp.query
         .filter_by(user_id=user.id, purpose="signup", channel="email")
@@ -715,12 +752,12 @@ def otp_verify():
     if not row:
         return jsonify(error="No pending code. Please request a new one."), 404
 
-    # Expiry check (treat naive datetimes as UTC)
+    # Expiry (treat naive as UTC)
     exp_ts = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
     if _now_utc() > exp_ts:
-        return jsonify(error="Code expired. Please request a new code."), 410
+        return jsonify(error="Code expired. Please request a new one."), 410
 
-    # Attempts & comparison (constant-time)
+    # Attempts & comparison
     if not secrets.compare_digest(row.code_hash, _hash_code(code)):
         row.attempts += 1
         db.session.commit()
@@ -728,7 +765,7 @@ def otp_verify():
             return jsonify(error="Too many attempts. Please request a new code."), 429
         return jsonify(error="Invalid code"), 401
 
-    # Success → mark verified and consume OTP
+    # Success → mark verified & consume OTP
     try:
         user.email_verified_at = _now_utc()
         db.session.delete(row)
@@ -737,7 +774,51 @@ def otp_verify():
         db.session.rollback()
         return jsonify(error="Verification failed. Try again."), 500
 
-    return jsonify(message="Email verified"), 200
+    # Optional: register push token
+    if expo_token:
+        rec = DeviceToken.query.filter_by(token=expo_token).first()
+        if rec:
+            changed = False
+            if rec.user_id != user.id:
+                rec.user_id = user.id; changed = True
+            if platform and rec.platform != platform:
+                rec.platform = platform; changed = True
+            if changed:
+                db.session.commit()
+        else:
+            db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
+            db.session.commit()
+
+    # Issue JWT (24h)
+    try:
+        token = jwt.encode(
+            {
+                "user_id": user.id,
+                "username": user.username,
+                "role": user.role,
+                "exp": datetime.utcnow() + timedelta(hours=24),
+            },
+            SECRET_KEY,
+            algorithm="HS256",
+        )
+    except Exception:
+        current_app.logger.exception("JWT encode failed after OTP verify")
+        return jsonify(error="Could not create session token"), 500
+
+    return jsonify(
+        message="Email verified",
+        token=token,
+        role=user.role,
+        user={
+            "id": user.id,
+            "username": user.username,
+            "firstName": user.first_name,
+            "lastName": user.last_name,
+            "phoneNumber": user.phone_number,
+            "email": user.email,
+            "emailVerified": True,
+        },
+    ), 200
 
 
 @auth_bp.route("/otp/verify-reset", methods=["POST"])
