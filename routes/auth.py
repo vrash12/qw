@@ -560,6 +560,11 @@ def login_verify_otp():
             db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
             db.session.commit()
 
+    current_app.logger.info(
+    "[auth] verify-otp uid=%s → bus_id=%r source=%s",
+    user.id, bus_id, bus_source
+    )
+
     return jsonify(
         message="Login successful",
         token=token,
