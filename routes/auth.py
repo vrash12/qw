@@ -1,4 +1,3 @@
-# backend/routes/auth.py
 from __future__ import annotations
 
 import os
@@ -6,7 +5,8 @@ import re
 import time
 import jwt
 import hashlib, secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
+
 from flask import Blueprint, request, jsonify, g, current_app
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import load_only
@@ -16,6 +16,7 @@ from db import db
 from models.user import User
 from models.user_otp import UserOtp
 from models.device_token import DeviceToken
+from models.pao_assignment import PaoAssignment
 
 from auth_guard import require_role
 from utils.mail import send_email
@@ -29,11 +30,15 @@ auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 SECRET_KEY = os.environ.get("SECRET_KEY", "your-secret-key-here")
 MNL_TZ = timezone(timedelta(hours=8))
 LOGIN_MFA_ROLES = {"commuter", "pao", "manager", "teller"}
+
 # OTP config
-OTP_TTL_MINUTES        = int(os.environ.get("OTP_TTL_MINUTES", "10"))
-OTP_MAX_ATTEMPTS       = int(os.environ.get("OTP_MAX_ATTEMPTS", "5"))
-OTP_RESEND_COOLDOWN_SEC= int(os.environ.get("OTP_RESEND_COOLDOWN_SEC", "60"))
-OTP_PEPPER             = os.environ.get("OTP_PEPPER", "change-me")  # set long random in prod
+OTP_TTL_MINUTES         = int(os.environ.get("OTP_TTL_MINUTES", "10"))
+OTP_MAX_ATTEMPTS        = int(os.environ.get("OTP_MAX_ATTEMPTS", "5"))
+OTP_RESEND_COOLDOWN_SEC = int(os.environ.get("OTP_RESEND_COOLDOWN_SEC", "60"))
+OTP_PEPPER              = os.environ.get("OTP_PEPPER", "change-me")  # set long random in prod
+
+FIRST_USER_ID_NO_OTP    = int(os.environ.get("FIRST_USER_ID_NO_OTP", "1"))
+
 
 def _to_utc(dt: datetime) -> datetime:
     """Coerce a possibly-naive DB timestamp to aware UTC for safe math."""
@@ -42,7 +47,8 @@ def _to_utc(dt: datetime) -> datetime:
     # Assume DB wrote local server time (Asia/Manila), then convert to UTC
     return dt.replace(tzinfo=MNL_TZ).astimezone(timezone.utc)
 
-def _as_bool(x, default=False) -> bool:
+
+def _as_bool(x, default: bool = False) -> bool:
     if x is None:
         return default
     if isinstance(x, bool):
@@ -50,7 +56,10 @@ def _as_bool(x, default=False) -> bool:
     s = str(x).strip().lower()
     return s in {"1", "true", "yes", "on"}
 
-OTP_DEV_MODE = (str(os.environ.get("OTP_DEV_MODE", "0")).strip().lower() in {"1","true","yes","on"})
+
+OTP_DEV_MODE = (str(os.environ.get("OTP_DEV_MODE", "0")).strip().lower() in {"1", "true", "yes", "on"})
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -70,12 +79,14 @@ def _otp_expiry() -> datetime:
 def _bus_for_pao_on(user_id: int, day) -> int | None:
     """Helper used by some PAO/driver screens; looks up assignment on a given day."""
     bus_id = db.session.execute(
-        text("""
+        text(
+            """
             SELECT bus_id
             FROM pao_assignments
             WHERE user_id = :uid AND service_date = :d
             LIMIT 1
-        """),
+        """
+        ),
         {"uid": int(user_id), "d": day},
     ).scalar()
     current_app.logger.info("[auth] lookup pao uid=%s day=%s → bus_id=%r", user_id, day, bus_id)
@@ -84,59 +95,75 @@ def _bus_for_pao_on(user_id: int, day) -> int | None:
 
 def _today_bus_for_pao(user_id: int) -> int | None:
     day = datetime.now(MNL_TZ).date()
+    start = datetime.combine(day, datetime.min.time())
+    end   = datetime.combine(day + timedelta(days=1), datetime.min.time())
+
     bus_id = db.session.execute(
-        text("""
+        text(
+            """
             SELECT bus_id
             FROM pao_assignments
-            WHERE user_id = :uid AND DATE(service_date) = :d
+            WHERE user_id = :uid
+              AND service_date >= :start
+              AND service_date <  :end
             LIMIT 1
-        """),
-        {"uid": int(user_id), "d": day},
+            """
+        ),
+        {"uid": int(user_id), "start": start, "end": end},
     ).scalar()
     return int(bus_id) if bus_id is not None else None
+
 
 
 def _debug_dump_pao_state(user_id: int, day):
     """Optional debug: log what we have for PAO assignments for the given date."""
     try:
         row = db.session.execute(
-            text("""
+            text(
+                """
                 SELECT a.id, a.user_id, a.bus_id,
                        CAST(a.service_date AS CHAR) AS service_date_txt
                 FROM pao_assignments a
                 WHERE a.user_id=:uid AND DATE(a.service_date)=:d
                 ORDER BY a.id DESC
                 LIMIT 1
-            """),
-            {"uid": int(user_id), "d": day}
+            """
+            ),
+            {"uid": int(user_id), "d": day},
         ).mappings().first()
 
         day_rows = db.session.execute(
-            text("""
+            text(
+                """
                 SELECT a.id, a.user_id, a.bus_id,
                        CAST(a.service_date AS CHAR) AS service_date_txt
                 FROM pao_assignments a
                 WHERE DATE(a.service_date)=:d
                 ORDER BY a.bus_id
-            """),
-            {"d": day}
+            """
+            ),
+            {"d": day},
         ).mappings().all()
 
         near = db.session.execute(
-            text("""
+            text(
+                """
                 SELECT a.id, a.bus_id,
                        CAST(a.service_date AS CHAR) AS service_date_txt
                 FROM pao_assignments a
                 WHERE a.user_id=:uid
                 ORDER BY ABS(DATEDIFF(DATE(a.service_date), :d)) ASC
                 LIMIT 3
-            """),
-            {"uid": int(user_id), "d": day}
+            """
+            ),
+            {"uid": int(user_id), "d": day},
         ).mappings().all()
 
         current_app.logger.info(
             "[pao:debug] uid=%s check_day=%s user_day_row=%s day_rows=%s near=%s",
-            user_id, day, (dict(row) if row else None),
+            user_id,
+            day,
+            (dict(row) if row else None),
             [dict(r) for r in day_rows],
             [dict(n) for n in near],
         )
@@ -144,16 +171,12 @@ def _debug_dump_pao_state(user_id: int, day):
         current_app.logger.exception("[pao:debug] dump failed")
 
 
-# -------------------------------------------------------------------
-# Middleware
-# -------------------------------------------------------------------
 @auth_bp.after_request
 def add_perf_headers(resp):
     resp.headers["Connection"] = "keep-alive"
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
-FIRST_USER_ID_NO_OTP = int(os.environ.get("FIRST_USER_ID_NO_OTP", "1"))
 
 def _mask_email(addr: str) -> str:
     try:
@@ -195,8 +218,16 @@ def _create_and_email_otp(user: User, *, purpose: str) -> str:
 
     try:
         # Send first; only commit if delivery succeeded
-        subj = {"signup": "Verify your email", "login": "Your verification code", "reset": "Password reset code"}.get(purpose, "Your verification code")
-        heading = {"signup": "Verify your email", "login": "Verify your sign-in", "reset": "Reset your password"}.get(purpose, "Your verification code")
+        subj = {
+            "signup": "Verify your email",
+            "login": "Your verification code",
+            "reset": "Password reset code",
+        }.get(purpose, "Your verification code")
+        heading = {
+            "signup": "Verify your email",
+            "login": "Verify your sign-in",
+            "reset": "Reset your password",
+        }.get(purpose, "Your verification code")
         html = f"""
           <div style="font-family:system-ui,Segoe UI,Roboto,Arial">
             <h2>{heading}</h2>
@@ -212,14 +243,20 @@ def _create_and_email_otp(user: User, *, purpose: str) -> str:
         db.session.rollback()  # removes the OTP row so cooldown doesn't trigger
         raise
 
+
 def _require_login_otp(user: User) -> bool:
-    # Require OTP only for commuters who have a verified email, except the first user (id==1).
+    """
+    Legacy helper: require OTP only for commuters who have a verified email,
+    except the first user (id==FIRST_USER_ID_NO_OTP). Currently not used
+    by the /login route, which enforces OTP for all roles with email.
+    """
     return (
-        (user.id != FIRST_USER_ID_NO_OTP) and
-        (user.role or "").lower() == "commuter" and
-        bool(getattr(user, "email", None)) and
-        bool(getattr(user, "email_verified_at", None))
+        (user.id != FIRST_USER_ID_NO_OTP)
+        and (user.role or "").lower() == "commuter"
+        and bool(getattr(user, "email", None))
+        and bool(getattr(user, "email_verified_at", None))
     )
+
 
 # -------------------------------------------------------------------
 # Health
@@ -253,16 +290,22 @@ def me():
         current_app.logger.error(f"/auth/me token error: {e}")
         return jsonify(error="Authentication processing error"), 500
 
-    return jsonify({
-        "id": u.id,
-        "email": getattr(u, "email", None),
-        "first_name": getattr(u, "first_name", ""),
-        "last_name": getattr(u, "last_name", ""),
-        "role": getattr(u, "role", None),
-        "assigned_bus_id": getattr(u, "assigned_bus_id", None),
-        "emailVerified": bool(getattr(u, "email_verified_at", None)),
-    }), 200
+    return jsonify(
+        {
+            "id": u.id,
+            "email": getattr(u, "email", None),
+            "first_name": getattr(u, "first_name", ""),
+            "last_name": getattr(u, "last_name", ""),
+            "role": getattr(u, "role", None),
+            "assigned_bus_id": getattr(u, "assigned_bus_id", None),
+            "emailVerified": bool(getattr(u, "email_verified_at", None)),
+        }
+    ), 200
 
+
+# -------------------------------------------------------------------
+# Signup
+# -------------------------------------------------------------------
 @auth_bp.route("/signup", methods=["POST"])
 def signup():
     """
@@ -289,7 +332,9 @@ def signup():
     raw_phone = str(data.get("phoneNumber", ""))
     digits = re.sub(r"\D", "", raw_phone)
     if not re.fullmatch(r"09\d{9}", digits):
-        return jsonify(error="phoneNumber must start with 09 and be 11 digits (e.g., 09123456789)"), 400
+        return jsonify(
+            error="phoneNumber must start with 09 and be 11 digits (e.g., 09123456789)"
+        ), 400
 
     # Normalize & validate email (optional)
     email = (data.get("email") or "").strip().lower()
@@ -345,24 +390,22 @@ def signup():
                     to=user.email,
                     subject="Your verification code",
                     html=html,
-                    text=f"Your code is {code}"
+                    text=f"Your code is {code}",
                 )
             except Exception:
                 current_app.logger.exception("Failed to send signup OTP email (delivery error)")
         except Exception:
             current_app.logger.exception("Failed to create/signup OTP row")
 
-  
-
     return jsonify(
         message=(
             "User registered successfully. Verification code sent."
-            if user.email else "User registered successfully"
+            if user.email
+            else "User registered successfully"
         ),
         userId=user.id,
         email=user.email,
         role=user.role,
-   
         user={
             "id": user.id,
             "username": user.username,
@@ -375,6 +418,9 @@ def signup():
     ), 201
 
 
+# -------------------------------------------------------------------
+# Login (password → OTP)
+# -------------------------------------------------------------------
 @auth_bp.route("/login", methods=["POST"])
 def login():
     """
@@ -390,9 +436,16 @@ def login():
         return (
             User.query.options(
                 load_only(
-                    User.id, User.username, User.role, User.first_name, User.last_name,
-                    User.assigned_bus_id, User.password_hash, User.phone_number,
-                    User.email, User.email_verified_at,
+                    User.id,
+                    User.username,
+                    User.role,
+                    User.first_name,
+                    User.last_name,
+                    User.assigned_bus_id,
+                    User.password_hash,
+                    User.phone_number,
+                    User.email,
+                    User.email_verified_at,
                 )
             )
             .filter_by(username=data["username"])
@@ -422,7 +475,9 @@ def login():
             except Exception:
                 current_app.logger.exception("[auth] _today_bus_for_pao lookup failed")
         if bus_id is None:
-            return jsonify(error="You are not assigned to a bus today. Please contact your manager."), 403
+            return jsonify(
+                error="You are not assigned to a bus today. Please contact your manager."
+            ), 403
 
     # ✅ Require OTP for everyone (must have an email on file)
     if not user.email:
@@ -438,7 +493,7 @@ def login():
 
         should_send = True
         if last:
-            last_ts_utc = _to_utc(last.created_at)  # ← proper TZ handling
+            last_ts_utc = _to_utc(last.created_at)  # proper TZ handling
             since = (_now_utc() - last_ts_utc).total_seconds()
             remaining = int(max(0, OTP_RESEND_COOLDOWN_SEC - since))
             if remaining > 0:
@@ -458,9 +513,12 @@ def login():
         delivery="email",
         to=_mask_email(user.email),
         resendCooldown=resend_cooldown,
-        message="Verification code sent" if resend_cooldown == 0 else "Code recently sent; please wait before resending"
+        message=(
+            "Verification code sent"
+            if resend_cooldown == 0
+            else "Code recently sent; please wait before resending"
+        ),
     ), 200
-
 
 
 @auth_bp.route("/login/verify-otp", methods=["POST"])
@@ -471,7 +529,7 @@ def login_verify_otp():
     """
     data = request.get_json(silent=True) or {}
     ident = (data.get("username") or "").strip() or (data.get("email") or "").strip().lower()
-    code  = (data.get("code") or "").strip()
+    code = (data.get("code") or "").strip()
 
     if not ident or not code:
         return jsonify(error="username/email and code are required"), 400
@@ -526,17 +584,20 @@ def login_verify_otp():
                 current_app.logger.exception("[auth] _today_bus_for_pao lookup failed")
         if bus_id is None:
             # Should be very rare since we checked in /login, but keep safety
-            return jsonify(error="You are not assigned to a bus today. Please contact your manager."), 403
+            return jsonify(
+                error="You are not assigned to a bus today. Please contact your manager."
+            ), 403
     elif role_lower == "driver":
         bus_id = legacy_bus
         bus_source = "static" if bus_id is not None else "none"
 
-    # Issue JWT (24h)
+    role_lower = (user.role or "").lower()
+
     token = jwt.encode(
         {
             "user_id": user.id,
             "username": user.username,
-            "role": user.role,
+            "role": role_lower,  # ← always lower-case in JWT
             "exp": datetime.utcnow() + timedelta(hours=24),
         },
         SECRET_KEY,
@@ -551,9 +612,11 @@ def login_verify_otp():
         if rec:
             changed = False
             if rec.user_id != user.id:
-                rec.user_id = user.id; changed = True
+                rec.user_id = user.id
+                changed = True
             if platform and rec.platform != platform:
-                rec.platform = platform; changed = True
+                rec.platform = platform
+                changed = True
             if changed:
                 db.session.commit()
         else:
@@ -561,8 +624,10 @@ def login_verify_otp():
             db.session.commit()
 
     current_app.logger.info(
-    "[auth] verify-otp uid=%s → bus_id=%r source=%s",
-    user.id, bus_id, bus_source
+        "[auth] verify-otp uid=%s → bus_id=%r source=%s",
+        user.id,
+        bus_id,
+        bus_source,
     )
 
     return jsonify(
@@ -582,6 +647,73 @@ def login_verify_otp():
         },
     ), 200
 
+
+# -------------------------------------------------------------------
+# PAO session check (for live bus reassignment)
+# -------------------------------------------------------------------
+def resolve_pao_bus_for_today(user_id: int) -> tuple[int | None, str]:
+    """
+    Returns (bus_id, source) for the PAO's current assignment.
+
+    source is:
+      - 'pao_assignments' if coming from daily assignment table
+      - 'static' if from users.assigned_bus_id
+      - 'none' if no assignment
+    """
+    today = date.today()
+
+    # 1. Try daily assignment table first
+    pa = (
+        db.session.query(PaoAssignment)
+        .filter(
+            PaoAssignment.user_id == user_id,
+            PaoAssignment.service_date == today,
+        )
+        .order_by(PaoAssignment.id.desc())
+        .first()
+    )
+    if pa and pa.bus_id:
+        return pa.bus_id, "pao_assignments"
+
+    # 2. Fallback to static assigned_bus_id on users table
+    user = db.session.get(User, user_id)
+    if user and user.assigned_bus_id:
+        return user.assigned_bus_id, "static"
+
+    # 3. Nothing
+    return None, "none"
+
+@auth_bp.route("/session/check", methods=["GET"])
+def session_check():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return jsonify(error="UNAUTHENTICATED"), 401
+
+    token = auth.split(" ", 1)[1]
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        return jsonify(error="Token has expired"), 401
+    except jwt.InvalidTokenError:
+        return jsonify(error="Invalid token"), 401
+    except Exception:
+        current_app.logger.exception("/session/check decode failed")
+        return jsonify(error="Authentication error"), 500
+
+    role = (payload.get("role") or "").lower()
+    if role != "pao":
+        # Token is valid, but not a PAO → forbid, not "expired"
+        return jsonify(error="Forbidden"), 403
+
+    user_id = payload.get("user_id")
+    if not user_id:
+        return jsonify(error="UNAUTHENTICATED"), 401
+
+    # Now resolve today's bus
+    bus_id, source = resolve_pao_bus_for_today(int(user_id))
+    return jsonify(ok=True, busId=bus_id, busSource=source), 200
+
 @auth_bp.route("/verify-token", methods=["GET"])
 def verify_token():
     auth_header = request.headers.get("Authorization", "")
@@ -594,7 +726,10 @@ def verify_token():
         user = db.session.get(User, payload["user_id"])
         if not user:
             return jsonify(error="User not found"), 401
-        return jsonify(valid=True, user={"id": user.id, "username": user.username, "role": user.role}), 200
+        return jsonify(
+            valid=True,
+            user={"id": user.id, "username": user.username, "role": user.role},
+        ), 200
     except jwt.ExpiredSignatureError:
         return jsonify(error="Token has expired"), 401
     except jwt.InvalidTokenError:
@@ -602,14 +737,14 @@ def verify_token():
 
 
 # -------------------------------------------------------------------
-# Reset password + Check username/phone (unchanged)
+# Reset password + Check username/phone
 # -------------------------------------------------------------------
 @auth_bp.route("/reset-password", methods=["POST"])
 def reset_password_by_username_phone():
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
-    phone    = (data.get("phoneNumber") or "").strip()
-    new_pw   = (data.get("newPassword") or "").strip()
+    phone = (data.get("phoneNumber") or "").strip()
+    new_pw = (data.get("newPassword") or "").strip()
 
     if not username or not phone or not new_pw:
         return jsonify(error="username, phoneNumber and newPassword are required"), 400
@@ -618,7 +753,9 @@ def reset_password_by_username_phone():
 
     digits = re.sub(r"\D", "", phone)
     if not re.fullmatch(r"09\d{9}", digits):
-        return jsonify(error="phoneNumber must start with 09 and be 11 digits (e.g., 09123456789)"), 400
+        return jsonify(
+            error="phoneNumber must start with 09 and be 11 digits (e.g., 09123456789)"
+        ), 400
 
     user = User.query.filter_by(username=username, phone_number=digits, role="commuter").first()
     if not user:
@@ -635,8 +772,8 @@ def check_username_phone():
 
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
-    phone    = (data.get("phoneNumber") or "").strip()
-    digits   = _re.sub(r"\D", "", phone)
+    phone = (data.get("phoneNumber") or "").strip()
+    digits = _re.sub(r"\D", "", phone)
 
     username_exists = False
     phone_exists = False
@@ -644,29 +781,32 @@ def check_username_phone():
     role_of_username = None
 
     if username:
-      row = User.query.filter_by(username=username).first()
-      if row:
-        username_exists = True
-        role_of_username = (row.role or None)
+        row = User.query.filter_by(username=username).first()
+        if row:
+            username_exists = True
+            role_of_username = (row.role or None)
 
     if digits:
-      phone_exists = User.query.filter_by(phone_number=digits).first() is not None
+        phone_exists = User.query.filter_by(phone_number=digits).first() is not None
 
     if username and digits:
-      pair_match_commuter = (
-        User.query.filter_by(username=username, phone_number=digits, role="commuter").first() is not None
-      )
+        pair_match_commuter = (
+            User.query.filter_by(username=username, phone_number=digits, role="commuter").first()
+            is not None
+        )
 
     return jsonify(
         usernameExists=username_exists,
         phoneExists=phone_exists,
         match=pair_match_commuter,
         roleOfUsername=role_of_username,
-        resetAllowed=(role_of_username == "commuter")
+        resetAllowed=(role_of_username == "commuter"),
     ), 200
 
 
-
+# -------------------------------------------------------------------
+# Generic OTP send / signup / login / reset
+# -------------------------------------------------------------------
 @auth_bp.route("/otp/send", methods=["POST"])
 def otp_send():
     """
@@ -681,11 +821,20 @@ def otp_send():
 
     def _coerce_purpose(p):
         p = (p or "signup").strip().lower()
-        alias = {"forgot": "reset", "forgot-password": "reset", "password_reset": "reset", "password-reset": "reset"}
+        alias = {
+            "forgot": "reset",
+            "forgot-password": "reset",
+            "password_reset": "reset",
+            "password-reset": "reset",
+        }
         return alias.get(p, p)
 
     purpose = _coerce_purpose(raw.get("purpose"))
-    ident = (raw.get("username") or "").strip() or (raw.get("email") or "").strip().lower() or (raw.get("to") or "").strip().lower()
+    ident = (
+        (raw.get("username") or "").strip()
+        or (raw.get("email") or "").strip().lower()
+        or (raw.get("to") or "").strip().lower()
+    )
 
     current_app.logger.info("[otp_send] payload=%r → purpose=%s ident=%s", raw, purpose, ident or "<empty>")
 
@@ -702,7 +851,9 @@ def otp_send():
 
     # Reset: keep commuter-only (align with your existing reset policy)
     if purpose == "reset" and role_lower != "commuter":
-        return jsonify(error="Password reset via email is only available for commuter accounts"), 400
+        return jsonify(
+            error="Password reset via email is only available for commuter accounts"
+        ), 400
 
     # Cooldown per purpose
     last = (
@@ -711,12 +862,11 @@ def otp_send():
         .first()
     )
     if last:
-        last_ts_utc = _to_utc(last.created_at)  # ← fix here too
+        last_ts_utc = _to_utc(last.created_at)
         since = (_now_utc() - last_ts_utc).total_seconds()
         remaining = int(max(0, OTP_RESEND_COOLDOWN_SEC - since))
         if remaining > 0:
             return jsonify(error=f"Please wait {remaining}s before requesting a new code"), 429
-
 
     try:
         _create_and_email_otp(user, purpose=purpose)
@@ -725,6 +875,7 @@ def otp_send():
         return jsonify(error="Unable to send OTP right now"), 500
 
     return jsonify(message="OTP sent"), 200
+
 
 @auth_bp.route("/otp/verify", methods=["POST"])
 def otp_verify():
@@ -736,9 +887,9 @@ def otp_verify():
     """
     data = request.get_json(silent=True) or {}
     ident = (data.get("username") or "").strip() or (data.get("email") or "").strip().lower()
-    code  = (data.get("code") or "").strip()
+    code = (data.get("code") or "").strip()
     expo_token = (data.get("expoPushToken") or "").strip()
-    platform   = (data.get("platform") or "").strip()
+    platform = (data.get("platform") or "").strip()
 
     if not ident or not code:
         return jsonify(error="username/email and code are required"), 400
@@ -749,8 +900,7 @@ def otp_verify():
 
     # Get most recent SIGNUP OTP
     row = (
-        UserOtp.query
-        .filter_by(user_id=user.id, purpose="signup", channel="email")
+        UserOtp.query.filter_by(user_id=user.id, purpose="signup", channel="email")
         .order_by(UserOtp.id.desc())
         .first()
     )
@@ -785,9 +935,11 @@ def otp_verify():
         if rec:
             changed = False
             if rec.user_id != user.id:
-                rec.user_id = user.id; changed = True
+                rec.user_id = user.id
+                changed = True
             if platform and rec.platform != platform:
-                rec.platform = platform; changed = True
+                rec.platform = platform
+                changed = True
             if changed:
                 db.session.commit()
         else:
@@ -835,7 +987,7 @@ def otp_verify_reset():
     """
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
-    code  = (data.get("code") or "").strip()
+    code = (data.get("code") or "").strip()
 
     if not email or not code:
         return jsonify(error="email and code are required"), 400
@@ -846,7 +998,9 @@ def otp_verify_reset():
 
     # Optional: restrict to commuter accounts (keeps consistent with your older reset flow)
     if (user.role or "").lower() != "commuter":
-        return jsonify(error="Password reset via email is only available for commuter accounts"), 400
+        return jsonify(
+            error="Password reset via email is only available for commuter accounts"
+        ), 400
 
     row = (
         UserOtp.query.filter_by(user_id=user.id, purpose="reset", channel="email")
@@ -859,7 +1013,7 @@ def otp_verify_reset():
     # Expiry
     exp_ts = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
     if _now_utc() > exp_ts:
-        return jsonify(error="Code expired. Please request a new code."), 410
+        return jsonify(error="Code expired. Please request a new one."), 410
 
     # Attempts & comparison
     if not secrets.compare_digest(row.code_hash, _hash_code(code)):
@@ -882,7 +1036,7 @@ def reset_password_email():
     """
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
-    code  = (data.get("code") or "").strip()
+    code = (data.get("code") or "").strip()
     new_pw = (data.get("newPassword") or "").strip()
 
     if not email or not code or not new_pw:
@@ -896,7 +1050,9 @@ def reset_password_email():
 
     # Optional: commuter-only, for parity with existing logic
     if (user.role or "").lower() != "commuter":
-        return jsonify(error="Password reset via email is only available for commuter accounts"), 400
+        return jsonify(
+            error="Password reset via email is only available for commuter accounts"
+        ), 400
 
     row = (
         UserOtp.query.filter_by(user_id=user.id, purpose="reset", channel="email")
@@ -909,7 +1065,7 @@ def reset_password_email():
     # Expiry
     exp_ts = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
     if _now_utc() > exp_ts:
-        return jsonify(error="Code expired. Please request a new code."), 410
+        return jsonify(error="Code expired. Please request a new one."), 410
 
     # Attempts & comparison
     if not secrets.compare_digest(row.code_hash, _hash_code(code)):
