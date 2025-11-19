@@ -1154,13 +1154,30 @@ def ticket_metrics():
 
     bus_id = request.args.get("bus_id", type=int)
 
+    # 🔹 NEW: detect schema
+    has_voided = table_has_column("ticket_sales", "voided")
+    has_status = table_has_column("ticket_sales", "status")
+
     qs = db.session.query(
         func.date_format(TicketSale.created_at, "%Y-%m-%d").label("d"),
         func.count(TicketSale.id).label("tickets"),
         func.sum(TicketSale.price).label("revenue"),
-    ).filter(TicketSale.created_at.between(window_start, window_end))
+    ).filter(
+        TicketSale.created_at >= window_start,
+        TicketSale.created_at < window_end,
+    )
+
     if bus_id:
         qs = qs.filter(TicketSale.bus_id == bus_id)
+
+    # 🔹 NEW: exclude voided / refunded / cancelled tickets
+    if has_voided:
+        qs = qs.filter(TicketSale.voided.is_(False))
+    elif has_status:
+        voided_states = ("void", "voided", "refunded", "cancelled", "canceled")
+        qs = qs.filter(
+            ~func.lower(func.coalesce(TicketSale.status, "")).in_(voided_states)
+        )
 
     rows = qs.group_by("d").order_by("d").all()
 
@@ -1173,6 +1190,7 @@ def ticket_metrics():
         total_revenue += float(r.revenue or 0)
 
     return jsonify(daily=daily, total_tickets=total_tickets, total_revenue=round(total_revenue, 2)), 200
+
 
 # ─────────────────────────────────────────────
 # Buses (list + patch)
@@ -1888,6 +1906,7 @@ def list_fare_segments():
         200,
     )
 
+
 @manager_bp.route("/pao-assignments", methods=["POST"], endpoint="pao_assignments_upsert")
 @require_role("manager")
 def pao_assignments_upsert():
@@ -1919,6 +1938,7 @@ def pao_assignments_upsert():
 
     if not (uid and bid):
         return jsonify(error="user_id and bus_id are required"), 400
+
     try:
         day = _dt.strptime(day_str, "%Y-%m-%d").date()
     except ValueError:
@@ -1933,7 +1953,7 @@ def pao_assignments_upsert():
         return jsonify(error="invalid bus_id"), 400
 
     try:
-        # Conflicts (user-per-day, bus-per-day)
+        # ── Conflicts (user-per-day, bus-per-day) ────────────────────────────
         by_user = db.session.execute(
             text("""
                 SELECT a.id, a.bus_id
@@ -1965,6 +1985,7 @@ def pao_assignments_upsert():
                 note="no change",
             ), 200
 
+        # ── Upsert row ───────────────────────────────────────────────────────
         with db.session.begin_nested():
             if by_user and not by_bus:
                 # Move user's assignment to this bus
@@ -2005,27 +2026,51 @@ def pao_assignments_upsert():
 
         db.session.commit()
 
-        # Mirror only for "today in Manila" and clear bus from any other PAO first
+        # ── Mirror to users.assigned_bus_id for "today in Manila" ───────────
         try:
             if day == _dt.now(MNL).date():
-                db.session.execute(
-                    text("UPDATE users SET assigned_bus_id = NULL WHERE role = 'pao' AND assigned_bus_id = :b"),
-                    {"b": bid},
-                )
-                db.session.execute(
-                    text("UPDATE users SET assigned_bus_id = :b WHERE id = :u"),
-                    {"b": bid, "u": uid},
-                )
-                db.session.commit()
+                if table_has_column("users", "assigned_bus_id"):
+                    # Clear this bus from any other PAO first
+                    db.session.execute(
+                        text(
+                            "UPDATE users "
+                            "SET assigned_bus_id = NULL "
+                            "WHERE role = 'pao' AND assigned_bus_id = :b"
+                        ),
+                        {"b": bid},
+                    )
+                    # Set the bus for this PAO
+                    db.session.execute(
+                        text(
+                            "UPDATE users "
+                            "SET assigned_bus_id = :b "
+                            "WHERE id = :u"
+                        ),
+                        {"b": bid, "u": uid},
+                    )
+                    db.session.commit()
+                else:
+                    current_app.logger.info(
+                        "[pao-assignments] skip mirror: users.assigned_bus_id column missing"
+                    )
         except Exception:
             db.session.rollback()
-            current_app.logger.warning("[pao-assignments] mirror update skipped/failed", exc_info=True)
+            current_app.logger.warning(
+                "[pao-assignments] mirror update skipped/failed",
+                exc_info=True,
+            )
 
         current_app.logger.info(
             "[pao-assignments][POST] UPSERT ok id=%s user_id=%s bus_id=%s date=%s",
             res_id, uid, bid, day.isoformat()
         )
-        return jsonify(ok=True, id=res_id, user_id=uid, bus_id=bid, service_date=day.isoformat()), 200
+        return jsonify(
+            ok=True,
+            id=res_id,
+            user_id=uid,
+            bus_id=bid,
+            service_date=day.isoformat(),
+        ), 200
 
     except Exception as e:
         db.session.rollback()

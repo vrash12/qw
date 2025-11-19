@@ -10,7 +10,7 @@ class User(db.Model):
 
     # Match MySQL: BIGINT(20) UNSIGNED
     id               = db.Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
-
+    assigned_bus_id = db.Column(db.Integer, db.ForeignKey("buses.id"), nullable=True)
     username         = db.Column(db.String(80), nullable=False, unique=True, index=True)
     phone_number     = db.Column(db.String(32), nullable=True, unique=True)
     first_name       = db.Column(db.String(80), nullable=True)
