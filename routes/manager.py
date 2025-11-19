@@ -559,9 +559,7 @@ def manager_void_ticket(ticket_id: int):
         db.session.rollback()
         return jsonify(error=str(e)), 500
 
-# ─────────────────────────────────────────────
-# Commuters (lists & stats)
-# ─────────────────────────────────────────────
+
 @manager_bp.route("/commuters", methods=["GET"])
 @require_role("manager")
 def list_commuters():
@@ -575,15 +573,20 @@ def list_commuters():
     base = User.query.filter(User.role == "commuter")
 
     if q:
-        like = f"%{q}%"
-        base = base.filter(
-            or_(
-                User.first_name.ilike(like),
-                User.last_name.ilike(like),
-                User.username.ilike(like),
-                User.phone_number.ilike(like),
+        # 🔹 Split into words so "Juan Cruz" works:
+        #   - "Juan" can match first_name or username
+        #   - "Cruz" can match last_name, etc.
+        terms = [part.strip() for part in q.split() if part.strip()]
+        for term in terms:
+            like = f"%{term}%"
+            base = base.filter(
+                or_(
+                    User.first_name.ilike(like),
+                    User.last_name.ilike(like),
+                    User.username.ilike(like),
+                    User.phone_number.ilike(like),
+                )
             )
-        )
 
     total = base.count()
 
@@ -637,6 +640,7 @@ def list_commuters():
         jsonify({"items": items, "page": page, "page_size": page_size, "total": total, "pages": pages}),
         200,
     )
+
 
 @manager_bp.route("/commuters/<int:user_id>", methods=["GET"])
 @require_role("manager")
