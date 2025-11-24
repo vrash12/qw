@@ -4,7 +4,7 @@ from db import db
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.mysql import BIGINT
 from werkzeug.security import generate_password_hash, check_password_hash
-
+from datetime import date
 class User(db.Model):
     __tablename__ = "users"
 
@@ -17,6 +17,8 @@ class User(db.Model):
     last_name        = db.Column(db.String(80), nullable=True)
     role             = db.Column(db.String(32), nullable=False, default="commuter", index=True)
 
+    passenger_type = db.Column(db.String(20), nullable=False)       
+    discount_valid_until = db.Column(db.Date, nullable=True)        
     assigned_bus_id  = db.Column(db.Integer, db.ForeignKey("buses.id"), nullable=True, index=True)
     email            = db.Column(db.String(254), nullable=True, unique=True, index=True)
     password_hash    = db.Column(db.String(255), nullable=False)
@@ -55,6 +57,15 @@ class User(db.Model):
             return check_password_hash(self.password_hash or "", raw or "")
         except Exception:
             return False
+
+    @property
+    def has_active_discount(self) -> bool:
+        """
+        True when passenger_type is 'discount' and discount_valid_until is today or later.
+        """
+        pt = (self.passenger_type or "regular").lower()
+        exp = self.discount_valid_until
+        return pt == "discount" and isinstance(exp, date) and exp >= date.today()
 
     @property
     def name(self) -> str:

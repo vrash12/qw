@@ -369,30 +369,65 @@ def _commuter_label(ticket: TicketSale) -> str:
         return f"{u.first_name} {u.last_name}"
     return "Guest"
 
+
+
 def _payment_method_for_ticket_row(t: TicketSale) -> str:
     """
-    Canonicalize a ticket's payment method as 'wallet' or 'gcash'.
+    Canonicalize a ticket's payment method.
+    Logs the raw DB fields so we can compare with commuter-side logic.
+
+    Rules:
+      - If ticket_sales.payment_method is set → trust it.
+      - Else if there is any PSP ref (external_ref / gcash_ref) → 'gcash'.
+      - Else if there is a user_id and it's paid → 'wallet'.
+      - Else → treat as 'cash' (guest + no PSP ref).
     """
+    raw_pm   = getattr(t, "payment_method", None)
+    raw_ext  = getattr(t, "external_ref", None)
+    raw_gref = getattr(t, "gcash_ref", None)
+
+    result = None
     try:
+        # 1) explicit column, if present & non-empty
         if _has_column("ticket_sales", "payment_method"):
-            m = (getattr(t, "payment_method", None) or "").strip().lower()
-            if m in {"wallet", "gcash"}:
-                return m
+            m = (raw_pm or "").strip().lower()
+            if m in {"wallet", "gcash", "cash"}:
+                result = m
 
-        if _has_column("ticket_sales", "external_ref") and getattr(t, "external_ref", None):
-            return "gcash"
-        if _has_column("ticket_sales", "gcash_ref") and getattr(t, "gcash_ref", None):
-            return "gcash"
+        # 2) infer from PSP refs / wallet / guest
+        if result is None:
+            if (_has_column("ticket_sales", "external_ref") and raw_ext) or (
+                _has_column("ticket_sales", "gcash_ref") and raw_gref
+            ):
+                # any PSP ref → GCash
+                result = "gcash"
+            elif getattr(t, "user_id", None) and bool(getattr(t, "paid", False)):
+                # linked to user + paid + no PSP ref → wallet
+                result = "wallet"
+            else:
+                # guest + no PSP ref → assume CASH
+                result = "cash"
 
-        if getattr(t, "user_id", None) and bool(getattr(t, "paid", False)):
-            return "wallet"
-
-        if not getattr(t, "user_id", None):
-            return "gcash"
-
-        return "wallet"
     except Exception:
-        return "wallet"
+        # on any failure, treat as cash (safe for reporting)
+        result = "cash"
+
+    # 🔎 LOG
+    try:
+        current_app.logger.info(
+            "[ticket_payment_method][pao] ticket_id=%s "
+            "payment_method=%r external_ref=%r gcash_ref=%r "
+            "user_id=%r paid=%s -> resolved=%s",
+            getattr(t, "id", None),
+            raw_pm, raw_ext, raw_gref,
+            getattr(t, "user_id", None),
+            bool(getattr(t, "paid", False)),
+            result,
+        )
+    except Exception:
+        pass
+
+    return result
 
 def _serialize_ticket_json(t: TicketSale, origin_name: str, destination_name: str) -> dict:
     amount = int(round(float(t.price or 0)))
@@ -783,6 +818,8 @@ def wallet_resolve():
         ).scalar() or 0
     )
 
+    eff_pt, exp, active = _user_passenger_status(user)
+
     payload = {
         "valid": True,
         "token_type": token_type,
@@ -791,7 +828,12 @@ def wallet_resolve():
         "user_id": int(user.id),
         "name": f"{user.first_name} {user.last_name}",
         "balance_php": float(balance_pesos),
+        # 👇 effective passenger type (respects expiry)
+        "passenger_type": eff_pt,
+        "discount_valid_until": exp.isoformat() if exp else None,
+        "discount_active": bool(active),
     }
+
     resp = jsonify(payload)
 
     if _debug_enabled():
@@ -1235,11 +1277,12 @@ def preview_ticket():
         current_app.logger.exception("preview_ticket failed")
         return jsonify(error="internal error"), 500
 
+
 @pao_bp.route("/tickets", methods=["POST"])
 @require_role("pao")
 def pao_create_ticket():
     """
-    Create a wallet or GCash ticket (supports group via items[]).
+    Create a wallet, GCash, or cash ticket (supports group via items[]).
     Adds idempotency:
       - Accepts X-Idempotency-Key header or 'idempotency_key' in JSON.
       - Reuses 'external_ref' column to store the key for BOTH wallet & gcash.
@@ -1270,25 +1313,43 @@ def pao_create_ticket():
         if qty > 0:
             items.append({"passenger_type": pt, "quantity": qty})
     if not items:
+        # default single passenger if nothing specified
         items = [{"passenger_type": (data.get("primary_type") or "regular"), "quantity": 1}]
 
-    # Payment method + fields
+    # Payment method
     payment_method = (data.get("payment_method") or "").strip().lower()
-    if payment_method not in {"wallet", "gcash"}:
-        return jsonify(error="unsupported payment_method"), 400
+    if payment_method not in {"wallet", "gcash", "cash"}:
+        return jsonify(error="unsupported_payment_method"), 400
 
+    # Commuter
     commuter_id = data.get("commuter_id")
     try:
         commuter_id = int(commuter_id) if commuter_id is not None else None
     except Exception:
         commuter_id = None
 
+    user = User.query.get(commuter_id) if commuter_id else None
+    discount_ok = False
+    if user:
+        _, _, active = _user_passenger_status(user)
+        discount_ok = bool(active)
+
+    ignore_discount = bool(data.get("ignore_discount"))
+
+    if payment_method == "wallet" and commuter_id and discount_ok and not ignore_discount:
+        total_qty = sum(int(i.get("quantity") or 0) for i in items)
+        if total_qty == 1:
+            for i in items:
+                if int(i.get("quantity") or 0) > 0:
+                    i["passenger_type"] = "discount"
+
+    # Primary passenger_type (for TicketSale.passenger_type)
     primary_type = (data.get("primary_type") or "").strip().lower() or _primary_type_from_items(items)
+
     is_gcash = (payment_method == "gcash")
     gcash_paid = bool(data.get("gcash_paid")) if "gcash_paid" in data else is_gcash
     gcash_ref = (data.get("gcash_ref") or data.get("external_ref") or "").strip() or None
 
-    # Idempotency key (works for both methods)
     idem = (
         (request.headers.get("X-Idempotency-Key") or "").strip()
         or (data.get("idempotency_key") or "").strip()
@@ -1308,7 +1369,7 @@ def pao_create_ticket():
     if not (origin_stop_id and destination_stop_id):
         return jsonify(error="origin_stop_id and destination_stop_id are required"), 400
 
-    # Compute fare totals
+    # Compute fare totals (uses passenger_type from items, including our auto-discount)
     totals = _compute_totals(origin_stop_id, destination_stop_id, items)
     total_fare = int(totals["total_fare"] or 0)
     reg_qty    = int(totals["reg_qty"] or 0)
@@ -1351,7 +1412,10 @@ def pao_create_ticket():
 
         t.passenger_type = (primary_type or "regular")
         t.price = int(total_fare)
-        t.paid  = bool(gcash_paid or (payment_method == "wallet"))
+        # wallet + cash tickets are issued as "paid" immediately
+        t.paid  = bool(
+            gcash_paid or (payment_method in {"wallet", "cash"})
+        )
 
         if _has_column("ticket_sales", "payment_method"):
             t.payment_method = payment_method
@@ -1427,7 +1491,10 @@ def pao_create_ticket():
                 if t.user_id:
                     u = User.query.get(int(t.user_id))
                     if u:
-                        head_item["commuter"] = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or (u.username or f"User #{u.id}")
+                        head_item["commuter"] = (
+                            f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                            or (u.username or f"User #{u.id}")
+                        )
             except Exception:
                 pass
 
@@ -1443,7 +1510,10 @@ def pao_create_ticket():
             try:
                 u = User.query.get(int(t.user_id))
                 if u:
-                    commuter_name = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or (u.username or f"User #{u.id}")
+                    commuter_name = (
+                        f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                        or (u.username or f"User #{u.id}")
+                    )
             except Exception:
                 pass
 
@@ -1483,6 +1553,147 @@ def pao_create_ticket():
         current_app.logger.exception("Failed to create ticket: %s", e)
         db.session.rollback()
         return jsonify(error="failed to create ticket"), 500
+
+
+
+def _user_passenger_status(u: User) -> tuple[str, Optional[dt.date], bool]:
+    """
+    Returns (effective_passenger_type, discount_valid_until, is_active_discount)
+
+    effective_passenger_type is 'discount' ONLY when discount is still valid as of today.
+    """
+    raw_pt = (getattr(u, "passenger_type", None) or "regular").lower()
+    exp = getattr(u, "discount_valid_until", None)
+    today = dt.date.today()
+    active = (raw_pt == "discount" and isinstance(exp, dt.date) and exp >= today)
+    eff_pt = "discount" if active else "regular"
+    return eff_pt, exp, active
+
+
+
+@pao_bp.route("/discounts/verify", methods=["POST"])
+@require_role("pao")
+def verify_commuter_discount():
+    """
+    Verify a commuter's discount entitlement by scanning their wallet QR.
+
+    Body:
+      {
+        "wallet_token": "<token or deeplink>",
+        "discount_type": "student|senior|pwd|other",   # optional metadata
+        "expires_at": "YYYY-MM-DD"
+      }
+
+    Effect:
+      - Resolves the wallet token → commuter user
+      - Sets user.passenger_type = 'discount'
+      - Sets user.discount_valid_until = expires_at
+    """
+    data = request.get_json(silent=True) or {}
+
+    raw = (data.get("wallet_token") or data.get("token") or data.get("raw") or "").strip()
+    if not raw:
+        return jsonify(error="wallet_token is required"), 400
+
+    # Parse full URL vs bare token
+    token = raw
+    try:
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(raw)
+        if u.scheme and u.netloc:
+            qs = parse_qs(u.query)
+            token = (
+                qs.get("wallet_token", [None])[0]
+                or qs.get("token", [None])[0]
+                or qs.get("wlt", [None])[0]
+                or raw
+            )
+    except Exception:
+        token = raw
+
+    token = (token or "").strip()
+    if not token:
+        return jsonify(error="wallet_token is required"), 400
+
+    # Resolve token → user_id (same rules as /wallet/resolve)
+    user_id = None
+
+    uid1, _, _ = _try_user_qr_soft(token)
+    if uid1:
+        user_id = uid1
+
+    if user_id is None:
+        uid2, _, _ = _try_wallet_rot_soft(token)
+        if uid2:
+            user_id = uid2
+
+    if user_id is None and verify_wallet_token:
+        try:
+            uid3 = int(verify_wallet_token(token))
+            if uid3 > 0:
+                user_id = uid3
+        except Exception:
+            pass
+
+    if not user_id:
+        return jsonify(error="invalid or expired wallet token"), 422
+
+    u = User.query.get(int(user_id))
+    if not u or (u.role or "").lower() != "commuter":
+        return jsonify(error="commuter not found"), 404
+
+    # Parse expiry
+    expires_str = (data.get("expires_at") or data.get("discount_valid_until") or "").strip()
+    if not expires_str:
+        return jsonify(error="expires_at is required (YYYY-MM-DD)"), 400
+    try:
+        expires_date = dt.datetime.strptime(expires_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify(error="expires_at must be YYYY-MM-DD"), 400
+
+    # (Optional) discount_type metadata, not yet persisted
+    discount_type = (data.get("discount_type") or data.get("type") or "discount").strip().lower()
+    # If you want to store this (student/senior/etc), add a new column on users.
+
+    # Store as generic discount
+    u.passenger_type = "discount"
+    u.discount_valid_until = expires_date
+
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify(error="failed to save discount"), 500
+
+    # Optional: notify commuter
+    try:
+        title = "✅ Discount verified"
+        body  = f"Your discount is active until {expires_date.isoformat()}."
+        payload = {
+            "type": "discount_verified",
+            "discount_type": discount_type,
+            "discount_valid_until": expires_date.isoformat(),
+        }
+        push_to_user(
+            db, DeviceToken, int(u.id),
+            title, body, payload,
+            channelId="general", priority="high", ttl=600,
+        )
+    except Exception:
+        current_app.logger.exception("[discounts.verify] push failed")
+
+    eff_pt, _, active = _user_passenger_status(u)
+
+    return jsonify(
+        ok=True,
+        user_id=int(u.id),
+        name=f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip() or (u.username or f"User #{u.id}"),
+        passenger_type=eff_pt,
+        discount_active=bool(active),
+        discount_valid_until=expires_date.isoformat(),
+        discount_type=discount_type,
+    ), 200
+
 
 
 @pao_bp.route("/tickets/<int:ticket_id>/void", methods=["PATCH"])
@@ -1846,7 +2057,19 @@ def list_tickets():
 @require_role("pao")
 def list_commuters():
     users = User.query.filter_by(role="commuter").order_by(User.first_name, User.last_name).all()
-    return jsonify([{"id": u.id, "name": f"{u.first_name} {u.last_name}"} for u in users]), 200
+    out = []
+    for u in users:
+        eff_pt, exp, active = _user_passenger_status(u)
+        out.append({
+            "id": u.id,
+            "name": f"{u.first_name} {u.last_name}",
+            "passenger_type": eff_pt,
+            "discount_valid_until": exp.isoformat() if exp else None,
+            "discount_active": bool(active),
+        })
+    return jsonify(out), 200
+
+
 
 # ------------------------------------------------------------------------------
 # Announcements (broadcast) CRUD
@@ -1872,6 +2095,43 @@ def _ann_json(ann: Announcement) -> dict:
         "author_name": f"{(u.first_name or '')} {(u.last_name or '')}".strip() if u else "",
         "bus": bus_identifier,
     }
+@pao_bp.route("/commuters/<int:user_id>/discount", methods=["PATCH"])
+@require_role("pao")
+def update_commuter_discount(user_id: int):
+    u = User.query.get(user_id)
+    if not u or u.role != "commuter":
+        return jsonify(error="commuter not found"), 404
+
+    data = request.get_json(silent=True) or {}
+    pt = (data.get("passenger_type") or "").strip().lower()
+    valid_until_str = (data.get("discount_valid_until") or "").strip() or None
+
+    if pt not in ("regular", "discount"):
+        return jsonify(error="passenger_type must be 'regular' or 'discount'"), 400
+
+    valid_until = None
+    if pt == "discount":
+        if not valid_until_str:
+            return jsonify(error="discount_valid_until required for discounted commuters"), 400
+        try:
+            valid_until = dt.datetime.strptime(valid_until_str, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify(error="discount_valid_until must be YYYY-MM-DD"), 400
+
+    u.passenger_type = pt
+    u.discount_valid_until = valid_until
+
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify(error="failed to update commuter"), 500
+
+    return jsonify(
+        id=u.id,
+        passenger_type=u.passenger_type,
+        discount_valid_until=u.discount_valid_until.isoformat() if u.discount_valid_until else None,
+    ), 200
 
 
 @pao_bp.route("/broadcast", methods=["POST"])

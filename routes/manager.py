@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from werkzeug.utils import secure_filename
 from flask import Blueprint, request, jsonify, send_from_directory, current_app, g
+from routes.commuter import _payment_method_for_ticket
 
 # ✅ add or_ (and and_ if you ever need it)
 from sqlalchemy import func, text, literal, or_
@@ -493,6 +494,15 @@ def manager_void_ticket(ticket_id: int):
     already_void = _is_ticket_void_row(ticket)
     was_paid = bool(getattr(ticket, "paid", False))
 
+    # 🔹 NEW: detect how this ticket was paid
+    try:
+        method = _payment_method_for_ticket(ticket)  # "wallet", "gcash", "cash", ...
+    except Exception:
+        method = None
+
+    # only auto-refund for wallet/gcash tickets
+    auto_refund = method in {"wallet", "gcash"}
+
     if want_void:
         if already_void:
             return jsonify(
@@ -510,9 +520,23 @@ def manager_void_ticket(ticket_id: int):
             with db.session.begin():
                 _mark_ticket_void(ticket, reason)
                 refund_summary = {"refunded": False, "balance": None, "note": None}
-                if was_paid:
-                    refund_summary = _refund_paid_ticket(ticket, actor_id=getattr(g, "user", None) and g.user.id)
+
+                if was_paid and auto_refund:
+                    # wallet / gcash → refund into wallet
+                    refund_summary = _refund_paid_ticket(
+                        ticket,
+                        actor_id=getattr(g, "user", None) and g.user.id,
+                    )
+                elif was_paid and method == "cash":
+                    # cash payment → handled manually in cash
+                    refund_summary = {
+                        "refunded": False,
+                        "balance": None,
+                        "note": "cash payment: handle refund in cash",
+                    }
+
                 db.session.flush()
+
             return jsonify(
                 ok=True,
                 ticket_id=ticket.id,

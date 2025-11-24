@@ -39,7 +39,7 @@ from sqlalchemy import desc
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 import os, uuid, time
 from werkzeug.utils import secure_filename
-
+from datetime import date, datetime
 from models.wallet import TopUp
 try:
     from zoneinfo import ZoneInfo
@@ -82,38 +82,82 @@ THEMES = {
 RECEIPTS_DIR = "topup_receipts"
 ALLOWED_EXTS = {"jpg", "jpeg", "png", "webp"}
 
-# ───────────────────────────── BUS STAFF HELPERS ─────────────────────────────
+
 def _payment_method_for_ticket(t: TicketSale) -> str:
+    """
+    Decide 'wallet' vs 'gcash' vs 'cash' for a TicketSale row.
+    Also logs what was found in the DB columns so we can debug mismatches.
+    """
+    # Grab raw fields for logging
+    raw_pm   = getattr(t, "payment_method", None)
+    raw_meth = getattr(t, "method", None)
+    raw_paym = getattr(t, "pay_method", None)
+    raw_ext  = getattr(t, "external_ref", None)
+    raw_gref = getattr(t, "gcash_ref", None)
+    raw_pref = getattr(t, "provider_ref", None)
+    raw_psp  = getattr(t, "psp_ref", None)
+
+    result = None
+
+    # 1) explicit field on the ticket row
     for attr in ("payment_method", "method", "pay_method"):
         v = getattr(t, attr, None)
         if isinstance(v, str):
             vv = v.strip().lower()
-            if vv in {"wallet", "gcash"}:
-                return vv
-    for attr in ("external_ref", "gcash_ref", "provider_ref", "psp_ref"):
-        ref = getattr(t, attr, None)
-        if isinstance(ref, str) and ref.strip():
-            return "gcash"
+            if vv in {"wallet", "gcash", "cash"}:
+                result = vv
+                break
+
+    # 2) GCash hints on ticket (only if nothing decided yet)
+    if result is None:
+        for attr in ("external_ref", "gcash_ref", "provider_ref", "psp_ref"):
+            ref = getattr(t, attr, None)
+            if isinstance(ref, str) and ref.strip():
+                result = "gcash"
+                break
+
+    # 3) wallet ledger that references this ticket (only if still undecided)
+    if result is None:
+        try:
+            rid = int(getattr(t, "id", 0) or 0)
+            if rid:
+                hit = db.session.execute(
+                    text("""
+                        SELECT 1
+                        FROM wallet_ledger
+                        WHERE ref_table IN ('ticket_sale','ticket_sales')
+                          AND ref_id = :rid
+                          AND direction = 'debit'
+                          AND event IN ('ticket_purchase','ride')
+                        LIMIT 1
+                    """),
+                    {"rid": rid},
+                ).scalar()
+                if hit:
+                    result = "wallet"
+        except Exception:
+            pass
+
+    # 4) final fallback: everything else → CASH, not GCash
+    if result is None:
+        result = "cash"
+
+    # 🔎 LOG
     try:
-        rid = int(getattr(t, "id", 0) or 0)
-        if rid:
-            hit = db.session.execute(
-                db.text("""
-                    SELECT 1
-                    FROM wallet_ledger
-                    WHERE ref_table IN ('ticket_sale','ticket_sales')
-                      AND ref_id = :rid
-                      AND direction = 'debit'
-                      AND event IN ('ticket_purchase','ride')
-                    LIMIT 1
-                """),
-                {"rid": rid},
-            ).scalar()
-            if hit:
-                return "wallet"
+        current_app.logger.info(
+            "[ticket_payment_method][commuter] ticket_id=%s "
+            "payment_method=%r method=%r pay_method=%r "
+            "external_ref=%r gcash_ref=%r provider_ref=%r psp_ref=%r "
+            "-> resolved=%s",
+            getattr(t, "id", None),
+            raw_pm, raw_meth, raw_paym,
+            raw_ext, raw_gref, raw_pref, raw_psp,
+            result,
+        )
     except Exception:
         pass
-    return "gcash"
+
+    return result
 
 def _fmt_name(u: Optional[User]) -> str:
     if not u:
@@ -203,8 +247,11 @@ def _publish_user_event(uid: int, payload: dict) -> bool:
 @require_role("commuter")
 def commuter_me():
     u = g.user
+
     def _val(x):
         return (x or "").strip() if isinstance(x, str) else x
+
+    discount_until = getattr(u, "discount_valid_until", None)
 
     return jsonify(
         id=int(u.id),
@@ -212,20 +259,27 @@ def commuter_me():
         phone_number=_val(getattr(u, "phone_number", None)),
         first_name=_val(getattr(u, "first_name", None)),
         last_name=_val(getattr(u, "last_name", None)),
-        email=_val(getattr(u, "email", None)),             # ← add this line
+        email=_val(getattr(u, "email", None)),
         role=_val(getattr(u, "role", None)) or "commuter",
         created_at=(
             getattr(u, "created_at", None).isoformat()
             if getattr(u, "created_at", None) else None
         ),
+        # 🔹 NEW: category + expiry for dashboard
+        passenger_type=_val(getattr(u, "passenger_type", None)),
+        passenger_type_expires_at=(
+            discount_until.isoformat() if discount_until else None
+        ),
+        # (optional: also expose raw DB column if you want it elsewhere)
+        discount_valid_until=(
+            discount_until.isoformat() if discount_until else None
+        ),
+        
     ), 200
 
 
 def _unique_ref(prefix: str) -> str:
     return f"{prefix}-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-
-
-
 
 
 @commuter_bp.route("/dashboard", methods=["GET"])
@@ -713,9 +767,10 @@ def _payment_method_for_ticket_row(t) -> str:
         v = getattr(t, attr, None)
         if isinstance(v, str):
             vv = v.strip().lower()
-            if vv in {"wallet", "gcash"}:
+            # 🔧 include "cash"
+            if vv in {"wallet", "gcash", "cash"}:
                 return vv
-
+            
     # 2) GCash hints on ticket
     for attr in ("external_ref", "gcash_ref", "provider_ref", "psp_ref"):
         ref = getattr(t, attr, None)
@@ -941,10 +996,33 @@ def commuter_ticket_image(ticket_id: int):
     draw.rectangle((L, y, R, y + 4), fill=BORDER)
     y += 30
 
-    # Amount + state
     is_void = _is_ticket_void(t)
     method  = _payment_method_for_ticket(t)
-    method_display = "Wallet" if method == "wallet" else "GCash"
+
+    # 🔎 log what the image renderer sees
+    try:
+        current_app.logger.info(
+            "[ticket_image] ticket_id=%s db_payment_method=%r external_ref=%r gcash_ref=%r "
+            "provider_ref=%r psp_ref=%r resolved_method=%s paid=%s",
+            t.id,
+            getattr(t, "payment_method", None),
+            getattr(t, "external_ref", None),
+            getattr(t, "gcash_ref", None),
+            getattr(t, "provider_ref", None),
+            getattr(t, "psp_ref", None),
+            method,
+            bool(getattr(t, "paid", False)),
+        )
+    except Exception:
+        pass
+
+    if method == "wallet":
+        method_display = "Wallet"
+    elif method == "cash":
+        method_display = "Cash"
+    else:
+        method_display = "GCash"
+
 
     draw.text((L, y), "TOTAL AMOUNT", fill=MUTED, font=ft_label)
     draw.text((L, y + 44), f"₱{total_peso}", fill=ACCENT, font=ft_big)
