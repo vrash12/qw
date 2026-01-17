@@ -419,17 +419,16 @@ def signup():
     ), 201
 
 
-# -------------------------------------------------------------------
-# Login (password → OTP)
-# -------------------------------------------------------------------
 @auth_bp.route("/login", methods=["POST"])
 def login():
     """
-    Password check → always require an email OTP to proceed (all roles).
-    No role-based MFA gating and no email_verified_at check.
-    PAO bus rule still enforced before sending OTP.
+    Password check → issue JWT immediately (NO OTP).
+    Still enforces:
+      - PAO must have a bus today (before issuing token)
+    Accepts optional:
+      - expoPushToken, platform  (for registering device token)
     """
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     if "username" not in data or "password" not in data:
         return jsonify(error="Missing username or password"), 400
 
@@ -466,61 +465,79 @@ def login():
 
     role_lower = (user.role or "").lower()
 
-    # 🔒 PAO must have a bus today (before we even send OTP)
+    # 🔒 PAO must have a bus today
     legacy_bus = int(getattr(user, "assigned_bus_id", None) or 0) or None
+    bus_id = None
+    bus_source = "none"
+
     if role_lower == "pao":
-        bus_id = legacy_bus
-        if bus_id is None:
+        if legacy_bus is not None:
+            bus_id = legacy_bus
+            bus_source = "static"
+        else:
             try:
                 bus_id = _today_bus_for_pao(user.id)
+                if bus_id is not None:
+                    bus_source = "pao_assignments"
             except Exception:
                 current_app.logger.exception("[auth] _today_bus_for_pao lookup failed")
+
         if bus_id is None:
             return jsonify(
                 error="You are not assigned to a bus today. Please contact your manager."
             ), 403
 
-    # ✅ Require OTP for everyone (must have an email on file)
-    if not user.email:
-        return jsonify(error="No email on file for this account."), 400
+    elif role_lower == "driver":
+        bus_id = legacy_bus
+        bus_source = "static" if bus_id is not None else "none"
 
-    resend_cooldown = 0
-    try:
-        last = (
-            UserOtp.query.filter_by(user_id=user.id, purpose="login", channel="email")
-            .order_by(UserOtp.id.desc())
-            .first()
-        )
+    # ✅ Issue JWT (24h)
+    token = jwt.encode(
+        {
+            "user_id": user.id,
+            "username": user.username,
+            "role": role_lower,  # always lower-case in JWT
+            "exp": datetime.utcnow() + timedelta(hours=24),
+        },
+        SECRET_KEY,
+        algorithm="HS256",
+    )
 
-        should_send = True
-        if last:
-            last_ts_utc = _to_utc(last.created_at)  # proper TZ handling
-            since = (_now_utc() - last_ts_utc).total_seconds()
-            remaining = int(max(0, OTP_RESEND_COOLDOWN_SEC - since))
-            if remaining > 0:
-                should_send = False
-                resend_cooldown = remaining
+    # ✅ Optional push-token registration (same logic you had in verify-otp)
+    expo_token = (data.get("expoPushToken") or "").strip()
+    platform = (data.get("platform") or "").strip()
+    if expo_token:
+        rec = DeviceToken.query.filter_by(token=expo_token).first()
+        if rec:
+            changed = False
+            if rec.user_id != user.id:
+                rec.user_id = user.id
+                changed = True
+            if platform and rec.platform != platform:
+                rec.platform = platform
+                changed = True
+            if changed:
+                db.session.commit()
+        else:
+            db.session.add(DeviceToken(user_id=user.id, token=expo_token, platform=platform))
+            db.session.commit()
 
-        if should_send:
-            _create_and_email_otp(user, purpose="login")
-
-    except Exception:
-        current_app.logger.exception("Failed to send login OTP email")
-        return jsonify(error="Unable to send verification code. Please try again."), 500
-
-    # No token here — client must call /auth/login/verify-otp with the code
     return jsonify(
-        otpRequired=True,
-        delivery="email",
-        to=_mask_email(user.email),
-        resendCooldown=resend_cooldown,
-        message=(
-            "Verification code sent"
-            if resend_cooldown == 0
-            else "Code recently sent; please wait before resending"
-        ),
+        message="Login successful",
+        token=token,
+        role=user.role,
+        busId=bus_id if role_lower in {"pao", "driver"} else None,
+        busSource=bus_source,
+        user={
+            "id": user.id,
+            "username": user.username,
+            "firstName": user.first_name,
+            "lastName": user.last_name,
+            "phoneNumber": user.phone_number,
+            "email": user.email,
+            "emailVerified": bool(user.email_verified_at),
+        },
     ), 200
-
 
 @auth_bp.route("/login/verify-otp", methods=["POST"])
 def login_verify_otp():

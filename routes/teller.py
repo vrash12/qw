@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 from flask import Blueprint, request, jsonify, current_app, url_for, g
 from sqlalchemy.orm import aliased
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import SQLAlchemyError
 from db import db
 from models.user import User
@@ -54,8 +54,58 @@ RECEIPTS_DIR = "topup_receipts"
 SALT_USER_QR = "user-qr-v1"
 SALT_WALLET_QR = "wallet-qr-rot-v1"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Small helpers
+
+def _norm_uid(uid: str) -> str:
+    # keep only hex-ish chars + digits; works with "47631906" too
+    u = (uid or "").strip().replace(" ", "").upper()
+    u = "".join([c for c in u if c in "0123456789ABCDEF"])
+    return u
+
+def _ensure_nfc_cards_table() -> None:
+    """
+    Dev-friendly: auto-create table if missing.
+    If you use migrations, do it there instead and remove this.
+    """
+    try:
+        db.session.execute(text("""
+            CREATE TABLE IF NOT EXISTS nfc_cards (
+                uid TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_nfc_cards_user_id ON nfc_cards(user_id)"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("[teller] ensure nfc_cards table failed")
+
+def _lookup_user_by_nfc(uid: str) -> Optional[int]:
+    uid = _norm_uid(uid)
+    if not uid:
+        return None
+
+    _ensure_nfc_cards_table()
+
+    try:
+        row = db.session.execute(
+            text("SELECT user_id, status FROM nfc_cards WHERE uid=:uid LIMIT 1"),
+            {"uid": uid},
+        ).mappings().first()
+    except Exception:
+        current_app.logger.exception("[teller] nfc lookup failed")
+        return None
+
+    if not row:
+        return None
+    if (row.get("status") or "").lower() != "active":
+        return None
+
+    try:
+        return int(row["user_id"])
+    except Exception:
+        return None
 
 def _now_mnl() -> datetime:
     return datetime.now(MNL_TZ)
@@ -493,20 +543,34 @@ def get_topup_request(tid: int):
 @require_role("teller")
 def resolve_wallet_token():
     data = request.get_json(silent=True) or {}
+
     wallet_token = (data.get("wallet_token") or data.get("token") or "").strip()
     wallet_user_id = data.get("user_id") or data.get("wallet_user_id")
+
+    # NEW: NFC UID support
+    nfc_uid = (data.get("uid") or data.get("nfc_uid") or "").strip()
 
     account_user_id: Optional[int] = None
     token_type: Optional[str] = None
 
-    if wallet_token:
-        # 1) static DB token (from /wallet/qrcode/rotate)
+    # 0) NFC UID (highest priority if provided)
+    if nfc_uid:
+        uid = _lookup_user_by_nfc(nfc_uid)
+        if not uid:
+            return jsonify(error="unknown_or_blocked_card"), 404
+        account_user_id = int(uid)
+        token_type = "nfc_uid"
+
+    # 1) Existing wallet token flows
+    if not account_user_id and wallet_token:
         acct = WalletAccount.query.filter_by(qr_token=wallet_token).first()
+        if not acct:
+            acct = WalletAccount.query.filter_by(nfc_uid=wallet_token).first()
+
         if acct:
             account_user_id = int(acct.user_id)
             token_type = "wallet_token"
         else:
-            # 2) rotating signed token (from /wallet/qrcode)
             uid = _unsign_wallet_qr(wallet_token, leeway_buckets=2)
             if uid:
                 account_user_id = int(uid)
@@ -514,6 +578,7 @@ def resolve_wallet_token():
             else:
                 return jsonify(error="invalid wallet token"), 400
 
+    # 2) user_id direct
     if not account_user_id and wallet_user_id not in (None, "", 0, "0"):
         try:
             account_user_id = int(wallet_user_id)
@@ -522,7 +587,7 @@ def resolve_wallet_token():
         token_type = "user_id"
 
     if not account_user_id:
-        return jsonify(error="missing wallet_token or user_id"), 400
+        return jsonify(error="missing wallet_token or user_id or uid"), 400
 
     user = User.query.get(account_user_id)
     if not user:
@@ -541,6 +606,94 @@ def resolve_wallet_token():
         "name": _user_name(user),
         "id": user.id,
     }), 200
+
+@teller_bp.route("/wallet/nfc/link", methods=["POST"])
+@require_role("teller")
+def link_nfc_card():
+    data = request.get_json(silent=True) or {}
+
+    raw_uid = str(data.get("nfc_uid") or data.get("uid") or "").strip()
+    if not raw_uid:
+        return jsonify(error="missing nfc_uid"), 400
+
+    try:
+        user_id = int(data.get("user_id"))
+    except Exception:
+        return jsonify(error="invalid user_id"), 400
+
+    uid = _norm_uid(raw_uid)
+    if not uid:
+        return jsonify(error="invalid uid format"), 400
+
+    # ensure table exists
+    _ensure_nfc_cards_table()
+
+    # ensure user exists
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify(error="user not found"), 404
+
+    # prevent one card being linked to another user
+    existing = db.session.execute(
+        text("SELECT user_id FROM nfc_cards WHERE uid=:uid LIMIT 1"),
+        {"uid": uid},
+    ).mappings().first()
+
+    if existing and int(existing["user_id"]) != int(user_id):
+        return jsonify(error="card already linked to another user"), 409
+
+    try:
+        # upsert (works on SQLite/Postgres)
+        dialect = db.engine.dialect.name
+        if dialect in ("sqlite", "postgresql"):
+            db.session.execute(text("""
+                INSERT INTO nfc_cards(uid, user_id, status)
+                VALUES(:uid, :user_id, 'active')
+                ON CONFLICT(uid) DO UPDATE SET
+                  user_id=excluded.user_id,
+                  status='active'
+            """), {"uid": uid, "user_id": user_id})
+        else:
+            # fallback for other DBs
+            db.session.execute(text("DELETE FROM nfc_cards WHERE uid=:uid"), {"uid": uid})
+            db.session.execute(text("""
+                INSERT INTO nfc_cards(uid, user_id, status)
+                VALUES(:uid, :user_id, 'active')
+            """), {"uid": uid, "user_id": user_id})
+
+        # OPTIONAL (but good): mirror into wallet_accounts too (backwards compatible)
+        acct = WalletAccount.query.get(user_id)
+        if not acct:
+            acct = WalletAccount(user_id=user_id, balance_pesos=0)
+            db.session.add(acct)
+        acct.nfc_uid = uid
+
+        db.session.commit()
+        return jsonify(ok=True, user_id=user_id, nfc_uid=uid), 200
+
+    except Exception as e:
+        current_app.logger.exception("[teller] link_nfc_card failed uid=%s user_id=%s", uid, user_id)
+        db.session.rollback()
+        return jsonify(error=str(e)), 400
+
+
+@teller_bp.route("/wallet/<int:user_id>/bind-card", methods=["POST"])
+@require_role("teller", "pao")
+def bind_card(user_id: int):
+    data = request.get_json(silent=True) or {}
+    uid = (data.get("card_uid") or "").strip()
+    if not uid:
+        return jsonify(error="card_uid required"), 400
+
+    acct = WalletAccount.query.get(user_id)
+    if not acct:
+        acct = WalletAccount(user_id=user_id, balance_pesos=0)
+        db.session.add(acct)
+        db.session.flush()
+
+    acct.qr_token = uid
+    db.session.commit()
+    return jsonify(ok=True, user_id=user_id, card_uid=uid), 200
 
 @teller_bp.route("/wallet/<int:user_id>/overview", methods=["GET"])
 @require_role("teller")
@@ -621,19 +774,20 @@ def wallet_overview(user_id: int):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CREATE TOP-UP (CASH ONLY)
-
 @teller_bp.route("/wallet/topups", methods=["POST"])
 @require_role("teller")
 def create_topup():
     data = request.get_json(silent=True) or {}
 
-    # Identify target wallet (by user_id or signed commuter QR token)
+    # Identify target wallet (by user_id OR signed commuter QR token OR NFC UID)
     account_user_id: Optional[int] = None
+
     if data.get("user_id") is not None:
         try:
             account_user_id = int(data.get("user_id"))
         except Exception:
             return jsonify(error="invalid user_id"), 400
+
     elif (data.get("token") or "").strip():
         try:
             uid = _unsign_user_qr((data.get("token") or "").strip())
@@ -641,11 +795,22 @@ def create_topup():
             uid = None
         if not uid:
             return jsonify(error="invalid token"), 400
-        account_user_id = uid
-    else:
-        return jsonify(error="user_id or token is required"), 400
+        account_user_id = int(uid)
 
-    # Cash-only (reject any non-cash method passed by old clients)
+    else:
+        # NEW: NFC UID
+        nfc_uid = (data.get("uid") or data.get("nfc_uid") or "").strip()
+        if nfc_uid:
+            uid = _lookup_user_by_nfc(nfc_uid)
+            if not uid:
+                return jsonify(error="unknown_or_blocked_card"), 404
+            account_user_id = int(uid)
+            token_type = "nfc_uid"
+
+        else:
+            return jsonify(error="user_id or token or uid is required"), 400
+
+    # Cash-only
     method = str(data.get("method") or "cash").strip().lower()
     if method != "cash":
         return jsonify(error="unsupported method: cash only"), 400
@@ -655,13 +820,13 @@ def create_topup():
         amount_pesos = int(data.get("amount_pesos") or data.get("amount_php") or 0)
     except Exception:
         amount_pesos = 0
+
     if amount_pesos < MIN_TOPUP or amount_pesos > MAX_TOPUP:
         return jsonify(error=f"amount must be between {MIN_TOPUP} and {MAX_TOPUP}"), 400
 
     _ensure_wallet_row(account_user_id)
 
     try:
-        # Cash only
         topup_id, ledger_id, new_bal = topup_cash(
             account_id=account_user_id,
             amount_pesos=amount_pesos,
@@ -674,7 +839,6 @@ def create_topup():
             "new_balance_php": int(round(float(new_bal))),
         }
 
-        # Best-effort realtime publish to commuter device(s)
         _publish_user_wallet(
             account_user_id,
             new_balance_pesos=int(round(float(new_bal))),
@@ -684,7 +848,6 @@ def create_topup():
             amount_php=int(amount_pesos),
         )
 
-        # Optional: push notification
         try:
             push_to_user(
                 account_user_id,

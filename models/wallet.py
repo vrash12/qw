@@ -13,6 +13,7 @@ class WalletAccount(db.Model):
 
     created_at    = db.Column(db.DateTime, server_default=func.now(), nullable=False)
     updated_at    = db.Column(db.DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    nfc_uid = db.Column(db.String(64), unique=True, nullable=True, index=True)
 
     # Back-compat alias (no extra column)
     id = synonym("user_id")

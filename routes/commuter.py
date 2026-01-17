@@ -83,6 +83,97 @@ RECEIPTS_DIR = "topup_receipts"
 ALLOWED_EXTS = {"jpg", "jpeg", "png", "webp"}
 
 
+def _norm_uid(uid: str) -> str:
+    u = (uid or "").strip().replace(" ", "").upper()
+    # Keep only hex-ish chars (optional hardening)
+    u = "".join([c for c in u if c in "0123456789ABCDEF"])
+    return u
+
+@commuter_bp.route("/nfc", methods=["GET"])
+@require_role("commuter")
+def commuter_list_nfc_cards():
+    rows = db.session.execute(
+        text("""
+            SELECT uid, label, status, created_at, updated_at
+            FROM nfc_cards
+            WHERE user_id = :uid
+            ORDER BY id DESC
+        """),
+        {"uid": int(g.user.id)},
+    ).mappings().all()
+
+    return jsonify([{
+        "uid": r["uid"],
+        "label": r["label"],
+        "status": r["status"],
+        "created_at": r["created_at"].isoformat(sep=" ") if r["created_at"] else None,
+        "updated_at": r["updated_at"].isoformat(sep=" ") if r["updated_at"] else None,
+    } for r in rows]), 200
+
+
+@commuter_bp.route("/nfc/bind", methods=["POST"])
+@require_role("commuter")
+def commuter_bind_nfc_card():
+    data = request.get_json(silent=True) or {}
+    uid = _norm_uid(data.get("uid") or "")
+    label = (data.get("label") or "").strip() or None
+
+    if not uid:
+        return jsonify(error="uid is required"), 400
+
+    try:
+        db.session.execute(
+            text("""
+                INSERT INTO nfc_cards (uid, user_id, label, status)
+                VALUES (:uid, :user_id, :label, 'active')
+            """),
+            {"uid": uid, "user_id": int(g.user.id), "label": label},
+        )
+        db.session.commit()
+        return jsonify(ok=True, uid=uid, user_id=int(g.user.id), already_bound=False), 201
+
+    except IntegrityError:
+        db.session.rollback()
+
+        # If UID already exists, check who owns it
+        row = db.session.execute(
+            text("SELECT user_id FROM nfc_cards WHERE uid=:uid LIMIT 1"),
+            {"uid": uid},
+        ).scalar()
+
+        if row and int(row) == int(g.user.id):
+            # Already bound to same user -> treat as success (optionally update label)
+            db.session.execute(
+                text("""
+                    UPDATE nfc_cards
+                    SET label = COALESCE(:label, label),
+                        status = 'active'
+                    WHERE uid = :uid
+                """),
+                {"uid": uid, "label": label},
+            )
+            db.session.commit()
+            return jsonify(ok=True, uid=uid, user_id=int(g.user.id), already_bound=True), 200
+
+        return jsonify(error="card_already_bound_to_another_user"), 409
+
+
+@commuter_bp.route("/nfc/<string:uid>", methods=["DELETE"])
+@require_role("commuter")
+def commuter_unbind_nfc_card(uid: str):
+    uid = _norm_uid(uid)
+    if not uid:
+        return jsonify(error="invalid uid"), 400
+
+    res = db.session.execute(
+        text("DELETE FROM nfc_cards WHERE uid=:uid AND user_id=:user_id"),
+        {"uid": uid, "user_id": int(g.user.id)},
+    )
+    db.session.commit()
+    return jsonify(ok=True, deleted=int(res.rowcount or 0)), 200
+
+
+
 def _payment_method_for_ticket(t: TicketSale) -> str:
     """
     Decide 'wallet' vs 'gcash' vs 'cash' for a TicketSale row.

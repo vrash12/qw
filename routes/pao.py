@@ -369,6 +369,62 @@ def _commuter_label(ticket: TicketSale) -> str:
         return f"{u.first_name} {u.last_name}"
     return "Guest"
 
+def _norm_uid(uid: str) -> str:
+    u = (uid or "").strip().replace(" ", "").upper()
+    u = "".join([c for c in u if c in "0123456789ABCDEF"])
+    return u
+
+@pao_bp.route("/nfc/resolve", methods=["POST"])
+@require_role("pao")
+def pao_nfc_resolve():
+    data = request.get_json(silent=True) or {}
+    uid = _norm_uid(data.get("uid") or "")
+    if not uid:
+        return jsonify(error="uid is required"), 400
+
+    row = db.session.execute(
+        text("""
+            SELECT c.user_id,
+                   COALESCE(a.balance_pesos, 0) AS balance_pesos,
+                   u.first_name, u.last_name, u.username,
+                   c.status
+            FROM nfc_cards c
+            JOIN users u ON u.id = c.user_id
+            LEFT JOIN wallet_accounts a ON a.user_id = c.user_id
+            WHERE c.uid = :uid
+            LIMIT 1
+        """),
+        {"uid": uid},
+    ).mappings().first()
+
+    if not row:
+        return jsonify(error="unknown_card"), 404
+    if (row.get("status") or "").lower() != "active":
+        return jsonify(error="card_blocked"), 403
+
+    name = (f"{(row['first_name'] or '').strip()} {(row['last_name'] or '').strip()}".strip()
+            or (row["username"] or f"User #{row['user_id']}"))
+
+    # Optional: passenger discount status using your existing helper
+    discount_active = False
+    discount_expires = None
+    try:
+        u = User.query.get(int(row["user_id"]))
+        if u:
+            _, exp, active = _user_passenger_status(u)
+            discount_active = bool(active)
+            discount_expires = exp.isoformat() if exp else None
+    except Exception:
+        pass
+
+    return jsonify(
+        user_id=int(row["user_id"]),
+        name=name,
+        balance_php=int(row["balance_pesos"]),
+        discount_active=discount_active,
+        discount_expires=discount_expires,
+        uid=uid,
+    ), 200
 
 
 def _payment_method_for_ticket_row(t: TicketSale) -> str:
@@ -550,11 +606,261 @@ def user_qr_scan():
 
     return jsonify(user_id=user_id, name=f"{u.first_name} {u.last_name}"), 200
 
+
+# ---------------------------------------------------------------------------
+# /pao/wallet/resolve
+# ---------------------------------------------------------------------------
+@pao_bp.route("/wallet/resolve", methods=["POST", "GET"])
+@require_role("pao")
+def wallet_resolve():
+    """
+    Resolve a scanned QR into a commuter OR resolve an NFC card UID.
+
+    Accepts (JSON or query):
+      - token / wallet_token / raw (full URL or token)
+      - uid / nfc_uid (NFC card UID)
+
+    Returns a unified payload:
+      {
+        valid: true,
+        token_type: "user_qr"|"wallet_token_rot"|"wallet_token"|"nfc_uid",
+        autopay: bool,
+        user: {id, name},
+        user_id: int,
+        name: str,
+        balance_php: float,
+        passenger_type: "regular"|"discount",
+        discount_active: bool,
+        discount_valid_until: str|None,
+        uid?: str (when token_type is nfc_uid)
+      }
+    """
+    rid = request.headers.get("X-Request-ID") or f"resolve-{int(time.time()*1000)}"
+    data = request.get_json(silent=True) or {}
+
+    # NFC UID support (uid / nfc_uid)
+    nfc_uid = (
+        (data.get("uid") or data.get("nfc_uid") or "").strip()
+        or (request.args.get("uid") or request.args.get("nfc_uid") or "").strip()
+    )
+
+    raw = (
+        data.get("raw")
+        or data.get("token")
+        or data.get("wallet_token")
+        or request.args.get("token")
+        or request.args.get("wallet_token")
+        or ""
+    ).strip()
+
+    qp_token = None
+    autopay = bool(data.get("autopay"))
+
+    # parse URL if needed (keep your existing behavior)
+    try:
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(raw)
+        if u.scheme and u.netloc:
+            qs = parse_qs(u.query)
+            qp_token = (
+                qs.get("wallet_token", [None])[0]
+                or qs.get("token", [None])[0]
+                or qs.get("wlt", [None])[0]
+            )
+            autopay = autopay or (qs.get("autopay", ["0"])[0] == "1")
+    except Exception:
+        pass
+
+    token = (qp_token or raw or "").strip()
+
+    dbg = {"raw": raw, "parsed_token": token, "nfc_uid": nfc_uid} if _debug_enabled() else {}
+    user_id: Optional[int] = None
+    token_type: Optional[str] = None
+    expired_hint = False
+
+    # 0) NFC FIRST if provided
+    if nfc_uid:
+        uid_found = _lookup_user_by_nfc(nfc_uid)
+        if not uid_found:
+            out = {"valid": False, "error": "unknown_or_blocked_card"}
+            if _debug_enabled():
+                out["debug"] = dbg
+            return jsonify(out), 404
+        user_id = int(uid_found)
+        token_type = "nfc_uid"
+        autopay = False  # NFC tap does not imply autopay
+
+    # 1) Token flows if no NFC
+    if user_id is None:
+        if not token:
+            return jsonify(error="missing token or uid"), 400
+
+        uid1, grace1, err1 = _try_user_qr_soft(token)
+        if uid1:
+            user_id = int(uid1)
+            token_type = "user_qr"
+            if _debug_enabled():
+                dbg["user_qr_grace"] = bool(grace1)
+        elif err1 == "expired":
+            expired_hint = True
+        elif err1 == "invalid" and _debug_enabled():
+            dbg["user_qr_error"] = "invalid"
+
+        if user_id is None:
+            uid2, grace2, err2 = _try_wallet_rot_soft(token)
+            if uid2:
+                user_id = int(uid2)
+                token_type = "wallet_token_rot"
+                if _debug_enabled():
+                    dbg["rot_grace"] = bool(grace2)
+            elif err2 == "expired":
+                expired_hint = True
+
+        if user_id is None and verify_wallet_token:
+            try:
+                uid3 = int(verify_wallet_token(token))
+                if uid3 > 0:
+                    user_id = int(uid3)
+                    token_type = "wallet_token"
+            except Exception as e:
+                if _debug_enabled():
+                    dbg["wallet_token_error"] = f"{type(e).__name__}: {e}"
+        elif user_id is None and verify_wallet_token is None and _debug_enabled():
+            dbg["wallet_token_error"] = "verify_wallet_token unavailable"
+
+        if not user_id:
+            status = 410 if expired_hint else 422
+            out = {"valid": False, "error": ("expired" if expired_hint else "invalid")}
+            if _debug_enabled():
+                out["debug"] = dbg
+            current_app.logger.warning("[PAO:resolve][%s] invalid/expired token", rid)
+            return jsonify(out), status
+
+    # Load user
+    user = User.query.get(int(user_id))
+    if not user:
+        return jsonify(valid=False, error="user not found"), 404
+
+    # Balance (safe default 0)
+    try:
+        balance_pesos = int(
+            db.session.execute(
+                text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
+                {"uid": int(user_id)},
+            ).scalar() or 0
+        )
+    except Exception:
+        balance_pesos = 0
+
+    # Passenger status (effective)
+    eff_pt, exp, active = _user_passenger_status(user)
+
+    full_name = f"{(user.first_name or '').strip()} {(user.last_name or '').strip()}".strip()
+    name = full_name or (getattr(user, "username", "") or f"User #{int(user.id)}")
+
+    payload = {
+        "valid": True,
+        "token_type": token_type,
+        "autopay": bool(autopay),
+        "user": {"id": int(user.id), "name": name},
+        "user_id": int(user.id),
+        "name": name,
+        "balance_php": float(balance_pesos),
+        "passenger_type": eff_pt,
+        "discount_valid_until": exp.isoformat() if exp else None,
+        "discount_active": bool(active),
+    }
+
+    if token_type == "nfc_uid":
+        payload["uid"] = _norm_uid(nfc_uid)
+
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+
+    if _debug_enabled():
+        resp.headers["X-Resolve-Raw"] = (raw or "")[:256]
+        resp.headers["X-Resolve-Token"] = (token or "")[:128]
+        resp.headers["X-Resolve-Type"] = token_type or ""
+        resp.headers["X-Resolve-Autopay"] = "1" if autopay else "0"
+        resp.headers["X-Resolve-UserId"] = str(int(user_id))
+        if dbg.get("user_qr_grace") or dbg.get("rot_grace"):
+            resp.headers["X-Resolve-Grace"] = "1"
+        current_app.logger.info(
+            "[PAO:resolve][%s] ok user=%s type=%s autopay=%s grace=%s",
+            rid, int(user_id), token_type, bool(autopay),
+            bool(dbg.get("user_qr_grace") or dbg.get("rot_grace")),
+        )
+
+    return resp, 200
+
+# ------------------------------------------------------------------------------
+# NFC card bindings (uid -> user_id)
+# ------------------------------------------------------------------------------
+
+def _ensure_nfc_cards_table() -> None:
+    """
+    Dev-friendly: auto-create table if missing.
+    If you use Alembic migrations, do this in migrations instead and remove this.
+    """
+    try:
+        db.session.execute(text("""
+            CREATE TABLE IF NOT EXISTS nfc_cards (
+                uid TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_nfc_cards_user_id ON nfc_cards(user_id)"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("[pao] ensure nfc_cards table failed")
+
+def _lookup_user_by_nfc(uid: str) -> Optional[int]:
+    uid = _norm_uid(uid)  # uses your existing helper (hex/digits only)
+    if not uid:
+        return None
+
+    _ensure_nfc_cards_table()
+
+    try:
+        row = db.session.execute(
+            text("SELECT user_id, status FROM nfc_cards WHERE uid=:uid LIMIT 1"),
+            {"uid": uid},
+        ).mappings().first()
+    except Exception:
+        current_app.logger.exception("[pao] nfc lookup failed")
+        return None
+
+    if not row:
+        return None
+    if (row.get("status") or "").lower() != "active":
+        return None
+
+    try:
+        return int(row["user_id"])
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# /pao/wallet/charge
+# ---------------------------------------------------------------------------
 @pao_bp.route("/wallet/charge", methods=["POST"])
 @require_role("pao")
 def pao_wallet_charge():
     """
     Debit a commuter's wallet (whole pesos) and optionally mark a ticket as paid.
+
+    Accepts:
+      - amount_php (required)
+      - user_id OR wallet_token/token/raw OR uid/nfc_uid
+      - ticket_id (optional)
+
+    Notes:
+      - Uses ledger event='ride'
+      - Uses ref_table='ticket_sales' when ticket_id is provided
+      - Duplicate guard uses the same (event/ref_table/ref_id)
     """
     data = request.get_json(silent=True) or {}
 
@@ -567,19 +873,66 @@ def pao_wallet_charge():
         return jsonify(error="amount must be > 0"), 400
     amount_pesos = int(round(amount_php))
 
-    # resolve user
-    token = (data.get("wallet_token") or "").strip()
-    user_id = data.get("user_id")
-    if token:
-        if verify_wallet_token is None:
-            return jsonify(error="wallet token not supported"), 400
+    # resolve user (priority: NFC UID -> token/raw -> user_id)
+    user_id: Optional[int] = None
+
+    # 0) NFC
+    nfc_uid = (data.get("uid") or data.get("nfc_uid") or "").strip()
+    if nfc_uid:
+        uid_found = _lookup_user_by_nfc(nfc_uid)
+        if not uid_found:
+            return jsonify(error="unknown_or_blocked_card"), 404
+        user_id = int(uid_found)
+
+    # 1) Token/raw (same idea as /wallet/resolve)
+    if user_id is None:
+        raw = (data.get("raw") or data.get("token") or data.get("wallet_token") or "").strip()
+        token = raw
+
+        # parse URL if needed
         try:
-            user_id = int(verify_wallet_token(token))
+            from urllib.parse import urlparse, parse_qs
+            u = urlparse(raw)
+            if u.scheme and u.netloc:
+                qs = parse_qs(u.query)
+                token = (
+                    qs.get("wallet_token", [None])[0]
+                    or qs.get("token", [None])[0]
+                    or qs.get("wlt", [None])[0]
+                    or raw
+                )
         except Exception:
-            return jsonify(error="invalid wallet token"), 400
+            token = raw
+
+        token = (token or "").strip()
+
+        if token:
+            uid1, _, _ = _try_user_qr_soft(token)
+            if uid1:
+                user_id = int(uid1)
+
+            if user_id is None:
+                uid2, _, _ = _try_wallet_rot_soft(token)
+                if uid2:
+                    user_id = int(uid2)
+
+            if user_id is None and verify_wallet_token:
+                try:
+                    uid3 = int(verify_wallet_token(token))
+                    if uid3 > 0:
+                        user_id = int(uid3)
+                except Exception:
+                    return jsonify(error="invalid wallet token"), 400
+
+    # 2) Direct user_id
+    if user_id is None:
+        try:
+            user_id = int(data.get("user_id")) if data.get("user_id") not in (None, "", 0, "0") else None
+        except Exception:
+            return jsonify(error="invalid user_id"), 400
+
     if not user_id:
-        return jsonify(error="missing wallet_token or user_id"), 400
-    user_id = int(user_id)
+        return jsonify(error="missing uid or wallet_token or user_id"), 400
 
     ticket_id = data.get("ticket_id")
     t = None
@@ -591,12 +944,14 @@ def pao_wallet_charge():
                 "SELECT user_id, COALESCE(balance_pesos,0) AS balance_pesos "
                 "FROM wallet_accounts WHERE user_id=:uid FOR UPDATE"
             ),
-            {"uid": user_id},
+            {"uid": int(user_id)},
         ).mappings().first()
+
         if not row:
             db.session.rollback()
             return jsonify(error="wallet not found"), 404
-        balance_pesos = int(row["balance_pesos"])
+
+        balance_pesos = int(row["balance_pesos"] or 0)
 
         # optional: lock ticket & duplicate guard
         if ticket_id is not None:
@@ -610,15 +965,18 @@ def pao_wallet_charge():
             if not t:
                 db.session.rollback()
                 return jsonify(error="ticket not found"), 404
-            if t.paid:
+            if bool(getattr(t, "paid", False)):
                 db.session.rollback()
                 return jsonify(error="already paid"), 409
 
+            # If payment_method column exists, only allow wallet-charge for wallet tickets
             if _has_column("ticket_sales", "payment_method"):
-                if (getattr(t, "payment_method", None) or "wallet") != "wallet":
+                meth = (getattr(t, "payment_method", None) or "wallet").strip().lower()
+                if meth != "wallet":
                     db.session.rollback()
                     return jsonify(error="cannot wallet-charge a non-wallet ticket"), 409
 
+            # Duplicate guard: same key we write on debit
             dup_id = db.session.execute(
                 text("""
                     SELECT id
@@ -626,25 +984,20 @@ def pao_wallet_charge():
                     WHERE account_id = :aid
                       AND direction = 'debit'
                       AND event = 'ride'
-                      AND ref_table = 'ticket_sale'
+                      AND ref_table = 'ticket_sales'
                       AND ref_id = :rid
                     LIMIT 1
                     FOR UPDATE
                 """),
-                {"aid": user_id, "rid": tid},
+                {"aid": int(user_id), "rid": int(tid)},
             ).scalar()
+
             if dup_id:
                 db.session.rollback()
                 return jsonify(error="already charged"), 409
 
         # funds check
         if balance_pesos < amount_pesos:
-            if t is not None and not t.paid:
-                try:
-                    db.session.delete(t)
-                    db.session.commit()
-                except Exception:
-                    db.session.rollback()
             return jsonify(
                 error="insufficient balance",
                 balance_php=float(balance_pesos),
@@ -652,12 +1005,13 @@ def pao_wallet_charge():
             ), 402
 
         # apply debit
-        new_balance = balance_pesos - amount_pesos
+        new_balance = int(balance_pesos - amount_pesos)
         db.session.execute(
             text("UPDATE wallet_accounts SET balance_pesos=:bal WHERE user_id=:uid"),
-            {"bal": new_balance, "uid": user_id},
+            {"bal": int(new_balance), "uid": int(user_id)},
         )
 
+        # ledger insert (canonical)
         db.session.execute(
             text("""
                 INSERT INTO wallet_ledger
@@ -667,10 +1021,10 @@ def pao_wallet_charge():
                     (:aid, 'debit', 'ride', :amt, :run, :rt, :rid, NOW())
             """),
             {
-                "aid": user_id,
-                "amt": amount_pesos,
-                "run": new_balance,
-                "rt": ("ticket_sale" if ticket_id is not None else None),
+                "aid": int(user_id),
+                "amt": int(amount_pesos),
+                "run": int(new_balance),
+                "rt": ("ticket_sales" if ticket_id is not None else None),
                 "rid": (int(ticket_id) if ticket_id is not None else None),
             },
         )
@@ -679,6 +1033,18 @@ def pao_wallet_charge():
             t.paid = True
 
         db.session.commit()
+
+        # realtime publish (best-effort)
+        try:
+            _publish_user_wallet(
+                int(user_id),
+                new_balance_pesos=int(new_balance),
+                event="wallet_debit",
+                amount_php=float(amount_pesos),
+                ticket_id=(int(ticket_id) if ticket_id is not None else None),
+            )
+        except Exception:
+            current_app.logger.exception("[mqtt] wallet debit publish failed")
 
         # push notify (best-effort)
         try:
@@ -702,14 +1068,14 @@ def pao_wallet_charge():
             )
 
             push_to_user(
-                db, DeviceToken, user_id,
+                db, DeviceToken, int(user_id),
                 title, body, payload,
                 channelId="payments", priority="high", ttl=600,
             )
         except Exception:
             current_app.logger.exception("[push] wallet-debit notify failed")
 
-        return jsonify(ok=True, user_id=user_id, new_balance_php=float(new_balance)), 200
+        return jsonify(ok=True, user_id=int(user_id), new_balance_php=float(new_balance)), 200
 
     except IntegrityError:
         db.session.rollback()
@@ -718,140 +1084,6 @@ def pao_wallet_charge():
         current_app.logger.exception("[PAO:wallet_charge] unexpected failure")
         db.session.rollback()
         return jsonify(error="internal error"), 500
-
-@pao_bp.route("/wallet/resolve", methods=["POST", "GET"])
-@require_role("pao")
-def wallet_resolve():
-    """
-    Resolve a scanned QR into a commuter. Accepts:
-    { "token": "...", "wallet_token": "...", "raw": "full URL or token", "autopay": true|false }
-    """
-    rid = request.headers.get("X-Request-ID") or f"resolve-{int(time.time()*1000)}"
-    data = request.get_json(silent=True) or {}
-
-    raw = (
-        data.get("raw")
-        or data.get("token")
-        or data.get("wallet_token")
-        or request.args.get("token")
-        or request.args.get("wallet_token")
-        or ""
-    ).strip()
-    qp_token = None
-    autopay = bool(data.get("autopay"))
-
-    # parse URL if needed
-    try:
-        from urllib.parse import urlparse, parse_qs
-        u = urlparse(raw)
-        if u.scheme and u.netloc:
-            qs = parse_qs(u.query)
-            qp_token = (
-                qs.get("wallet_token", [None])[0]
-                or qs.get("token", [None])[0]
-                or qs.get("wlt", [None])[0]
-            )
-            autopay = autopay or (qs.get("autopay", ["0"])[0] == "1")
-    except Exception:
-        pass
-
-    token = qp_token or raw or (data.get("token") or data.get("wallet_token") or "").strip()
-    if not token:
-        return jsonify(error="missing token"), 400
-
-    dbg = {"raw": raw, "parsed_token": token} if _debug_enabled() else {}
-    user_id = None
-    token_type = None
-    expired_hint = False
-
-    uid1, grace1, err1 = _try_user_qr_soft(token)
-    if uid1:
-        user_id = uid1
-        token_type = "user_qr"
-        if _debug_enabled():
-            dbg["user_qr_grace"] = bool(grace1)
-    elif err1 == "expired":
-        expired_hint = True
-    elif err1 == "invalid":
-        if _debug_enabled():
-            dbg["user_qr_error"] = "invalid"
-
-    if user_id is None:
-        uid2, grace2, err2 = _try_wallet_rot_soft(token)
-        if uid2:
-            user_id = uid2
-            token_type = "wallet_token_rot"
-            if _debug_enabled():
-                dbg["rot_grace"] = bool(grace2)
-        elif err2 == "expired":
-            expired_hint = True
-
-    if user_id is None and verify_wallet_token:
-        try:
-            uid = int(verify_wallet_token(token))
-            if uid > 0:
-                user_id = uid
-                token_type = "wallet_token"
-        except Exception as e:
-            if _debug_enabled():
-                dbg["wallet_token_error"] = f"{type(e).__name__}: {e}"
-    elif user_id is None and verify_wallet_token is None:
-        if _debug_enabled():
-            dbg["wallet_token_error"] = "verify_wallet_token unavailable"
-
-    if not user_id:
-        status = 410 if expired_hint else 422
-        current_app.logger.warning("[PAO:resolve][%s] invalid/expired token", rid)
-        out = {"valid": False, "error": ("expired" if expired_hint else "invalid")}
-        if _debug_enabled():
-            out["debug"] = dbg
-        return jsonify(out), status
-
-    user = User.query.get(user_id)
-    if not user:
-        return jsonify(valid=False, error="user not found"), 404
-
-    balance_pesos = int(
-        db.session.execute(
-            text("SELECT COALESCE(balance_pesos,0) FROM wallet_accounts WHERE user_id=:uid"),
-            {"uid": user_id},
-        ).scalar() or 0
-    )
-
-    eff_pt, exp, active = _user_passenger_status(user)
-
-    payload = {
-        "valid": True,
-        "token_type": token_type,
-        "autopay": bool(autopay),
-        "user": {"id": user.id, "name": f"{user.first_name} {user.last_name}"},
-        "user_id": int(user.id),
-        "name": f"{user.first_name} {user.last_name}",
-        "balance_php": float(balance_pesos),
-        # 👇 effective passenger type (respects expiry)
-        "passenger_type": eff_pt,
-        "discount_valid_until": exp.isoformat() if exp else None,
-        "discount_active": bool(active),
-    }
-
-    resp = jsonify(payload)
-
-    if _debug_enabled():
-        resp.headers["X-Resolve-Raw"] = raw[:256]
-        resp.headers["X-Resolve-Token"] = (token or "")[:128]
-        resp.headers["X-Resolve-Type"] = token_type or ""
-        resp.headers["X-Resolve-Autopay"] = "1" if autopay else "0"
-        resp.headers["X-Resolve-UserId"] = str(user_id)
-        if dbg.get("user_qr_grace"):
-            resp.headers["X-Resolve-Grace"] = "1"
-        current_app.logger.info(
-            "[PAO:resolve][%s] ok user=%s type=%s autopay=%s grace=%s",
-            rid, user_id, token_type, autopay, bool(dbg.get("user_qr_grace")),
-        )
-
-    return resp, 200
-
-
 
 @pao_bp.route("/wallet/<int:user_id>/overview", methods=["GET"])
 @require_role("pao")
