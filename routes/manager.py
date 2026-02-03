@@ -9,7 +9,7 @@ from flask import Blueprint, request, jsonify, send_from_directory, current_app,
 from routes.commuter import _payment_method_for_ticket
 
 # ✅ add or_ (and and_ if you ever need it)
-from sqlalchemy import func, text, literal, or_
+from sqlalchemy import func, text, literal, or_, case
 from sqlalchemy.orm import aliased
 
 from db import db
@@ -1218,6 +1218,333 @@ def ticket_metrics():
         total_revenue += float(r.revenue or 0)
 
     return jsonify(daily=daily, total_tickets=total_tickets, total_revenue=round(total_revenue, 2)), 200
+
+
+# ─────────────────────────────────────────────
+# Trend Forecasting (Tickets / Revenue)
+# ─────────────────────────────────────────────
+
+def _dialect_name() -> str:
+    try:
+        bind = db.session.get_bind()
+        return (getattr(bind, "dialect", None) and bind.dialect.name or "").lower()
+    except Exception:
+        return ""
+
+
+def _parse_bool(v: str | None, default: bool = False) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _window_utc_from_days(day_from, day_to, tz: str) -> tuple[datetime, datetime]:
+    """
+    Returns (start_utc_naive, end_utc_naive_exclusive) for filtering created_at.
+
+    - tz='mnl': interprets day_from/day_to as Manila days and converts to UTC naive.
+    - tz='utc': interprets day_from/day_to as UTC days and returns UTC naive.
+    """
+    if tz == "mnl":
+        start_mnl = datetime.combine(day_from, datetime.min.time(), tzinfo=MNL_TZ)
+        end_mnl_excl = datetime.combine(day_to + timedelta(days=1), datetime.min.time(), tzinfo=MNL_TZ)
+        start_utc = start_mnl.astimezone(timezone.utc).replace(tzinfo=None)
+        end_utc = end_mnl_excl.astimezone(timezone.utc).replace(tzinfo=None)
+        return start_utc, end_utc
+
+    # tz == 'utc'
+    start_utc = datetime.combine(day_from, datetime.min.time())
+    end_utc = datetime.combine(day_to + timedelta(days=1), datetime.min.time())
+    return start_utc, end_utc
+
+
+def _day_bucket_expr_for_ticket_sales(*, tz: str):
+    """Dialect-aware day bucket label for grouping ticket_sales.created_at into YYYY-MM-DD."""
+    dialect = _dialect_name()
+
+    # When tz == 'mnl', assume created_at stored in UTC and shift +8h for grouping.
+    if tz == "mnl":
+        if dialect in ("mysql", "mariadb"):
+            local_dt = func.date_add(TicketSale.created_at, text("INTERVAL 8 HOUR"))
+            return func.date_format(local_dt, "%Y-%m-%d")
+        if dialect in ("postgresql", "postgres"):
+            local_dt = TicketSale.created_at + text("INTERVAL '8 hours'")
+            return func.to_char(local_dt, "YYYY-MM-DD")
+        # sqlite / fallback
+        return func.strftime("%Y-%m-%d", TicketSale.created_at, "+8 hours")
+
+    # tz == 'utc'
+    if dialect in ("mysql", "mariadb"):
+        return func.date_format(TicketSale.created_at, "%Y-%m-%d")
+    if dialect in ("postgresql", "postgres"):
+        return func.to_char(TicketSale.created_at, "YYYY-MM-DD")
+    return func.strftime("%Y-%m-%d", TicketSale.created_at)
+
+
+def _load_daily_ticket_series(
+    *,
+    metric: str,
+    count_mode: str,
+    day_from,
+    day_to,
+    tz: str,
+    bus_id: int | None,
+    paid_only: bool,
+    include_voided: bool,
+) -> dict[str, float]:
+    """Returns sparse mapping {"YYYY-MM-DD": value}."""
+    has_voided = table_has_column("ticket_sales", "voided")
+    has_status = table_has_column("ticket_sales", "status")
+    has_paid = table_has_column("ticket_sales", "paid")
+
+    start_utc, end_utc = _window_utc_from_days(day_from, day_to, tz)
+    day_expr = _day_bucket_expr_for_ticket_sales(tz=tz).label("d")
+
+    metric = (metric or "tickets").strip().lower()
+    count_mode = (count_mode or "passengers").strip().lower()
+
+    if metric == "revenue":
+        y_expr = func.coalesce(func.sum(TicketSale.price), 0.0).label("y")
+    else:
+        # metric == 'tickets'
+        if count_mode == "rows":
+            y_expr = func.count(TicketSale.id).label("y")
+        else:
+            # passengers: group ticket counts as group_regular + group_discount, else 1
+            pax_piece = case(
+                (
+                    TicketSale.is_group.is_(True),
+                    func.coalesce(TicketSale.group_regular, 0) + func.coalesce(TicketSale.group_discount, 0),
+                ),
+                else_=literal(1),
+            )
+            y_expr = func.coalesce(func.sum(pax_piece), 0.0).label("y")
+
+    qs = db.session.query(day_expr, y_expr).filter(
+        TicketSale.created_at >= start_utc,
+        TicketSale.created_at < end_utc,
+    )
+
+    if bus_id:
+        qs = qs.filter(TicketSale.bus_id == bus_id)
+
+    if paid_only and has_paid:
+        qs = qs.filter(TicketSale.paid.is_(True))
+
+    if not include_voided:
+        if has_voided:
+            qs = qs.filter(TicketSale.voided.is_(False))
+        elif has_status:
+            voided_states = ("void", "voided", "refunded", "cancelled", "canceled")
+            qs = qs.filter(~func.lower(func.coalesce(TicketSale.status, "")).in_(voided_states))
+
+    rows = qs.group_by(day_expr).order_by(day_expr).all()
+
+    out: dict[str, float] = {}
+    for r in rows:
+        d = str(getattr(r, "d", "") or "")
+        y = getattr(r, "y", 0) or 0
+        out[d] = float(y)
+    return out
+
+
+def _fill_daily_range(day_from, day_to, sparse: dict[str, float]) -> list[dict]:
+    pts: list[dict] = []
+    d = day_from
+    while d <= day_to:
+        key = d.isoformat()
+        pts.append({"date": key, "value": float(sparse.get(key, 0.0))})
+        d = d + timedelta(days=1)
+    return pts
+
+
+def _stddev(xs: list[float]) -> float:
+    n = len(xs)
+    if n <= 1:
+        return 0.0
+    m = sum(xs) / n
+    v = sum((x - m) ** 2 for x in xs) / (n - 1)
+    return v ** 0.5
+
+
+def _linear_slope_last_k(y: list[float], k: int) -> float:
+    """Least-squares slope over last k points where x=0..k-1."""
+    n = len(y)
+    if n < 2:
+        return 0.0
+    k = max(2, min(k, n))
+    ys = y[-k:]
+    xs = list(range(k))
+    xm = (k - 1) / 2.0
+    ym = sum(ys) / k
+    cov = sum((xs[i] - xm) * (ys[i] - ym) for i in range(k))
+    var = sum((xs[i] - xm) ** 2 for i in range(k))
+    return (cov / var) if var > 0 else 0.0
+
+
+def _weekday_avgs(history_pts: list[dict]) -> dict[int, float]:
+    buckets: dict[int, list[float]] = {i: [] for i in range(7)}
+    for p in history_pts:
+        d = datetime.strptime(p["date"], "%Y-%m-%d").date()
+        buckets[d.weekday()].append(float(p["value"]))
+    avgs: dict[int, float] = {}
+    for wd, vals in buckets.items():
+        avgs[wd] = (sum(vals) / len(vals)) if vals else 0.0
+    return avgs
+
+
+def _forecast_from_history(*, history_pts: list[dict], horizon_days: int) -> tuple[list[dict], dict]:
+    """
+    Forecast next N days using:
+      - recent linear trend (last 28 days)
+      - weekday seasonality adjustment (avg per weekday)
+      - CI based on stddev of day-to-day deltas
+    """
+    if not history_pts:
+        return [], {"method": "empty", "slope_per_day": 0.0, "weekday_avgs": {}}
+
+    y = [float(p["value"]) for p in history_pts]
+    n = len(y)
+
+    wd_avg = _weekday_avgs(history_pts)
+    overall_avg = (sum(y) / n) if n else 0.0
+
+    slope = _linear_slope_last_k(y, k=28)
+
+    deltas = [y[i] - y[i - 1] for i in range(1, n)]
+    sigma_delta = _stddev(deltas) if deltas else _stddev(y)
+    sigma_delta = max(sigma_delta, 0.05 * (overall_avg or 1.0))
+
+    last_day = datetime.strptime(history_pts[-1]["date"], "%Y-%m-%d").date()
+    last_val = y[-1]
+
+    preds: list[dict] = []
+    for h in range(1, horizon_days + 1):
+        d = last_day + timedelta(days=h)
+        base = last_val + slope * h
+
+        wd = d.weekday()
+        wd_adj = wd_avg.get(wd, overall_avg) - overall_avg
+        yhat = max(0.0, base + wd_adj)
+
+        sigma_h = sigma_delta * (h ** 0.5)
+        lo95 = max(0.0, yhat - 1.96 * sigma_h)
+        hi95 = max(0.0, yhat + 1.96 * sigma_h)
+
+        preds.append({"date": d.isoformat(), "yhat": yhat, "lo95": lo95, "hi95": hi95})
+
+    diag = {
+        "method": "dow+trend",
+        "slope_per_day": float(slope),
+        "weekday_avgs": {str(k): float(v) for k, v in wd_avg.items()},
+        "overall_avg": float(overall_avg),
+    }
+    return preds, diag
+
+
+@manager_bp.route("/metrics/tickets/forecast", methods=["GET"])
+@require_role("manager")
+def tickets_forecast():
+    """
+    GET /manager/metrics/tickets/forecast
+
+    Query:
+      metric=tickets|revenue            (default tickets)
+      count_mode=passengers|rows        (default passengers; only for metric=tickets)
+      history_days=<int>               (default 90, max 1095)
+      horizon_days=<int>               (default 14, max 90)
+      bus_id=<int>                     (optional)
+      paid_only=true|false             (default false)
+      include_voided=true|false        (default false)
+      tz=mnl|utc                       (default mnl)
+      to=YYYY-MM-DD                    (optional, default today in tz)
+
+    Notes:
+      - tz=mnl groups by (created_at shifted +8h) AND filters using Manila day boundaries converted to UTC.
+      - Passenger counting respects is_group/group_regular/group_discount.
+    """
+    metric = (request.args.get("metric") or "tickets").strip().lower()
+    if metric not in {"tickets", "revenue"}:
+        return jsonify(error="metric must be tickets or revenue"), 400
+
+    count_mode = (request.args.get("count_mode") or "passengers").strip().lower()
+    if count_mode not in {"passengers", "rows"}:
+        return jsonify(error="count_mode must be passengers or rows"), 400
+
+    tz = (request.args.get("tz") or "mnl").strip().lower()
+    if tz not in {"mnl", "utc"}:
+        return jsonify(error="tz must be mnl or utc"), 400
+
+    history_days = request.args.get("history_days", type=int) or 90
+    history_days = max(14, min(history_days, 1095))
+
+    horizon_days = request.args.get("horizon_days", type=int) or 14
+    horizon_days = max(1, min(horizon_days, 90))
+
+    bus_id = request.args.get("bus_id", type=int)
+
+    paid_only = _parse_bool(request.args.get("paid_only"), default=False)
+    include_voided = _parse_bool(request.args.get("include_voided"), default=False)
+
+    to_str = (request.args.get("to") or "").strip()
+    try:
+        if to_str:
+            day_to = datetime.strptime(to_str, "%Y-%m-%d").date()
+        else:
+            day_to = (datetime.now(MNL_TZ).date() if tz == "mnl" else datetime.utcnow().date())
+    except ValueError:
+        return jsonify(error="invalid to (use YYYY-MM-DD)"), 400
+
+    day_from = day_to - timedelta(days=history_days - 1)
+
+    sparse = _load_daily_ticket_series(
+        metric=metric,
+        count_mode=count_mode,
+        day_from=day_from,
+        day_to=day_to,
+        tz=tz,
+        bus_id=bus_id,
+        paid_only=paid_only,
+        include_voided=include_voided,
+    )
+    history_pts = _fill_daily_range(day_from, day_to, sparse)
+    forecast_pts, diag = _forecast_from_history(history_pts=history_pts, horizon_days=horizon_days)
+
+    if metric == "tickets":
+        for p in history_pts:
+            p["value"] = int(round(float(p["value"])))
+        for p in forecast_pts:
+            p["yhat"] = int(round(float(p["yhat"])))
+            p["lo95"] = int(round(float(p["lo95"])))
+            p["hi95"] = int(round(float(p["hi95"])))
+    else:
+        for p in history_pts:
+            p["value"] = round(float(p["value"]), 2)
+        for p in forecast_pts:
+            p["yhat"] = round(float(p["yhat"]), 2)
+            p["lo95"] = round(float(p["lo95"]), 2)
+            p["hi95"] = round(float(p["hi95"]), 2)
+
+    return jsonify(
+        metric=metric,
+        count_mode=count_mode,
+        tz=tz,
+        bus_id=bus_id,
+        paid_only=bool(paid_only),
+        include_voided=bool(include_voided),
+        history_days=int(history_days),
+        horizon_days=int(horizon_days),
+        from_date=day_from.isoformat(),
+        to_date=day_to.isoformat(),
+        history=history_pts,
+        forecast=forecast_pts,
+        diagnostics=diag,
+    ), 200
 
 
 # ─────────────────────────────────────────────

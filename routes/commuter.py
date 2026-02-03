@@ -1,6 +1,8 @@
 # routes/commuter.py
 from __future__ import annotations
 import datetime as dt
+from typing import cast
+
 from typing import Any, Dict, List, Optional
 
 from flask import (
@@ -24,6 +26,7 @@ from models.bus import Bus
 from models.user import User
 from models.ticket_stop import TicketStop
 from models.device_token import DeviceToken
+from models.fare_segment import FareSegment
 from utils.qr import build_qr_payload
 from utils.push import push_to_user
 from io import BytesIO
@@ -88,6 +91,56 @@ def _norm_uid(uid: str) -> str:
     # Keep only hex-ish chars (optional hardening)
     u = "".join([c for c in u if c in "0123456789ABCDEF"])
     return u
+
+
+@commuter_bp.route("/impact/summary", methods=["GET"])
+@require_role("commuter")
+def commuter_impact_summary():
+    uid = int(g.user.id)
+    days = request.args.get("days", type=int)
+
+    q = (
+        db.session.query(
+            func.coalesce(
+                func.sum(cast(FareSegment.distance_km, db.Float) * cast(TicketSale.quantity, db.Float)),
+                0.0,
+            ).label("passenger_km"),
+            func.coalesce(func.sum(TicketSale.quantity), 0).label("rides"),
+        )
+        .join(FareSegment, FareSegment.id == TicketSale.fare_segment_id)
+        .filter(TicketSale.user_id == uid)
+        .filter(TicketSale.status.in_(["paid", "confirmed"]))
+    )
+
+    if days:
+        since = dt.datetime.utcnow() - dt.timedelta(days=days)
+        q = q.filter(TicketSale.created_at >= since)
+
+    row = q.one()
+    passenger_km = float(row.passenger_km or 0.0)
+    rides = int(row.rides or 0)
+
+    # Defaults (you can tune these)
+    car_kg = float(os.getenv("CAR_KG_CO2E_PER_KM", "0.1645"))         # per km per car
+    bus_kg = float(os.getenv("BUS_KG_CO2E_PER_PKM", "0.1085"))        # per passenger-km
+
+    return jsonify({
+        "ok": True,
+        "scope": {"days": days},
+        "as_of": dt.datetime.utcnow().isoformat() + "Z",
+        "passenger_km": passenger_km,
+        "passenger_rides": rides,
+        "factors": {
+            "car_kg_co2e_per_km": car_kg,
+            "bus_kg_co2e_per_passenger_km": bus_kg,
+            "notes": [
+                "CO₂ is an estimate using average emission factors.",
+                "Car comparison assumes a typical passenger car; you can change car occupancy in the app."
+            ]
+        }
+    })
+
+
 
 @commuter_bp.route("/nfc", methods=["GET"])
 @require_role("commuter")
